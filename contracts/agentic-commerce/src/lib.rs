@@ -23,6 +23,8 @@ pub enum Error {
     NotEvaluator = 8,
     /// Caller is not the contract admin.
     NotAdmin = 9,
+    /// The token address is not on the approved whitelist.
+    UnsupportedToken = 10,
 }
 
 /// Lifecycle states for a job escrow.
@@ -123,6 +125,34 @@ pub struct PaymentChannel {
     pub voucher_key: soroban_sdk::BytesN<32>,
 }
 
+/// Metadata stored for each whitelisted token.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenInfo {
+    pub token: Address,
+    /// Number of decimal places for this token (e.g. 7 for XLM/USDC on Stellar).
+    pub decimals: u32,
+    /// Normalization factor relative to 7-decimal base: 10^(7 - decimals).
+    /// For 7-decimal tokens this is 1; for 6-decimal tokens this is 10.
+    pub normalization_factor: i128,
+}
+
+/// A single milestone within a milestone-based escrow job.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Milestone {
+    /// Zero-based index within the job's milestone list.
+    pub index: u32,
+    /// Amount allocated for this milestone in token smallest units.
+    pub amount: i128,
+    /// Human-readable description of this milestone's deliverable.
+    pub description: String,
+    /// Submitted deliverable URI (empty until provider calls submit_milestone).
+    pub deliverable: String,
+    /// True once the evaluator has approved and payment has been released.
+    pub approved: bool,
+}
+
 #[contracttype]
 enum DataKey {
     NextId,
@@ -137,6 +167,12 @@ enum DataKey {
     Evaluators(u64),
     Channel(u64),
     MultiEvalThreshold,
+    /// Persistent milestone list for a milestone-based job.
+    Milestones(u64),
+    /// Stores TokenInfo for each whitelisted token address.
+    AllowedToken(Address),
+    /// Ordered list of whitelisted token addresses for enumeration.
+    AllowedTokenList,
 }
 
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
@@ -258,6 +294,23 @@ pub struct Unpaused {
     pub timestamp: u64,
 }
 
+/// Emitted when an admin adds a token to the whitelist.
+#[contractevent]
+pub struct TokenWhitelisted {
+    #[topic]
+    pub admin: Address,
+    pub token: Address,
+    pub decimals: u32,
+}
+
+/// Emitted when an admin removes a token from the whitelist.
+#[contractevent]
+pub struct TokenRemoved {
+    #[topic]
+    pub admin: Address,
+    pub token: Address,
+}
+
 /// Emitted when admin/treasury are updated via `re_init`.
 #[contractevent]
 pub struct ReInitialized {
@@ -265,6 +318,45 @@ pub struct ReInitialized {
     pub admin: Address,
     pub new_admin: Address,
     pub new_treasury: Address,
+}
+
+/// Emitted when a milestone-based job is created.
+#[contractevent]
+pub struct MilestoneJobCreated {
+    #[topic]
+    pub client: Address,
+    pub job_id: u64,
+    pub budget: i128,
+    pub milestone_count: u32,
+}
+
+/// Emitted when a provider submits a milestone deliverable.
+#[contractevent]
+pub struct MilestoneSubmitted {
+    #[topic]
+    pub provider: Address,
+    pub job_id: u64,
+    pub milestone_index: u32,
+}
+
+/// Emitted when an evaluator approves a milestone and releases partial funds.
+#[contractevent]
+pub struct MilestoneApproved {
+    #[topic]
+    pub evaluator: Address,
+    pub job_id: u64,
+    pub milestone_index: u32,
+    pub payout: i128,
+    pub fee: i128,
+}
+
+/// Emitted when a client cancels remaining uncompleted milestones and gets a refund.
+#[contractevent]
+pub struct MilestonesPartialCancelled {
+    #[topic]
+    pub client: Address,
+    pub job_id: u64,
+    pub refund: i128,
 }
 
 #[contractevent]
@@ -555,6 +647,19 @@ impl AgenticCommerceContract {
         if provider == evaluator {
             panic_with_error!(&env, Error::InvalidParties);
         }
+        // #694 — reject tokens not on the approved whitelist.
+        // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
+        // is skipped so the contract can still be used before whitelist setup.
+        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+            let list: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AllowedTokenList)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !list.is_empty() {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+        }
 
         let next: u64 = env
             .storage()
@@ -660,6 +765,20 @@ impl AgenticCommerceContract {
                 previous += 1;
             }
             index += 1;
+        }
+
+        // #694 — reject tokens not on the approved whitelist.
+        // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
+        // is skipped so the contract can still be used before whitelist setup.
+        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+            let list: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AllowedTokenList)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !list.is_empty() {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
         }
 
         let next: u64 = env
@@ -1017,6 +1136,117 @@ impl AgenticCommerceContract {
         env.storage()
             .instance()
             .set(&DataKey::MultiEvalThreshold, &threshold);
+    }
+
+    // -----------------------------------------------------------------------
+    // #694 — Multi-token whitelist management
+    // -----------------------------------------------------------------------
+
+    /// Admin-only: add a token to the approved whitelist.
+    /// `decimals` is the token's decimal precision (e.g. 7 for USDC/XLM on Stellar).
+    /// Stores normalization factor = 10^(7 - decimals) for fee calculations.
+    pub fn add_token(env: Env, admin: Address, token: Address, decimals: u32) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != current_admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        // Normalization factor: if decimals <= 7, factor = 10^(7 - decimals); else 1.
+        let normalization_factor: i128 = if decimals <= 7 {
+            let exp = 7u32 - decimals;
+            let mut factor: i128 = 1;
+            let mut i = 0u32;
+            while i < exp {
+                factor *= 10;
+                i += 1;
+            }
+            factor
+        } else {
+            1
+        };
+        let info = TokenInfo {
+            token: token.clone(),
+            decimals,
+            normalization_factor,
+        };
+        env.storage().instance().set(&DataKey::AllowedToken(token.clone()), &info);
+        // Maintain ordered list for enumeration
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenList)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Only add if not already present
+        let mut found = false;
+        for existing in list.iter() {
+            if existing == token {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            list.push_back(token.clone());
+            env.storage().instance().set(&DataKey::AllowedTokenList, &list);
+        }
+        TokenWhitelisted {
+            admin,
+            token,
+            decimals,
+        }
+        .publish(&env);
+    }
+
+    /// Admin-only: remove a token from the approved whitelist.
+    pub fn remove_token(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != current_admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().remove(&DataKey::AllowedToken(token.clone()));
+        // Remove from ordered list
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for existing in list.iter() {
+            if existing != token {
+                new_list.push_back(existing);
+            }
+        }
+        env.storage().instance().set(&DataKey::AllowedTokenList, &new_list);
+        TokenRemoved {
+            admin,
+            token,
+        }
+        .publish(&env);
+    }
+
+    /// Read-only: list all whitelisted token addresses and their info.
+    pub fn list_allowed_tokens(env: Env) -> Vec<TokenInfo> {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result: Vec<TokenInfo> = Vec::new(&env);
+        for token in list.iter() {
+            if let Some(info) = env
+                .storage()
+                .instance()
+                .get::<DataKey, TokenInfo>(&DataKey::AllowedToken(token.clone()))
+            {
+                result.push_back(info);
+            }
+        }
+        result
+    }
+
+    /// Read-only: check if a token is whitelisted and return its info.
+    pub fn get_token_info(env: Env, token: Address) -> Option<TokenInfo> {
+        env.storage().instance().get(&DataKey::AllowedToken(token))
     }
 
     /// Read the configured high-value threshold in token smallest units.
@@ -1384,6 +1614,307 @@ impl AgenticCommerceContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // #693 — Milestone-based progressive escrow releases
+    // -----------------------------------------------------------------------
+
+    /// Create a job with multiple sequential milestones.
+    ///
+    /// The total budget is the sum of all milestone amounts. Funds are locked
+    /// in escrow and released milestone-by-milestone as the evaluator approves.
+    /// The job stays in `Funded` status until all milestones are approved (released == budget).
+    ///
+    /// # Panics
+    /// - If any milestone amount is <= 0.
+    /// - If the sum of milestone amounts does not equal `budget`.
+    /// - If fewer than 1 or more than 20 milestones are provided.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_milestone_job(
+        env: Env,
+        client_addr: Address,
+        provider: Address,
+        evaluator: Address,
+        token: Address,
+        budget: i128,
+        description: String,
+        milestones: Vec<Milestone>,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        client_addr.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+        if budget < MIN_BUDGET {
+            panic!("budget below minimum");
+        }
+        if milestones.is_empty() || milestones.len() > 20 {
+            panic!("milestones must contain between 1 and 20 entries");
+        }
+        if client_addr == provider {
+            panic_with_error!(&env, Error::SelfEscrow);
+        }
+        if provider == evaluator {
+            panic_with_error!(&env, Error::InvalidParties);
+        }
+        // Invariant: sum of milestone amounts must equal budget exactly.
+        let mut total: i128 = 0;
+        let mut idx = 0u32;
+        while idx < milestones.len() {
+            let m = milestones.get(idx).unwrap();
+            if m.amount <= 0 {
+                panic!("milestone amount must be positive");
+            }
+            total = total.checked_add(m.amount).expect("milestone sum overflow");
+            idx += 1;
+        }
+        if total != budget {
+            panic!("sum of milestone amounts must equal budget");
+        }
+
+        let snapshotted_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+
+        let token_client = token::TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+        token_client.balance(&contract_addr);
+        token_client.transfer(&client_addr, &contract_addr, &budget);
+
+        let next: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+        let now = env.ledger().timestamp();
+        let job = Job {
+            id: next,
+            client: client_addr.clone(),
+            provider,
+            evaluator,
+            token,
+            budget,
+            released: 0,
+            status: JobStatus::Funded,
+            description,
+            deliverable: String::from_str(&env, ""),
+            funded_at: now,
+            created_at: now,
+            updated_at: now,
+            fee_bps: snapshotted_fee_bps,
+        };
+        env.storage().persistent().set(&DataKey::Job(next), &job);
+        // Normalise milestone indices to match their position in the Vec.
+        let mut normalised: Vec<Milestone> = Vec::new(&env);
+        let mut midx = 0u32;
+        while midx < milestones.len() {
+            let mut m = milestones.get(midx).unwrap();
+            m.index = midx;
+            normalised.push_back(m);
+            midx += 1;
+        }
+        env.storage().persistent().set(&DataKey::Milestones(next), &normalised);
+        env.storage().instance().set(&DataKey::NextId, &(next + 1));
+
+        let milestone_count = normalised.len();
+        MilestoneJobCreated {
+            client: client_addr,
+            job_id: next,
+            budget,
+            milestone_count,
+        }
+        .publish(&env);
+        next
+    }
+
+    /// Provider submits a deliverable for a specific milestone.
+    ///
+    /// Milestones must be submitted in order (index 0 before index 1, etc.).
+    /// The milestone must not already be approved.
+    pub fn submit_milestone(
+        env: Env,
+        caller: Address,
+        job_id: u64,
+        milestone_idx: u32,
+        deliverable: String,
+    ) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        let job: Job = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Job(job_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JobNotFound));
+        if caller != job.provider {
+            panic_with_error!(&env, Error::NotProvider);
+        }
+        if job.status != JobStatus::Funded && job.status != JobStatus::Submitted {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+        let is_blank = deliverable
+            .to_bytes()
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+        if is_blank {
+            panic!("deliverable cannot be empty");
+        }
+        if deliverable.len() > MAX_DELIVERABLE_LEN {
+            panic!("deliverable too long");
+        }
+        let mut milestones: Vec<Milestone> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(job_id))
+            .unwrap_or_else(|| panic!("not a milestone job"));
+        if milestone_idx >= milestones.len() {
+            panic!("milestone index out of bounds");
+        }
+        // Enforce sequential submission: all prior milestones must be approved.
+        if milestone_idx > 0 {
+            let prev = milestones.get(milestone_idx - 1).unwrap();
+            if !prev.approved {
+                panic!("previous milestone not yet approved");
+            }
+        }
+        let mut m = milestones.get(milestone_idx).unwrap();
+        if m.approved {
+            panic!("milestone already approved");
+        }
+        if !m.deliverable.to_bytes().is_empty() {
+            // Already submitted but not yet approved — allow resubmission
+        }
+        m.deliverable = deliverable;
+        milestones.set(milestone_idx, m);
+        env.storage().persistent().set(&DataKey::Milestones(job_id), &milestones);
+
+        MilestoneSubmitted {
+            provider: caller,
+            job_id,
+            milestone_index: milestone_idx,
+        }
+        .publish(&env);
+    }
+
+    /// Evaluator approves a milestone, releasing its proportional funds to the provider.
+    ///
+    /// Computes fee using the job's snapshotted `fee_bps`. When the last milestone
+    /// is approved (`job.released == job.budget`), the job transitions to `Completed`.
+    pub fn approve_milestone(
+        env: Env,
+        caller: Address,
+        job_id: u64,
+        milestone_idx: u32,
+    ) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        let mut job: Job = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Job(job_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JobNotFound));
+        if caller != job.evaluator {
+            panic_with_error!(&env, Error::NotEvaluator);
+        }
+        if job.status != JobStatus::Funded && job.status != JobStatus::Submitted {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+        let mut milestones: Vec<Milestone> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones(job_id))
+            .unwrap_or_else(|| panic!("not a milestone job"));
+        if milestone_idx >= milestones.len() {
+            panic!("milestone index out of bounds");
+        }
+        let mut m = milestones.get(milestone_idx).unwrap();
+        if m.approved {
+            panic!("milestone already approved");
+        }
+        // Deliverable must have been submitted before approval.
+        let blank = m.deliverable.to_bytes().iter().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+        if blank {
+            panic!("milestone deliverable not yet submitted");
+        }
+        let fee = Self::compute_fee(m.amount, job.fee_bps);
+        let payout = m.amount - fee;
+        m.approved = true;
+        milestones.set(milestone_idx, m.clone());
+        job.released = job.released.checked_add(m.amount).expect("released overflow");
+        job.updated_at = env.ledger().timestamp();
+        // Transition to Completed only when all funds have been released.
+        if job.released >= job.budget {
+            job.status = JobStatus::Completed;
+        }
+        env.storage().persistent().set(&DataKey::Job(job_id), &job);
+        env.storage().persistent().set(&DataKey::Milestones(job_id), &milestones);
+
+        let token_client = token::TokenClient::new(&env, &job.token);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&contract_addr, &job.provider, &payout);
+        if fee > 0 {
+            let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+            token_client.transfer(&contract_addr, &treasury, &fee);
+        }
+
+        MilestoneApproved {
+            evaluator: caller,
+            job_id,
+            milestone_index: milestone_idx,
+            payout,
+            fee,
+        }
+        .publish(&env);
+    }
+
+    /// Client cancels all uncompleted milestones, getting a refund of unreleased funds.
+    ///
+    /// Already-approved milestones are preserved — the provider keeps their earned payouts.
+    /// The job is transitioned to `Cancelled`.
+    pub fn cancel_uncompleted_milestones(env: Env, caller: Address, job_id: u64) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        let mut job: Job = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Job(job_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JobNotFound));
+        if caller != job.client {
+            panic_with_error!(&env, Error::NotClient);
+        }
+        if job.status == JobStatus::Completed || job.status == JobStatus::Cancelled {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+        env.storage().persistent().has(&DataKey::Milestones(job_id));
+        // Verify this is actually a milestone job.
+        if !env.storage().persistent().has(&DataKey::Milestones(job_id)) {
+            panic!("not a milestone job");
+        }
+        let net_budget = job.budget - job.released;
+        if net_budget > 0 {
+            let token_client = token::TokenClient::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.client, &net_budget);
+        }
+        let refund = net_budget;
+        job.released = job.budget;
+        job.status = JobStatus::Cancelled;
+        job.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::Job(job_id), &job);
+
+        MilestonesPartialCancelled {
+            client: caller,
+            job_id,
+            refund,
+        }
+        .publish(&env);
+    }
+
+    /// Read-only: fetch the milestone list for a job.
+    pub fn get_milestones(env: Env, job_id: u64) -> Option<Vec<Milestone>> {
+        env.storage().persistent().get(&DataKey::Milestones(job_id))
     }
 }
 

@@ -956,6 +956,149 @@ export class CommerceClient extends BaseClient {
   }
 
   /**
+   * Create a milestone-based escrow job.
+   *
+   * The `milestones` array defines sequential deliverables. The sum of all
+   * milestone `amount` values must equal `budget` exactly — the contract
+   * enforces this invariant and will reject the transaction if it is violated.
+   *
+   * @param client - The client's Signer. Funds are pulled from this account.
+   * @param provider - The provider's Stellar address.
+   * @param evaluator - The evaluator's Stellar address.
+   * @param token - Token contract address for payment.
+   * @param budget - Total escrow budget (must equal sum of milestone amounts).
+   * @param description - Overall job description.
+   * @param milestones - Ordered list of milestone definitions.
+   * @returns The new job's on-chain ID as a `bigint`.
+   */
+  async createMilestoneJob(
+    client: Signer,
+    provider: string,
+    evaluator: string,
+    token: string,
+    budget: bigint,
+    description: string,
+    milestones: Array<{ amount: bigint; description: string }>,
+  ): Promise<bigint> {
+    if (budget <= 0n) throw new Error('budget must be greater than 0');
+    if (budget > MAX_I128) throw new Error('budget exceeds i128 max');
+    if (milestones.length === 0 || milestones.length > 20) {
+      throw new Error('milestones must contain between 1 and 20 entries');
+    }
+    const total = milestones.reduce((acc, m) => acc + m.amount, 0n);
+    if (total !== budget) throw new Error('sum of milestone amounts must equal budget');
+
+    // Encode milestones as a Soroban Vec<Milestone>
+    const milestoneScVals = milestones.map((m, i) =>
+      nativeToScVal(
+        {
+          index: nativeToScVal(i, { type: 'u32' }),
+          amount: nativeToScVal(m.amount, { type: 'i128' }),
+          description: nativeToScVal(m.description, { type: 'string' }),
+          deliverable: nativeToScVal('', { type: 'string' }),
+          approved: nativeToScVal(false, { type: 'bool' }),
+        },
+        { type: 'map' },
+      ),
+    );
+    const milestonesScVal = xdr.ScVal.scvVec(milestoneScVals);
+
+    const op = this.contract.call(
+      'create_milestone_job',
+      new Address(signerPublicKey(client)).toScVal(),
+      new Address(provider).toScVal(),
+      new Address(evaluator).toScVal(),
+      new Address(token).toScVal(),
+      nativeToScVal(budget, { type: 'i128' }),
+      nativeToScVal(description, { type: 'string' }),
+      milestonesScVal,
+    );
+    return await this.invoke(client, op, (v) => BigInt(scValToNative(v) as string), 'commerce');
+  }
+
+  /**
+   * Provider submits a deliverable for a specific milestone.
+   *
+   * @param provider - The provider's Signer.
+   * @param jobId - The milestone job's on-chain ID.
+   * @param milestoneIdx - Zero-based index of the milestone to submit.
+   * @param deliverable - URI or content string of the completed deliverable.
+   */
+  async submitMilestone(
+    provider: Signer,
+    jobId: bigint,
+    milestoneIdx: number,
+    deliverable: string,
+  ): Promise<void> {
+    const op = this.contract.call(
+      'submit_milestone',
+      new Address(signerPublicKey(provider)).toScVal(),
+      nativeToScVal(jobId, { type: 'u64' }),
+      nativeToScVal(milestoneIdx, { type: 'u32' }),
+      nativeToScVal(deliverable, { type: 'string' }),
+    );
+    await this.invoke(provider, op, () => undefined, 'commerce');
+  }
+
+  /**
+   * Evaluator approves a milestone, releasing proportional funds to the provider.
+   *
+   * @param evaluator - The evaluator's Signer.
+   * @param jobId - The milestone job's on-chain ID.
+   * @param milestoneIdx - Zero-based index of the milestone to approve.
+   */
+  async approveMilestone(
+    evaluator: Signer,
+    jobId: bigint,
+    milestoneIdx: number,
+  ): Promise<void> {
+    const op = this.contract.call(
+      'approve_milestone',
+      new Address(signerPublicKey(evaluator)).toScVal(),
+      nativeToScVal(jobId, { type: 'u64' }),
+      nativeToScVal(milestoneIdx, { type: 'u32' }),
+    );
+    await this.invoke(evaluator, op, () => undefined, 'commerce');
+  }
+
+  /**
+   * Client cancels all uncompleted milestones and gets a refund of unreleased funds.
+   * Already-approved milestones are preserved.
+   *
+   * @param client - The client's Signer.
+   * @param jobId - The milestone job's on-chain ID.
+   */
+  async cancelUncompletedMilestones(client: Signer, jobId: bigint): Promise<void> {
+    const op = this.contract.call(
+      'cancel_uncompleted_milestones',
+      new Address(signerPublicKey(client)).toScVal(),
+      nativeToScVal(jobId, { type: 'u64' }),
+    );
+    await this.invoke(client, op, () => undefined, 'commerce');
+  }
+
+  /**
+   * Fetch the milestone list for a job.
+   *
+   * @param jobId - The milestone job's on-chain ID.
+   * @returns Array of Milestone objects, or null if not a milestone job.
+   */
+  async getMilestones(jobId: bigint): Promise<import('./types.js').Milestone[] | null> {
+    const op = this.contract.call('get_milestones', nativeToScVal(jobId, { type: 'u64' }));
+    return await this.simulateOption(op, (v) => {
+      const native = scValToNative(v);
+      if (!Array.isArray(native)) return [];
+      return native.map((m: Record<string, unknown>) => ({
+        index: Number(m.index),
+        amount: BigInt(m.amount as string),
+        description: String(m.description),
+        deliverable: String(m.deliverable ?? ''),
+        approved: Boolean(m.approved),
+      })) as import('./types.js').Milestone[];
+    });
+  }
+
+  /**
    * Disconnect and clean up any resources held by this client.
    *
    * The RPC server uses stateless HTTP connections, so this is currently a
