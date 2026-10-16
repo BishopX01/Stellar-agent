@@ -1257,3 +1257,296 @@ fn channel_cannot_be_force_closed_before_challenge_period() {
 
     client.force_close(&payer, &channel_id);
 }
+
+// ===========================================================================
+// #704 — weighted evaluator voting for multi-evaluator quorums
+// ===========================================================================
+
+/// Builds a 3-party weighted evaluator set: Lead Auditor (weight 3),
+/// QA Engineer (weight 1) and Reviewer (weight 1) — total weight 5.
+fn weighted_evaluators(env: &Env) -> (Vec<Address>, Vec<u32>) {
+    (
+        Vec::from_array(
+            env,
+            [
+                Address::generate(env),
+                Address::generate(env),
+                Address::generate(env),
+            ],
+        ),
+        Vec::from_array(env, [3u32, 1u32, 1u32]),
+    )
+}
+
+/// Weighted quorum: the job must stay Submitted until the accumulated weight
+/// of approving evaluators reaches `weight_threshold`, then settle 99/1.
+#[test]
+fn weighted_eval_settles_only_when_accumulated_weight_reaches_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, token_client, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    // Lead Auditor (3) + QA Engineer (1) = 4 >= 4, Reviewer (1) is surplus.
+    let id = client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &4u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "weighted 4-of-5"),
+    );
+    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
+
+    // QA Engineer alone (weight 1) is not enough.
+    assert_eq!(client.approve_job(&evaluators.get(1).unwrap(), &id), 1);
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Submitted);
+    assert_eq!(token_client.balance(&provider), 0);
+
+    // Reviewer alone (weight 1) still is not enough: 1 + 1 = 2 < 4.
+    assert_eq!(client.approve_job(&evaluators.get(2).unwrap(), &id), 2);
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Submitted);
+    assert_eq!(token_client.balance(&provider), 0);
+
+    // Lead Auditor (weight 3) pushes the total to 5 >= 4 → auto-complete.
+    assert_eq!(client.approve_job(&evaluators.get(0).unwrap(), &id), 5);
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
+    assert_eq!(token_client.balance(&provider), 99_000);
+    assert_eq!(token_client.balance(&treasury), 1_000);
+    assert_eq!(token_client.balance(&client.address), 0);
+}
+
+/// A single high-weight evaluator can carry the quorum on their own.
+#[test]
+fn weighted_eval_lead_auditor_alone_meets_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, token_client, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    let id = client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &3u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "lead auditor carries quorum"),
+    );
+    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
+
+    assert_eq!(client.approve_job(&evaluators.get(0).unwrap(), &id), 3);
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
+    assert_eq!(token_client.balance(&provider), 99_000);
+    assert_eq!(token_client.balance(&treasury), 1_000);
+}
+
+/// Job creation must reject a weight threshold that exceeds the sum of all
+/// evaluator weights, since the quorum could never be reached.
+#[test]
+#[should_panic(expected = "invalid weight threshold")]
+fn weighted_eval_rejects_threshold_above_total_weight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    // Total weight is 5; a threshold of 6 is unreachable.
+    client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &6u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "unreachable quorum"),
+    );
+}
+
+/// Job creation must reject a zero weight for any evaluator.
+#[test]
+#[should_panic(expected = "evaluator weight must be positive")]
+fn weighted_eval_rejects_zero_weight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let evaluators = Vec::from_array(
+        &env,
+        [Address::generate(&env), Address::generate(&env)],
+    );
+    let weights = Vec::from_array(&env, [3u32, 0u32]);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &3u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "zero weight"),
+    );
+}
+
+/// Job creation must reject mismatched evaluator/weight vector lengths.
+#[test]
+#[should_panic(expected = "evaluator weight length mismatch")]
+fn weighted_eval_rejects_mismatched_weight_length() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, _) = weighted_evaluators(&env);
+    let weights = Vec::from_array(&env, [3u32, 1u32]);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &3u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "mismatched weights"),
+    );
+}
+
+/// A repeated approval from the same evaluator must not double-count weight.
+#[test]
+#[should_panic(expected = "evaluator already approved")]
+fn weighted_eval_rejects_duplicate_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    let id = client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &5u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "no double counting"),
+    );
+    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
+
+    let lead = evaluators.get(0).unwrap();
+    assert_eq!(client.approve_job(&lead, &id), 3);
+    // Second approval from the same address must panic rather than adding
+    // another 3 to the accumulated weight.
+    client.approve_job(&lead, &id);
+}
+
+/// An address that is not part of the weighted evaluator set cannot approve.
+#[test]
+#[should_panic(expected = "not an assigned evaluator")]
+fn weighted_eval_rejects_non_member_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    let id = client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &4u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "members only"),
+    );
+    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
+
+    client.approve_job(&outsider, &id);
+}
+
+/// Approval before the provider submits must be rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn weighted_eval_rejects_approval_before_submission() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    let id = client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &4u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "approve too early"),
+    );
+
+    // Job is still Funded — approval must panic with InvalidStatus (#4).
+    client.approve_job(&evaluators.get(0).unwrap(), &id);
+}
+
+/// Weighted jobs cannot be settled through the single-evaluator complete().
+#[test]
+#[should_panic(expected = "multi-evaluator job requires approvals")]
+fn weighted_eval_job_cannot_use_single_evaluator_complete() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (evaluators, weights) = weighted_evaluators(&env);
+    let (token, _, asset) = deploy_token(&env, &admin);
+    asset.mint(&buyer, &1_000_000);
+
+    let id = client.create_job_weighted_eval(
+        &buyer,
+        &provider,
+        &evaluators,
+        &weights,
+        &4u32,
+        &token,
+        &100_000,
+        &String::from_str(&env, "weighted quorum required"),
+    );
+    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
+
+    client.complete(&evaluators.get(0).unwrap(), &id);
+}

@@ -48,6 +48,21 @@ echo "==> Building + optimizing Soroban contracts (wasm32-unknown-unknown, relea
 # `stellar contract optimize` command in stellar-cli 25.x.
 stellar contract build --optimize
 
+echo "==> Generating Python client from Soroban contract specs"
+if ! command -v python3 &> /dev/null; then
+  echo "WARNING: python3 not found; skipping Python client generation."
+  echo "         Install Python 3 to regenerate python/marc_stellar/ clients."
+elif [ ! -f scripts/generate-python-client.py ]; then
+  echo "WARNING: scripts/generate-python-client.py not found; skipping Python client generation."
+else
+  if python3 scripts/generate-python-client.py; then
+    echo "==> Python client generated successfully"
+  else
+    echo "WARNING: Python client generation failed; continuing build."
+    echo "         Ensure the generator's dependencies are installed (e.g. pip install -r python/requirements.txt)."
+  fi
+fi
+
 echo "==> Building SDK (TypeScript)"
 ( cd sdk && npm run build )
 

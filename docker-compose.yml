@@ -19,13 +19,11 @@ version: "3.9"
 #   buyer         interactive Blessed TUI (healthcheck port 4550, stdin required)
 
 x-node: &node
-  image: node:22-slim
   working_dir: /app
-  volumes:
-    - .:/app
   env_file: ${ENV_FILE:-.env}
   networks:
     - marc-net
+  user: nonroot
 
 services:
   soroban-rpc:
@@ -53,11 +51,10 @@ services:
   # ── Web Dashboard ──────────────────────────────────────────────────────────
   dashboard:
     <<: *node
-    working_dir: /app/dashboard
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx server.ts
-    "
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    working_dir: /app
     ports:
       - "3000:3000"
     depends_on:
@@ -69,11 +66,10 @@ services:
   # ── Agent Registry ────────────────────────────────────────────────────────
   registry:
     <<: *node
-    working_dir: /app/agents/registry
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx server.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/registry/Dockerfile
+    working_dir: /app
     ports:
       - "4500:4500"
     healthcheck:
@@ -88,11 +84,10 @@ services:
   # ── Seller Agents ─────────────────────────────────────────────────────────
   seller-webbuilder:
     <<: *node
-    working_dir: /app/agents/seller-webbuilder
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-webbuilder/Dockerfile
+    working_dir: /app
     ports:
       - "4501:4501"
     healthcheck:
@@ -109,11 +104,10 @@ services:
 
   seller-copywriter:
     <<: *node
-    working_dir: /app/agents/seller-copywriter
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-copywriter/Dockerfile
+    working_dir: /app
     ports:
       - "4502:4502"
     healthcheck:
@@ -130,11 +124,10 @@ services:
 
   seller-namer:
     <<: *node
-    working_dir: /app/agents/seller-namer
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-namer/Dockerfile
+    working_dir: /app
     ports:
       - "4503:4503"
     healthcheck:
@@ -151,11 +144,10 @@ services:
 
   seller-researcher:
     <<: *node
-    working_dir: /app/agents/seller-researcher
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-researcher/Dockerfile
+    working_dir: /app
     ports:
       - "4504:4504"
     healthcheck:
@@ -173,11 +165,10 @@ services:
   # ── Soroban Event Indexer ─────────────────────────────────────────────────
   indexer:
     <<: *node
-    working_dir: /app/indexer
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx src/index.ts
-    "
+    build:
+      context: .
+      dockerfile: indexer/Dockerfile
+    working_dir: /app
     depends_on:
       sdk:
         condition: service_completed_successfully
@@ -187,11 +178,10 @@ services:
   # ── Buyer TUI (interactive) ───────────────────────────────────────────────
   buyer:
     <<: *node
-    working_dir: /app/agents/buyer
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/buyer/Dockerfile
+    working_dir: /app
     ports:
       - "4550:4550"
     healthcheck:
