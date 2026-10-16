@@ -1257,3 +1257,278 @@ fn channel_cannot_be_force_closed_before_challenge_period() {
 
     client.force_close(&payer, &channel_id);
 }
+
+// ===========================================================================
+// #698 — atomic batch job creation
+// ===========================================================================
+
+/// Build a single `JobRequest` for the batch tests.
+fn job_request(
+    env: &Env,
+    provider: &Address,
+    evaluator: &Address,
+    token: &Address,
+    budget: i128,
+    description: &str,
+) -> JobRequest {
+    JobRequest {
+        provider: provider.clone(),
+        evaluator: evaluator.clone(),
+        token: token.clone(),
+        budget,
+        description: String::from_str(env, description),
+    }
+}
+
+/// A batch of 5 concurrent worker agents must be escrowed atomically with a
+/// single aggregated token transfer from the client into the contract.
+#[test]
+fn batch_create_jobs_funds_five_workers_with_single_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let per_job: i128 = 10_000;
+    let mut requests = Vec::new(&env);
+    for _ in 0..5 {
+        requests.push_back(job_request(
+            &env,
+            &Address::generate(&env),
+            &buyer,
+            &token_addr,
+            per_job,
+            "worker task",
+        ));
+    }
+
+    let job_ids = client.batch_create_jobs(&buyer, &requests);
+
+    // 5 sequential ids starting at 1.
+    assert_eq!(job_ids.len(), 5);
+    for (i, id) in job_ids.iter().enumerate() {
+        assert_eq!(id, (i as u64) + 1);
+    }
+
+    // Every job is persisted and Funded.
+    for id in job_ids.iter() {
+        let job = client.get_job(&id).unwrap();
+        assert_eq!(job.status, JobStatus::Funded);
+        assert_eq!(job.budget, per_job);
+        assert_eq!(job.client, buyer);
+    }
+
+    // Exactly one aggregated transfer: buyer debited the summed budget once.
+    let total = per_job * 5;
+    assert_eq!(token.balance(&buyer), 1_000_000 - total);
+    assert_eq!(token.balance(&client.address), total);
+}
+
+/// The `BatchJobsCreated` event must carry the assigned job ids.
+#[test]
+fn batch_create_jobs_emits_batch_jobs_created_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let mut requests = Vec::new(&env);
+    for _ in 0..3 {
+        requests.push_back(job_request(
+            &env,
+            &Address::generate(&env),
+            &buyer,
+            &token_addr,
+            1_000,
+            "task",
+        ));
+    }
+
+    let job_ids = client.batch_create_jobs(&buyer, &requests);
+
+    let expected_event = BatchJobsCreated {
+        client: buyer.clone(),
+        job_ids: job_ids.clone(),
+    };
+    let all_events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(
+        all_events.events().last().unwrap().clone(),
+        expected_event.to_xdr(&env, &client.address),
+    );
+}
+
+/// If the client cannot cover the aggregate budget the whole batch reverts and
+/// no jobs are stored.
+#[test]
+#[should_panic]
+fn batch_create_jobs_reverts_when_balance_insufficient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    // Only enough for 2 of the 5 requested jobs.
+    stellar_token.mint(&buyer, &20_000);
+
+    let mut requests = Vec::new(&env);
+    for _ in 0..5 {
+        requests.push_back(job_request(
+            &env,
+            &Address::generate(&env),
+            &buyer,
+            &token_addr,
+            10_000,
+            "task",
+        ));
+    }
+
+    client.batch_create_jobs(&buyer, &requests);
+}
+
+/// A batch larger than the 10-job cap must be rejected outright.
+#[test]
+#[should_panic]
+fn batch_create_jobs_rejects_more_than_ten_jobs() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let mut requests = Vec::new(&env);
+    for _ in 0..11 {
+        requests.push_back(job_request(
+            &env,
+            &Address::generate(&env),
+            &buyer,
+            &token_addr,
+            1_000,
+            "task",
+        ));
+    }
+
+    client.batch_create_jobs(&buyer, &requests);
+}
+
+/// An empty batch is a no-op that must be rejected.
+#[test]
+#[should_panic]
+fn batch_create_jobs_rejects_empty_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let requests: Vec<JobRequest> = Vec::new(&env);
+    client.batch_create_jobs(&buyer, &requests);
+}
+
+/// A single self-escrow request (client == provider) reverts the whole batch.
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn batch_create_jobs_reverts_on_self_escrow_request() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let mut requests = Vec::new(&env);
+    requests.push_back(job_request(
+        &env,
+        &Address::generate(&env),
+        &buyer,
+        &token_addr,
+        1_000,
+        "ok",
+    ));
+    // client == provider → SelfEscrow
+    requests.push_back(job_request(&env, &buyer, &buyer, &token_addr, 1_000, "bad"));
+
+    client.batch_create_jobs(&buyer, &requests);
+}
+
+/// A single provider == evaluator request reverts the whole batch.
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn batch_create_jobs_reverts_on_provider_as_evaluator_request() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let bad_provider = Address::generate(&env);
+    let mut requests = Vec::new(&env);
+    requests.push_back(job_request(
+        &env,
+        &Address::generate(&env),
+        &buyer,
+        &token_addr,
+        1_000,
+        "ok",
+    ));
+    // provider == evaluator → InvalidParties
+    requests.push_back(job_request(
+        &env,
+        &bad_provider,
+        &bad_provider,
+        &token_addr,
+        1_000,
+        "bad",
+    ));
+
+    client.batch_create_jobs(&buyer, &requests);
+}
+
+/// A request referencing an unsupported token reverts the whole batch.
+#[test]
+#[should_panic]
+fn batch_create_jobs_reverts_on_unsupported_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    // A token contract that was never registered/allow-listed.
+    let bogus_token = Address::generate(&env);
+
+    let mut requests = Vec::new(&env);
+    requests.push_back(job_request(
+        &env,
+        &Address::generate(&env),
+        &buyer,
+        &token_addr,
+        1_000,
+        "ok",
+    ));
+    requests.push_back(job_request(
+        &env,
+        &Address::generate(&env),
+        &buyer,
+        &bogus_token,
+        1_000,
+        "bad",
+    ));
+
+    client.batch_create_jobs(&buyer, &requests);
+}

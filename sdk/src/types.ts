@@ -420,3 +420,50 @@ export interface MilestoneInput {
   amount: bigint;
   description: string;
 }
+
+// ---------------------------------------------------------------------------
+// #698 — Atomic batch job creation (SDK mirror of Rust structs)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single job request within a batch submission (#698).
+ *
+ * Mirrors the `JobRequest` contracttype struct in
+ * `contracts/agentic-commerce/src/lib.rs`. The `client` is intentionally
+ * omitted: it is the transaction signer and is shared across every request
+ * in the batch, so it is supplied once to `batchCreateJobs()`.
+ *
+ * @example
+ * ```typescript
+ * const requests: JobRequest[] = [
+ *   { provider: namer, evaluator, token: usdc, budget: 5_000_000n, description: "Name the product" },
+ *   { provider: researcher, evaluator, token: usdc, budget: 8_000_000n, description: "Market research" },
+ * ];
+ * const jobIds = await commerce.batchCreateJobs(clientKeypair, requests);
+ * ```
+ */
+export interface JobRequest {
+  /** The service provider (deliverable submitter). */
+  provider: Address;
+  /** The evaluator (approves completion and triggers payout). */
+  evaluator: Address;
+  /** Token contract address (e.g., USDC SAC). */
+  token: Address;
+  /** Budget amount in smallest token units. */
+  budget: bigint;
+  /** Human-readable job description. */
+  description: string;
+}
+
+/**
+ * Payload emitted by the `batch_jobs_created` contract event (#698).
+ *
+ * Contains the client that funded the batch and the job IDs assigned to each
+ * request, in the same order the requests were supplied.
+ */
+export interface BatchJobsCreatedEvent {
+  /** The client (batch creator and budget owner). */
+  client: Address;
+  /** Assigned job IDs, ordered to match the submitted `JobRequest[]`. */
+  jobIds: bigint[];
+}

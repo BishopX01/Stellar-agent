@@ -767,3 +767,193 @@ fn upgrade_panics_when_not_initialized() {
     let fake_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
     client.upgrade(&admin, &fake_hash);
 }
+
+// ===========================================================================
+// #701 — capability badge / verifiable credential tests
+// ===========================================================================
+
+/// (1) An authorized issuer can mint a badge and it is retrievable via
+/// get_badges() while still active.
+#[test]
+fn issue_badge_stores_and_get_badges_returns_active_badge() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+
+    let badges = client.get_badges(&agent_id);
+    assert_eq!(badges.len(), 1);
+    let badge = badges.get(0).unwrap();
+    assert_eq!(badge.issuer, issuer);
+    assert_eq!(badge.tag, tag);
+    assert_eq!(badge.score, 95u32);
+    assert_eq!(badge.issued_at, env.ledger().timestamp());
+    assert_eq!(badge.expires_at, env.ledger().timestamp() + 1_000u64);
+}
+
+/// (2) A caller that is not the issuer cannot mint a badge on behalf of
+/// another address — auth is required from the issuer.
+#[test]
+#[should_panic]
+fn issue_badge_requires_issuer_auth() {
+    let env = Env::default();
+    // NOTE: mock_all_auths() intentionally omitted so require_auth() is enforced.
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+}
+
+/// (3) get_badges() must exclude credentials whose expires_at has passed.
+#[test]
+fn get_badges_excludes_expired_credentials() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    // Issue a badge that expires in 100 seconds.
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &100u64);
+    assert_eq!(client.get_badges(&agent_id).len(), 1);
+
+    // Advance the ledger past the expiry.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 200);
+
+    assert_eq!(client.get_badges(&agent_id).len(), 0);
+}
+
+/// (4a) revoke_badge() removes a previously issued badge.
+#[test]
+fn revoke_badge_removes_badge() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+    assert_eq!(client.get_badges(&agent_id).len(), 1);
+
+    client.revoke_badge(&issuer, &agent_id, &tag);
+    assert_eq!(client.get_badges(&agent_id).len(), 0);
+}
+
+/// (4b) Only the original issuer may revoke a badge.
+#[test]
+#[should_panic]
+fn revoke_badge_rejects_non_issuer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let mallory = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+
+    // mallory is not the issuer — must panic.
+    client.revoke_badge(&mallory, &agent_id, &tag);
+}
+
+/// (5) Deregistering an agent must archive/remove its associated badges so
+/// they are no longer returned by get_badges().
+#[test]
+fn deregister_removes_associated_badges() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+    assert_eq!(client.get_badges(&agent_id).len(), 1);
+
+    client.deregister(&alice, &agent_id);
+
+    // Badges must no longer be retrievable for the deregistered agent.
+    assert_eq!(client.get_badges(&agent_id).len(), 0);
+}
+
+/// (6a) issue_badge() emits a BadgeIssued event.
+#[test]
+fn issue_badge_emits_badge_issued_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+
+    let expected_event = BadgeIssued {
+        issuer: issuer.clone(),
+        agent_id,
+        tag: tag.clone(),
+        score: 95u32,
+        expires_at: env.ledger().timestamp() + 1_000u64,
+    };
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        [expected_event.to_xdr(&env, &contract_id)],
+    );
+}
+
+/// (6b) revoke_badge() emits a BadgeRevoked event.
+#[test]
+fn revoke_badge_emits_badge_revoked_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+
+    let tag = Symbol::new(&env, "audit");
+    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
+    client.revoke_badge(&issuer, &agent_id, &tag);
+
+    let expected_event = BadgeRevoked {
+        issuer: issuer.clone(),
+        agent_id,
+        tag: tag.clone(),
+    };
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        [expected_event.to_xdr(&env, &contract_id)],
+    );
+}

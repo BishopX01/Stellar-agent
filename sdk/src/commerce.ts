@@ -30,6 +30,28 @@ export interface EvaluatorProgress {
   approvals: number;
 }
 
+/**
+ * A single job definition for {@link CommerceClient.batchCreateJobs}.
+ *
+ * Mirrors the on-chain `JobRequest` struct consumed by the contract's
+ * `batch_create_jobs` entry point.
+ */
+export interface JobRequest {
+  /** The service provider's Stellar address (G...). */
+  provider: string;
+  /** The evaluator's Stellar address (G...). */
+  evaluator: string;
+  /** The token contract address (C...) used for payment. */
+  token: string;
+  /** The escrow amount in the token's smallest unit. Must be > 0 and fit in an i128. */
+  budget: bigint;
+  /** Human-readable description of the work to be done. */
+  description: string;
+}
+
+/** Maximum number of jobs accepted by a single `batch_create_jobs` invocation. */
+export const MAX_BATCH_JOBS = 10;
+
 const MAX_I128 = (1n << 127n) - 1n;
 
 // --- ScVal encoding helpers (exported for custom contract interactions) ---
@@ -224,6 +246,71 @@ export class CommerceClient extends BaseClient {
       (v) => BigInt(scValToNative(v) as string),
       "commerce",
       options,
+    );
+  }
+
+  /**
+   * Create multiple funded escrow jobs in a single atomic transaction.
+   *
+   * Escrows the aggregated budget for every request in one `batch_create_jobs`
+   * invocation, so agent orchestrators can fund a swarm of specialized worker
+   * agents without paying N base fees or risking partial failure. If any single
+   * job creation fails (e.g. insufficient token allowance), the entire batch
+   * reverts.
+   *
+   * @param client - The client's Signer. Funds are pulled from this account.
+   * @param requests - Between 1 and {@link MAX_BATCH_JOBS} job definitions.
+   * @returns The assigned on-chain job IDs, in the same order as `requests`.
+   * @throws {Error} If `requests` is empty, exceeds {@link MAX_BATCH_JOBS}, or any
+   *                 entry has a non-positive or out-of-range budget.
+   *
+   * @example
+   * ```typescript
+   * const jobIds = await commerce.batchCreateJobs(clientKeypair, [
+   *   { provider: namer, evaluator, token: TESTNET.usdcToken, budget: 5_000_000n, description: "Name the product" },
+   *   { provider: researcher, evaluator, token: TESTNET.usdcToken, budget: 8_000_000n, description: "Market research" },
+   * ]);
+   * ```
+   */
+  async batchCreateJobs(client: Signer, requests: JobRequest[]): Promise<bigint[]> {
+    if (requests.length === 0) throw new Error("requests must contain at least one job");
+    if (requests.length > MAX_BATCH_JOBS) {
+      throw new Error(`requests must contain at most ${MAX_BATCH_JOBS} jobs`);
+    }
+    for (const request of requests) {
+      if (request.budget <= 0n) throw new Error("budget must be greater than 0");
+      if (request.budget > MAX_I128) throw new Error("budget exceeds i128 max");
+    }
+
+    const requestsScVal = xdr.ScVal.scvVec(
+      requests.map((request) =>
+        nativeToScVal(
+          {
+            provider: new Address(request.provider).toScVal(),
+            evaluator: new Address(request.evaluator).toScVal(),
+            token: new Address(request.token).toScVal(),
+            budget: nativeToScVal(request.budget, { type: "i128" }),
+            description: nativeToScVal(request.description, { type: "string" }),
+          },
+          { type: "map" },
+        ),
+      ),
+    );
+
+    const op = this.contract.call(
+      "batch_create_jobs",
+      new Address(signerPublicKey(client)).toScVal(),
+      requestsScVal,
+    );
+    return await this.invoke(
+      client,
+      op,
+      (v) => {
+        const native = scValToNative(v);
+        if (!Array.isArray(native)) return [];
+        return native.map((id) => BigInt(id as string));
+      },
+      "commerce",
     );
   }
 

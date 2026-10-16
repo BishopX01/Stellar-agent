@@ -297,6 +297,33 @@ export class IdentityClient extends BaseClient {
     return await this.simulate(op, (v) => Number(scValToNative(v)));
   }
 
+  /**
+   * Fetch the capability badges (verified credentials) attached to an agent.
+   *
+   * Badges are stored on the identity contract and represent verified
+   * capabilities (e.g. `"code-review"`, `"translation"`) that buyers and the
+   * dashboard can display. Returns an empty array when the agent has no badges
+   * or does not exist, so callers can safely iterate without null checks.
+   *
+   * @param agentId - The agent's unique on-chain identifier.
+   * @returns An array of badge identifier strings, in contract-stored order.
+   * @throws {Error} On RPC/network failure.
+   *
+   * @example
+   * ```typescript
+   * const badges = await identity.getBadges(42n);
+   * console.log("Verified capabilities:", badges);
+   * ```
+   */
+  async getBadges(agentId: bigint): Promise<string[]> {
+    const op = this.contract.call("get_badges", nativeToScVal(agentId, { type: "u64" }));
+    return await this.simulate(op, (v) => {
+      const native = scValToNative(v);
+      if (native == null) return [];
+      return (native as unknown[]).map((b) => String(b));
+    });
+  }
+
   // -------------------------------------------------------------------------
   // #696 — Delegate / WebAuthn session key management
   // -------------------------------------------------------------------------
