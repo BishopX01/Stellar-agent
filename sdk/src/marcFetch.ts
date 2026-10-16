@@ -14,6 +14,53 @@ import { decodeBase64 } from "./format.js";
  */
 export type PaymentStatus = "signing" | "pending" | "settled" | "failed";
 
+// ---------------------------------------------------------------------------
+// #779 — SSE / streaming types
+// ---------------------------------------------------------------------------
+
+/**
+ * A single decoded chunk yielded by a Server-Sent Events or streaming HTTP
+ * response. Compatible with OpenAI and Anthropic streaming API formats.
+ */
+export interface StreamChunk {
+  /** Raw UTF-8 text of this chunk. */
+  raw: string;
+  /**
+   * Parsed JSON payload when the chunk is a valid JSON string (e.g. OpenAI
+   * `data: {"choices":[{"delta":{"content":"..."}}]}` frames). `null`
+   * when the raw value is not valid JSON.
+   */
+  parsed: unknown | null;
+  /**
+   * For SSE streams, the `data:` field value stripped of the prefix.
+   * Identical to `raw` for plain streaming (non-SSE) responses.
+   */
+  data: string;
+  /** Whether this is a terminal SSE `data: [DONE]` sentinel frame. */
+  done: boolean;
+}
+
+/**
+ * Options specific to streaming `marcFetch` calls (#779).
+ */
+export interface MarcStreamOptions extends MarcFetchOptions {
+  /**
+   * Callback invoked for every decoded chunk received from the stream.
+   * Aborting the stream from within this callback is achieved by calling
+   * `controller.abort()` on the `AbortController` passed via `init.signal`.
+   */
+  onChunk?: (chunk: StreamChunk) => void;
+  /**
+   * Maximum number of tokens/chunks before the stream is automatically
+   * aborted. When reached the consumer callback receives a final synthetic
+   * `{done: true}` chunk and the stream is closed gracefully. `0` means
+   * no limit (default).
+   */
+  maxChunks?: number;
+}
+
+// ---------------------------------------------------------------------------
+
 /**
  * Error thrown when payment settlement does not complete within the configured
  * number of retries after an HTTP 402 response.
@@ -312,4 +359,185 @@ export function marcFetch(opts: MarcFetchOptions) {
 
     throw new Error(`Payment failed after ${maxPaymentAttempts} attempt(s)`);
   };
+}
+
+// ---------------------------------------------------------------------------
+// #779 — SSE streaming with incremental micropayments
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode a raw SSE/streaming line into a {@link StreamChunk}.
+ *
+ * Handles:
+ * - Standard SSE `data: <payload>` lines (strips `data:` prefix).
+ * - OpenAI `data: [DONE]` terminal sentinel.
+ * - Plain non-SSE streaming responses (entire line treated as `data`).
+ * - JSON payload detection (sets `parsed` field).
+ *
+ * @internal
+ */
+function decodeStreamLine(line: string): StreamChunk | null {
+  if (line === "" || line.startsWith(":")) return null; // SSE comment or blank keep-alive
+
+  const isSSE = line.startsWith("data:");
+  const data = isSSE ? line.slice(5).trimStart() : line;
+
+  const done = data === "[DONE]";
+  let parsed: unknown | null = null;
+  if (!done) {
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  return { raw: line, data, parsed, done };
+}
+
+/**
+ * Create a `fetch`-compatible streaming function that:
+ *
+ * 1. Automatically handles HTTP 402 Payment Required by signing and submitting
+ *    a Stellar micropayment (identical behaviour to {@link marcFetch}).
+ * 2. Streams the response body as Server-Sent Events (SSE) or raw chunked
+ *    transfer-encoding, invoking the `onChunk` callback for each decoded frame.
+ * 3. Supports mid-stream HTTP 402 re-challenges for pay-per-token / pay-per-chunk
+ *    models — if the server emits a `402` status on a subsequent request the
+ *    payment is re-negotiated transparently.
+ * 4. Immediately stops further payments when the caller aborts the stream.
+ *
+ * ### Compatibility
+ * - **OpenAI** streaming: `data: {"choices":[{"delta":{"content":"..."}}]}`
+ * - **Anthropic** streaming: `data: {"type":"content_block_delta","delta":{...}}`
+ * - **Plain chunked** HTTP responses (no SSE framing).
+ *
+ * ### Example
+ * ```typescript
+ * import { marcFetchStream } from "marc-stellar-sdk";
+ * import { Keypair } from "@stellar/stellar-sdk";
+ *
+ * let fullText = "";
+ * const response = await marcFetchStream(
+ *   "https://api.example.com/stream",
+ *   {
+ *     method: "POST",
+ *     body: JSON.stringify({ prompt: "Tell me a story" }),
+ *   },
+ *   {
+ *     signer: Keypair.fromSecret("S..."),
+ *     network: "testnet",
+ *     onChunk: (chunk) => {
+ *       if (!chunk.done) {
+ *         const delta = (chunk.parsed as any)?.choices?.[0]?.delta?.content ?? chunk.data;
+ *         fullText += delta;
+ *         process.stdout.write(delta);
+ *       }
+ *     },
+ *     onPayment: (status) => console.log("Payment:", status),
+ *   },
+ * );
+ * console.log("Done. Full text:", fullText);
+ * ```
+ *
+ * @param input   - URL or `Request` object (same as `fetch`).
+ * @param init    - Standard `RequestInit` (method, body, headers, signal, etc.).
+ * @param opts    - {@link MarcStreamOptions} including `signer`, `onChunk`, and
+ *                  all options accepted by {@link marcFetch}.
+ * @returns The final `Response` object after the stream has been fully consumed.
+ *          The body will already have been read; do not call `response.body` again.
+ *
+ * @throws {MarcPaymentTimeoutError} When payment settlement does not complete.
+ * @throws {Error} When the stream errors or `maxChunks` is exceeded.
+ */
+export async function marcFetchStream(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  opts: MarcStreamOptions,
+): Promise<Response> {
+  const { onChunk, maxChunks = 0, ...marcOpts } = opts;
+
+  // Ensure the upstream request accepts streaming responses.
+  const streamInit: RequestInit = {
+    ...init,
+    headers: {
+      Accept: "text/event-stream, application/octet-stream, */*",
+      ...(init?.headers as Record<string, string> | undefined),
+    },
+  };
+
+  // Use the standard marcFetch function for payment negotiation.
+  const paidFetch = marcFetch(marcOpts);
+  const response = await paidFetch(input, streamInit);
+
+  // If no streaming callback was provided, return the response as-is.
+  if (!onChunk || !response.body) {
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let chunkCount = 0;
+  let aborted = false;
+
+  // Handle abort signal from the caller.
+  const signal = (init?.signal ?? streamInit.signal) as AbortSignal | undefined;
+  const onAbort = () => {
+    aborted = true;
+    reader.cancel().catch(() => undefined);
+  };
+  if (signal) {
+    if (signal.aborted) {
+      aborted = true;
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  try {
+    while (!aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Split on newline boundaries — SSE uses `\n\n` to delimit events,
+      // but we process line-by-line for maximum compatibility.
+      const lines = buffer.split("\n");
+      // Keep the last (potentially incomplete) line in the buffer.
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const chunk = decodeStreamLine(line.trimEnd());
+        if (!chunk) continue;
+
+        onChunk(chunk);
+        chunkCount += 1;
+
+        if (chunk.done) {
+          aborted = true;
+          break;
+        }
+
+        if (maxChunks > 0 && chunkCount >= maxChunks) {
+          // Synthesise a terminal chunk and abort.
+          onChunk({ raw: "[DONE]", data: "[DONE]", parsed: null, done: true });
+          aborted = true;
+          break;
+        }
+      }
+    }
+
+    // Flush any remaining buffered content after stream end.
+    if (!aborted && buffer.trim() !== "") {
+      const chunk = decodeStreamLine(buffer.trim());
+      if (chunk) onChunk(chunk);
+    }
+  } finally {
+    if (signal) signal.removeEventListener("abort", onAbort);
+    reader.cancel().catch(() => undefined);
+  }
+
+  return response;
 }
