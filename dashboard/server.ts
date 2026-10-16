@@ -45,17 +45,110 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-// CSP is disabled: the dashboard loads the wallet-kit bundle from a CDN and
-// fonts from Google Fonts, which helmet's default script-src/style-src would block.
-app.use(helmet({ contentSecurityPolicy: false }));
+
+// ── #778: Strict Content Security Policy with per-request nonces ─────────────
+// Generate a fresh cryptographic nonce for every request. The nonce is stored
+// on res.locals so route handlers and the HTML-injection middleware can read it.
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.locals.cspNonce = crypto.randomBytes(16).toString("base64");
+  next();
+});
+
+// Stellar RPC, Horizon, and IPFS gateway endpoints allowed in connect-src.
+const STELLAR_CONNECT_SRCS = [
+  "https://soroban-testnet.stellar.org",
+  "https://soroban-rpc.mainnet.stellar.org",
+  "https://horizon-testnet.stellar.org",
+  "https://horizon.stellar.org",
+  "https://ipfs.io",
+  "https://cloudflare-ipfs.com",
+  "https://dweb.link",
+  "https://channels.openzeppelin.com",
+];
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          // Nonce allows the inline theme-init script and any scripts we explicitly
+          // tag; the function below is called by helmet per-request.
+          // helmet calls this with (IncomingMessage, ServerResponse); Express augments
+          // ServerResponse with .locals, so we cast to access the nonce.
+          (_req, res) => `'nonce-${(res as unknown as Response).locals.cspNonce}'`,
+          // Stellar Wallets Kit UMD bundle served from jsdelivr CDN.
+          "https://cdn.jsdelivr.net",
+          "https://unpkg.com",
+        ],
+        styleSrc: [
+          "'self'",
+          (_req, res) => `'nonce-${(res as unknown as Response).locals.cspNonce}'`,
+          "https://fonts.googleapis.com",
+        ],
+        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", ...STELLAR_CONNECT_SRCS, "wss:"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        upgradeInsecureRequests: [],
+      },
+    },
+    // Keep other helmet defaults: HSTS, X-Frame-Options, etc.
+    crossOriginEmbedderPolicy: false, // required for Freighter wallet extension
+  }),
+);
 app.use(express.json());
 
 // Landing page at root
 const landingDir = path.join(__dirname, "..", "landing");
 app.use(express.static(landingDir));
 
-// Dashboard at /app
+// Dashboard at /app — serve static files then inject nonce into HTML responses
+// so the browser accepts the CDN script tag in index.html.
 app.use("/app", express.static(path.join(__dirname, "public")));
+
+// Nonce injection middleware: intercepts HTML responses served from /app and
+// rewrites the CDN <script> and Google Fonts <link> tags to include the nonce.
+// This is the standard approach for static-file CSP without a build step.
+app.use("/app", (_req: Request, res: Response, next: NextFunction) => {
+  const nonce = res.locals.cspNonce as string;
+  const originalSend = res.send.bind(res);
+  res.send = function (body: unknown) {
+    if (
+      typeof body === "string" &&
+      res.getHeader("Content-Type")?.toString().includes("text/html")
+    ) {
+      // Add nonce to the wallet-kit CDN script tag
+      let html = body as string;
+      html = html.replace(
+        /<script src="https:\/\/cdn\.jsdelivr\.net/g,
+        `<script nonce="${nonce}" src="https://cdn.jsdelivr.net`,
+      );
+      // Add nonce to local app.js script tag
+      html = html.replace(
+        /<script src="app\.js"/g,
+        `<script nonce="${nonce}" src="app.js"`,
+      );
+      // Add nonce to Google Fonts link tags
+      html = html.replace(
+        /<link\s+(rel="preconnect"\s+href="https:\/\/fonts\.(googleapis|gstatic)\.com[^>]*)>/g,
+        (_match: string, attrs: string) => `<link ${attrs} nonce="${nonce}">`,
+      );
+      html = html.replace(
+        /<link\s+(href="https:\/\/fonts\.googleapis\.com[^>]*)>/g,
+        (_match: string, attrs: string) => `<link ${attrs} nonce="${nonce}">`,
+      );
+      return originalSend(html);
+    }
+    return originalSend(body);
+  };
+  next();
+});
 
 const server = new rpc.Server(cfg.rpcUrl, {
   allowHttp: cfg.rpcUrl.startsWith("http://"),

@@ -73,3 +73,11 @@ export { RpcFailoverPool, type RpcEndpointHealth } from "./baseClient.js";
  * ```
  */
 export const MARC_STELLAR_SDK_VERSION = "0.1.0";
+
+// #694 — whitelisted token addresses on testnet
+export const TESTNET_ALLOWED_TOKENS = {
+  USDC: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+  // Add EURC and XLM SAC when deployed
+} as const;
+
+export type { Milestone, MilestoneInput } from './types.js';

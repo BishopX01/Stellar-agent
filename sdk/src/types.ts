@@ -397,3 +397,26 @@ export function isJobTerminal(status: JobStatus): boolean {
 export function isJobActive(status: JobStatus): boolean {
   return !isJobTerminal(status);
 }
+
+/**
+ * A single milestone within a milestone-based escrow job.
+ * Mirrors the Rust `Milestone` contracttype struct in `agentic-commerce`.
+ */
+export interface Milestone {
+  /** Zero-based position within the job's milestone sequence. */
+  index: number;
+  /** Allocated amount for this milestone in smallest token units. */
+  amount: bigint;
+  /** Human-readable description of this milestone's deliverable. */
+  description: string;
+  /** Submitted deliverable URI (empty string until submitted). */
+  deliverable: string;
+  /** Whether the evaluator has approved this milestone. */
+  approved: boolean;
+}
+
+/** Input shape for creating a milestone job (pre-normalisation). */
+export interface MilestoneInput {
+  amount: bigint;
+  description: string;
+}
