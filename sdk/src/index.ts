@@ -2,6 +2,12 @@ export * from "./types.js";
 export * from "./events.js";
 export * from "./errors.js";
 export { formatAmount, parseAmount, isValidMetadataUri } from "./format.js";
+// #706 — SHA-256 deliverable payload content hash helpers
+export {
+  computeDeliverableHash,
+  verifyDeliverableHash,
+  type DeliverableHashInput,
+} from "./deliverableHash.js";
 export { IdentityClient } from "./identity.js";
 export { CommerceClient } from "./commerce.js";
 export type {

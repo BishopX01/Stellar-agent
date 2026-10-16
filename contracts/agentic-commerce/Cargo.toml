@@ -15,4 +15,13 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [features]
+# `testutils` exposes test-only helpers (e.g. `Env::default()`, `Address::generate`,
+# `BytesN` construction utilities) used by unit tests and by the cargo-fuzz targets
+# in `contracts/fuzz/`. The fuzz crate depends on this contract with
+# `features = ["testutils"]` so it can drive `create_job()`, `submit()`, and
+# voucher verification without a live network.
+#
+# No new external crates are required for the SHA-256 deliverable content hash:
+# `soroban_sdk::BytesN<32>` is provided by `soroban-sdk` and is used directly in
+# `submit()` / `complete()`.
 testutils = ["soroban-sdk/testutils"]

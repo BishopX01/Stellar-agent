@@ -85,6 +85,66 @@ export const strToScVal = (v: string) => nativeToScVal(v, { type: "string" });
  */
 export const addrToScVal = (v: string) => new Address(v).toScVal();
 
+/**
+ * Encode a 32-byte hash (or any byte buffer) as a Soroban `BytesN<32>` ScVal.
+ *
+ * @param v - The raw bytes to encode. Must be exactly 32 bytes for `BytesN<32>`.
+ * @returns An XDR ScVal of type `bytes`.
+ */
+export const bytesToScVal = (v: Uint8Array) => nativeToScVal(v, { type: "bytes" });
+
+/**
+ * Encode a 32-byte SHA-256 digest as a Soroban `BytesN<32>` ScVal.
+ *
+ * @param v - The 32-byte digest to encode.
+ * @returns An XDR ScVal of type `bytes`.
+ * @throws {Error} If `v` is not exactly 32 bytes.
+ */
+export const sha256ToScVal = (v: Uint8Array) => {
+  if (v.length !== 32) throw new Error("SHA-256 hash must be exactly 32 bytes");
+  return nativeToScVal(v, { type: "bytes" });
+};
+
+/**
+ * Compute the SHA-256 digest of a deliverable payload.
+ *
+ * Uses the Web Crypto API (`crypto.subtle.digest`) when available (browsers,
+ * Deno, modern Node) and falls back to `node:crypto` otherwise. Accepts either
+ * a `Uint8Array`/`ArrayBuffer` buffer or a UTF-8 string, which is encoded
+ * before hashing.
+ *
+ * @param payload - The deliverable content to hash (buffer or string).
+ * @returns A promise resolving to the 32-byte SHA-256 digest.
+ *
+ * @example
+ * ```typescript
+ * const hash = await computeDeliverableHash("https://ipfs.io/ipfs/Qm...");
+ * await commerce.submit(providerKeypair, jobId, deliverable, hash);
+ * ```
+ */
+export const computeDeliverableHash = async (
+  payload: Uint8Array | ArrayBuffer | string,
+): Promise<Uint8Array> => {
+  let bytes: Uint8Array;
+  if (typeof payload === "string") {
+    bytes = new TextEncoder().encode(payload);
+  } else if (payload instanceof Uint8Array) {
+    bytes = payload;
+  } else {
+    bytes = new Uint8Array(payload);
+  }
+
+  const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle;
+  if (subtle) {
+    const digest = await subtle.digest("SHA-256", bytes);
+    return new Uint8Array(digest);
+  }
+
+  const nodeCrypto = await import("node:crypto");
+  const digest = nodeCrypto.createHash("sha256").update(bytes).digest();
+  return new Uint8Array(digest);
+};
+
 // --- ScVal decoding helpers ---
 
 /**
@@ -546,21 +606,34 @@ export class CommerceClient extends BaseClient {
    * @param jobId - The ID of the job to submit a deliverable for.
    * @param deliverable - URL or content string representing the completed work
    *                      (e.g. an IPFS URL, a raw text summary, or a hosted file link).
+   * @param deliverableHash - Optional 32-byte SHA-256 content hash of the deliverable
+   *                          payload. When omitted, the hash is computed automatically
+   *                          from the `deliverable` string via {@link computeDeliverableHash}.
    * @returns A promise that resolves when the submission is confirmed on-chain.
    * @throws {Error} If the signer is not the assigned provider, the job is not in
-   *                 `Funded` status, or the transaction fails.
+   *                 `Funded` status, the hash is not 32 bytes, or the transaction fails.
    *
    * @example
    * ```typescript
    * await commerce.submit(providerKeypair, jobId, "https://ipfs.io/ipfs/Qm...");
+   * // or with a pre-computed hash of the actual deliverable buffer:
+   * const hash = await computeDeliverableHash(deliverableBuffer);
+   * await commerce.submit(providerKeypair, jobId, "https://ipfs.io/ipfs/Qm...", hash);
    * ```
    */
-  async submit(provider: Signer, jobId: bigint, deliverable: string): Promise<void> {
+  async submit(
+    provider: Signer,
+    jobId: bigint,
+    deliverable: string,
+    deliverableHash?: Uint8Array,
+  ): Promise<void> {
+    const hash = deliverableHash ?? (await computeDeliverableHash(deliverable));
     const op = this.contract.call(
       "submit",
       new Address(signerPublicKey(provider)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
       nativeToScVal(deliverable, { type: "string" }),
+      sha256ToScVal(hash),
     );
     await this.invoke(provider, op, () => undefined, "commerce");
   }
@@ -574,21 +647,34 @@ export class CommerceClient extends BaseClient {
    *
    * @param evaluator - The evaluator's Signer. Must match the job's `evaluator` field.
    * @param jobId - The ID of the job to complete.
+   * @param expectedHash - Optional 32-byte SHA-256 hash the evaluator asserts matches
+   *                       the stored deliverable hash. When provided, the contract
+   *                       rejects the call if it does not match the submitted hash.
    * @returns A promise that resolves when completion and payout are confirmed on-chain.
    * @throws {Error} If the signer is not the assigned evaluator, the job is not in
-   *                 `Submitted` status, or the transaction fails.
+   *                 `Submitted` status, the asserted hash does not match, or the
+   *                 transaction fails.
    *
    * @example
    * ```typescript
    * await commerce.complete(evaluatorKeypair, jobId);
+   * // or attesting to the evaluated content:
+   * await commerce.complete(evaluatorKeypair, jobId, expectedHash);
    * ```
    */
-  async complete(evaluator: Signer, jobId: bigint): Promise<void> {
-    const op = this.contract.call(
-      "complete",
+  async complete(
+    evaluator: Signer,
+    jobId: bigint,
+    expectedHash?: Uint8Array,
+  ): Promise<void> {
+    const args: xdr.ScVal[] = [
       new Address(signerPublicKey(evaluator)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
-    );
+    ];
+    if (expectedHash !== undefined) {
+      args.push(sha256ToScVal(expectedHash));
+    }
+    const op = this.contract.call("complete", ...args);
     await this.invoke(evaluator, op, () => undefined, "commerce");
   }
 
@@ -1033,18 +1119,23 @@ export class CommerceClient extends BaseClient {
    * @param providerAddress - Stellar public key of the provider.
    * @param jobId           - On-chain job ID.
    * @param deliverable     - URL or content string for the completed work.
+   * @param deliverableHash - Optional 32-byte SHA-256 content hash of the deliverable
+   *                          payload. Computed automatically from `deliverable` when omitted.
    * @returns Base64-encoded unsigned Soroban transaction XDR.
    */
   async prepareSubmit(
     providerAddress: string,
     jobId: bigint,
     deliverable: string,
+    deliverableHash?: Uint8Array,
   ): Promise<string> {
+    const hash = deliverableHash ?? (await computeDeliverableHash(deliverable));
     const op = this.contract.call(
       "submit",
       new Address(providerAddress).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
       nativeToScVal(deliverable, { type: "string" }),
+      sha256ToScVal(hash),
     );
 
     return this.rpcCall(async (server) => {
@@ -1067,14 +1158,23 @@ export class CommerceClient extends BaseClient {
    *
    * @param evaluatorAddress - Stellar public key of the evaluator.
    * @param jobId            - On-chain job ID.
+   * @param expectedHash     - Optional 32-byte SHA-256 hash the evaluator asserts
+   *                           matches the stored deliverable hash.
    * @returns Base64-encoded unsigned Soroban transaction XDR.
    */
-  async prepareComplete(evaluatorAddress: string, jobId: bigint): Promise<string> {
-    const op = this.contract.call(
-      "complete",
+  async prepareComplete(
+    evaluatorAddress: string,
+    jobId: bigint,
+    expectedHash?: Uint8Array,
+  ): Promise<string> {
+    const args: xdr.ScVal[] = [
       new Address(evaluatorAddress).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
-    );
+    ];
+    if (expectedHash !== undefined) {
+      args.push(sha256ToScVal(expectedHash));
+    }
+    const op = this.contract.call("complete", ...args);
 
     return this.rpcCall(async (server) => {
       const account = await server.getAccount(evaluatorAddress);
@@ -1196,19 +1296,24 @@ export class CommerceClient extends BaseClient {
    * @param jobId - The milestone job's on-chain ID.
    * @param milestoneIdx - Zero-based index of the milestone to submit.
    * @param deliverable - URI or content string of the completed deliverable.
+   * @param deliverableHash - Optional 32-byte SHA-256 content hash of the deliverable
+   *                          payload. Computed automatically from `deliverable` when omitted.
    */
   async submitMilestone(
     provider: Signer,
     jobId: bigint,
     milestoneIdx: number,
     deliverable: string,
+    deliverableHash?: Uint8Array,
   ): Promise<void> {
+    const hash = deliverableHash ?? (await computeDeliverableHash(deliverable));
     const op = this.contract.call(
       'submit_milestone',
       new Address(signerPublicKey(provider)).toScVal(),
       nativeToScVal(jobId, { type: 'u64' }),
       nativeToScVal(milestoneIdx, { type: 'u32' }),
       nativeToScVal(deliverable, { type: 'string' }),
+      sha256ToScVal(hash),
     );
     await this.invoke(provider, op, () => undefined, 'commerce');
   }

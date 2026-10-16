@@ -1,0 +1,42 @@
+[package]
+name = "contracts-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.soroban-sdk]
+version = "21.0.0"
+features = ["testutils"]
+
+[dependencies.agent-identity]
+path = "../agent-identity"
+
+[dependencies.agentic-commerce]
+path = "../agentic-commerce"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "fuzz_agent_identity"
+path = "fuzz_targets/fuzz_agent_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_agentic_commerce"
+path = "fuzz_targets/fuzz_agentic_commerce.rs"
+test = false
+doc = false
+bench = false
