@@ -4,6 +4,8 @@ import {
   scValToNative,
   Address,
   xdr,
+  TransactionBuilder,
+  BASE_FEE,
 } from "@stellar/stellar-sdk";
 import type { Keypair } from "@stellar/stellar-sdk";
 import type { Job, MarcConfig } from "./types.js";
@@ -954,6 +956,177 @@ export class CommerceClient extends BaseClient {
     const op = tokenContract.call("balance", new Address(address).toScVal());
     return await this.simulate(op, (v) => BigInt(scValToNative(v) as string));
   }
+
+  // -------------------------------------------------------------------------
+  // #780 — Offline transaction preparation (air-gapped / multisig workflows)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Build and simulate a `create_job` transaction, returning the **unsigned**
+   * XDR string for offline or multisig signing.
+   *
+   * No private key is required — pass only the *public address* of the client
+   * that will eventually sign. The transaction is simulated against the network
+   * to attach the Soroban resource footprint and fee, but is never submitted.
+   *
+   * ### Air-gapped workflow
+   * ```typescript
+   * // 1. Online: prepare the unsigned XDR
+   * const unsignedXdr = await commerce.prepareCreateJob(
+   *   clientAddress, provider, evaluator, token, 10_000_000n, "Build a website",
+   * );
+   *
+   * // 2. Offline: sign with Ledger / HSM / multisig vault
+   * const signedXdr = await ledgerDevice.sign(unsignedXdr);
+   *
+   * // 3. Online: broadcast the signed XDR
+   * const txHash = await commerce.submitSignedXdr(signedXdr);
+   * ```
+   *
+   * @param clientAddress - Stellar public key (G...) of the client account.
+   * @param provider      - Provider's Stellar address.
+   * @param evaluator     - Evaluator's Stellar address.
+   * @param token         - Token contract address.
+   * @param budget        - Escrow amount in smallest token units.
+   * @param description   - Human-readable job description.
+   * @returns Base64-encoded unsigned Soroban transaction XDR.
+   */
+  async prepareCreateJob(
+    clientAddress: string,
+    provider: string,
+    evaluator: string,
+    token: string,
+    budget: bigint,
+    description: string,
+  ): Promise<string> {
+    if (budget <= 0n) throw new Error("budget must be greater than 0");
+    if (budget > MAX_I128) throw new Error("budget exceeds i128 max");
+
+    const op = this.contract.call(
+      "create_job",
+      new Address(clientAddress).toScVal(),
+      new Address(provider).toScVal(),
+      new Address(evaluator).toScVal(),
+      new Address(token).toScVal(),
+      nativeToScVal(budget, { type: "i128" }),
+      nativeToScVal(description, { type: "string" }),
+    );
+
+    return this.rpcCall(async (server) => {
+      const account = await server.getAccount(clientAddress);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.cfg.networkPassphrase,
+      })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+      const prepared = await server.prepareTransaction(tx);
+      return prepared.toXDR();
+    });
+  }
+
+  /**
+   * Build and simulate a `submit` transaction, returning unsigned XDR for
+   * offline signing (#780).
+   *
+   * @param providerAddress - Stellar public key of the provider.
+   * @param jobId           - On-chain job ID.
+   * @param deliverable     - URL or content string for the completed work.
+   * @returns Base64-encoded unsigned Soroban transaction XDR.
+   */
+  async prepareSubmit(
+    providerAddress: string,
+    jobId: bigint,
+    deliverable: string,
+  ): Promise<string> {
+    const op = this.contract.call(
+      "submit",
+      new Address(providerAddress).toScVal(),
+      nativeToScVal(jobId, { type: "u64" }),
+      nativeToScVal(deliverable, { type: "string" }),
+    );
+
+    return this.rpcCall(async (server) => {
+      const account = await server.getAccount(providerAddress);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.cfg.networkPassphrase,
+      })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+      const prepared = await server.prepareTransaction(tx);
+      return prepared.toXDR();
+    });
+  }
+
+  /**
+   * Build and simulate a `complete` transaction, returning unsigned XDR for
+   * offline signing (#780).
+   *
+   * @param evaluatorAddress - Stellar public key of the evaluator.
+   * @param jobId            - On-chain job ID.
+   * @returns Base64-encoded unsigned Soroban transaction XDR.
+   */
+  async prepareComplete(evaluatorAddress: string, jobId: bigint): Promise<string> {
+    const op = this.contract.call(
+      "complete",
+      new Address(evaluatorAddress).toScVal(),
+      nativeToScVal(jobId, { type: "u64" }),
+    );
+
+    return this.rpcCall(async (server) => {
+      const account = await server.getAccount(evaluatorAddress);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.cfg.networkPassphrase,
+      })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+      const prepared = await server.prepareTransaction(tx);
+      return prepared.toXDR();
+    });
+  }
+
+  /**
+   * Submit a pre-signed XDR transaction to the network and poll for finality.
+   *
+   * The transaction must already be fully signed (by a Ledger device, cold
+   * wallet, or multisig flow) and base64-encoded. Routes through the RPC
+   * failover pool for reliability (#780, #781).
+   *
+   * @param signedXdr - Base64-encoded signed transaction XDR.
+   * @returns The transaction hash once confirmed on-chain.
+   * @throws {Error} If the transaction is rejected or times out.
+   */
+  async submitSignedXdr(signedXdr: string): Promise<string> {
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, this.cfg.networkPassphrase);
+    const sent = await this.rpcCall((s) => s.sendTransaction(signedTx));
+
+    if (sent.status === "ERROR") {
+      throw new Error(`submitSignedXdr: submit failed: ${sent.errorResult}`);
+    }
+
+    const startTime = Date.now();
+    const timeoutMs = this.cfg.pollTimeoutMs ?? 60_000;
+    let getResp = await this.rpcCall((s) => s.getTransaction(sent.hash));
+    while (getResp.status === "NOT_FOUND") {
+      if (Date.now() - startTime >= timeoutMs) {
+        throw new Error(`submitSignedXdr: timed out polling for tx ${sent.hash}`);
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+      getResp = await this.rpcCall((s) => s.getTransaction(sent.hash));
+    }
+    if (getResp.status !== "SUCCESS") {
+      throw new Error(`submitSignedXdr: tx failed with status ${getResp.status}`);
+    }
+    this.cfg.onTx?.(sent.hash, "submitSignedXdr");
+    return sent.hash;
+  }
+
+  // -------------------------------------------------------------------------
 
   /**
    * Disconnect and clean up any resources held by this client.

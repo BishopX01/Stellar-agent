@@ -26,8 +26,11 @@ export {
 } from "./marcPaywallNodeHttp.js";
 export {
   marcFetch,
+  marcFetchStream,
   parsePaymentRequiredHeader,
   type MarcFetchOptions,
+  type MarcStreamOptions,
+  type StreamChunk,
   type PaymentStatus,
   type ParsedPaymentRequirement,
 } from "./marcFetch.js";
@@ -54,6 +57,9 @@ export {
   strFromScVal,
   addrFromScVal,
 } from "./commerce.js";
+
+// #781 — RPC failover pool (exported for advanced usage / observability)
+export { RpcFailoverPool, type RpcEndpointHealth } from "./baseClient.js";
 
 /**
  * The current semantic version of the `marc-stellar-sdk` package.

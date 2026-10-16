@@ -143,11 +143,22 @@ export interface Job {
  * Specifies network, deployment, and RPC settings. Create once per network
  * and reuse across client instances. The `TESTNET` constant is a convenient preset.
  *
+ * ### Multi-endpoint failover (#781)
+ * Provide `rpcUrls` with two or more Soroban RPC URLs to enable automatic
+ * health-checking and transparent failover via {@link RpcFailoverPool}. The
+ * pool routes calls to the lowest-latency healthy endpoint and retries with
+ * exponential backoff when an endpoint returns a 5xx or network error.
+ * `rpcUrl` is still accepted for single-endpoint / backward-compatible usage.
+ *
  * @example
  * ```typescript
  * const cfg: MarcConfig = {
  *   ...TESTNET,
- *   rpcUrl: "https://custom-rpc.example.com", // override RPC
+ *   // Multi-endpoint failover:
+ *   rpcUrls: [
+ *     "https://soroban-testnet.stellar.org",
+ *     "https://rpc.ankr.com/stellar_testnet",
+ *   ],
  * };
  * const identity = new IdentityClient(cfg);
  * ```
@@ -155,6 +166,14 @@ export interface Job {
 export interface MarcConfig {
   /** Soroban JSON-RPC endpoint (e.g., `https://soroban-testnet.stellar.org`). */
   rpcUrl: string;
+  /**
+   * Optional list of Soroban RPC endpoints for automatic failover (#781).
+   *
+   * When provided, the SDK creates an {@link RpcFailoverPool} that routes
+   * all calls through the healthiest available endpoint. `rpcUrl` is used
+   * as a fallback when this array is empty or omitted.
+   */
+  rpcUrls?: string[];
   /** Network passphrase for transaction signing (e.g., `Networks.TESTNET`). */
   networkPassphrase: string;
   /** Deployed `agent_identity` contract address (starts with `C`). */
@@ -175,6 +194,52 @@ export interface MarcConfig {
   pollTimeoutMs?: number;
   /** Optional callback fired after each successful on-chain transaction. */
   onTx?: (hash: string, method: string) => void;
+}
+
+// ---------------------------------------------------------------------------
+// #696 — Delegate / WebAuthn session key types (SDK mirror of Rust structs)
+// ---------------------------------------------------------------------------
+
+/**
+ * Permission bitmask constants for agent delegates (#696).
+ *
+ * Mirrors the `PERM_*` constants in `contracts/agent-identity/src/lib.rs`.
+ */
+export const DelegatePermission = {
+  /** Delegate may call `update_uri` on behalf of the agent owner. */
+  UPDATE_URI: 0b0001,
+  /** Delegate may call `deregister` on behalf of the agent owner. */
+  DEREGISTER: 0b0010,
+  /** Delegate may call `transfer_owner` on behalf of the agent owner. */
+  TRANSFER: 0b0100,
+  /** All permissions combined. */
+  ALL: 0b0111,
+} as const;
+
+export type DelegatePermissionValue = (typeof DelegatePermission)[keyof typeof DelegatePermission];
+
+/**
+ * A time-bounded delegate key that can act on behalf of an agent owner.
+ *
+ * Mirrors the `Delegate` struct in `contracts/agent-identity/src/lib.rs` (#696).
+ * Designed for autonomous AI agents that cannot safely hold master private keys.
+ *
+ * @example
+ * ```typescript
+ * // Grant a 24-hour session key with URI-update permission only
+ * await identity.addDelegate(ownerKeypair, agentId, sessionPublicKey, {
+ *   ttl: 86_400n,
+ *   permissions: DelegatePermission.UPDATE_URI,
+ * });
+ * ```
+ */
+export interface DelegateInfo {
+  /** Stellar address of the delegate key (ephemeral session key or passkey address). */
+  delegateAddress: Address;
+  /** Unix timestamp (seconds) after which the delegate is considered expired. */
+  validUntil: bigint;
+  /** Bitmask of allowed operations — see {@link DelegatePermission}. */
+  permissions: number;
 }
 
 interface PresetConfig {

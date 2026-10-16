@@ -10,7 +10,7 @@ import {
   Account,
   rpc,
 } from "@stellar/stellar-sdk";
-import type { Agent, MarcConfig } from "./types.js";
+import type { Agent, MarcConfig, DelegateInfo } from "./types.js";
 import { BaseClient } from "./baseClient.js";
 import type { Signer } from "./signer.js";
 import { signerPublicKey } from "./signer.js";
@@ -296,6 +296,123 @@ export class IdentityClient extends BaseClient {
     const op = this.contract.call("registered_count");
     return await this.simulate(op, (v) => Number(scValToNative(v)));
   }
+
+  // -------------------------------------------------------------------------
+  // #696 — Delegate / WebAuthn session key management
+  // -------------------------------------------------------------------------
+
+  /**
+   * Grant a time-bounded delegate key for an agent (#696).
+   *
+   * The `owner` must sign. The delegate key (`delegateAddress`) can be an
+   * ephemeral session key or a WebAuthn passkey-backed address. The contract
+   * stores the record under `DataKey::Delegate(agentId, delegateAddress)`.
+   *
+   * @param owner           - Agent owner's Signer.
+   * @param agentId         - On-chain agent ID.
+   * @param delegateAddress - Stellar address of the delegate key.
+   * @param opts.ttl        - Seconds from now until the delegate expires.
+   * @param opts.permissions - Bitmask of allowed operations (see `DelegatePermission`).
+   */
+  async addDelegate(
+    owner: Signer,
+    agentId: bigint,
+    delegateAddress: string,
+    opts: { ttl: bigint; permissions: number },
+  ): Promise<void> {
+    const op = this.contract.call(
+      "add_delegate",
+      new Address(signerPublicKey(owner)).toScVal(),
+      nativeToScVal(agentId, { type: "u64" }),
+      new Address(delegateAddress).toScVal(),
+      nativeToScVal(opts.ttl, { type: "u64" }),
+      nativeToScVal(opts.permissions, { type: "u32" }),
+    );
+    await this.invoke(owner, op, () => undefined, "identity");
+  }
+
+  /**
+   * Revoke a previously-granted delegate key (owner-only, #696).
+   *
+   * @param owner           - Agent owner's Signer.
+   * @param agentId         - On-chain agent ID.
+   * @param delegateAddress - Stellar address of the delegate to revoke.
+   */
+  async revokeDelegate(
+    owner: Signer,
+    agentId: bigint,
+    delegateAddress: string,
+  ): Promise<void> {
+    const op = this.contract.call(
+      "revoke_delegate",
+      new Address(signerPublicKey(owner)).toScVal(),
+      nativeToScVal(agentId, { type: "u64" }),
+      new Address(delegateAddress).toScVal(),
+    );
+    await this.invoke(owner, op, () => undefined, "identity");
+  }
+
+  /**
+   * Read a delegate record for a given (agentId, delegateAddress) pair (#696).
+   *
+   * Returns `null` if no delegate is stored or if the record has expired.
+   *
+   * @param agentId         - On-chain agent ID.
+   * @param delegateAddress - Stellar address of the delegate to look up.
+   * @returns The {@link DelegateInfo} record if found and non-expired, else `null`.
+   */
+  async getDelegate(agentId: bigint, delegateAddress: string): Promise<DelegateInfo | null> {
+    const op = this.contract.call(
+      "get_delegate",
+      nativeToScVal(agentId, { type: "u64" }),
+      new Address(delegateAddress).toScVal(),
+    );
+    return await this.simulate(op, (v) => {
+      const native = scValToNative(v);
+      if (!native) return null;
+      return {
+        delegateAddress: String(native.delegate_address),
+        validUntil: BigInt(native.valid_until),
+        permissions: Number(native.permissions),
+      } as DelegateInfo;
+    });
+  }
+
+  /**
+   * Verify whether `callerAddress` is authorised to act on behalf of `agentId`
+   * with `requiredPermission` (#696).
+   *
+   * Returns `true` if the caller is the agent owner or a non-expired delegate
+   * with the required permission bit set. Returns `false` if the check fails
+   * (rather than throwing), making it easy to use in conditional guards.
+   *
+   * Note: this is a *simulation* — it does not consume gas or modify state.
+   *
+   * @param agentId            - On-chain agent ID.
+   * @param callerAddress      - Stellar address to check authorization for.
+   * @param requiredPermission - Bitmask of required permissions.
+   * @returns `true` if authorized, `false` otherwise.
+   */
+  async checkDelegate(
+    agentId: bigint,
+    callerAddress: string,
+    requiredPermission: number,
+  ): Promise<boolean> {
+    const op = this.contract.call(
+      "check_delegate",
+      nativeToScVal(agentId, { type: "u64" }),
+      new Address(callerAddress).toScVal(),
+      nativeToScVal(requiredPermission, { type: "u32" }),
+    );
+    try {
+      await this.simulate(op, () => undefined);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // -------------------------------------------------------------------------
 
   /**
    * Disconnect and clean up any resources held by this client.
