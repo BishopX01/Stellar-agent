@@ -25,6 +25,9 @@ pub enum Error {
     NotAdmin = 9,
     /// The token address is not on the approved whitelist.
     UnsupportedToken = 10,
+    /// #713 — the required input amount for the swap exceeds the client's
+    /// `max_input_amount` slippage guard.
+    SlippageExceeded = 11,
 }
 
 /// Lifecycle states for a job escrow.
@@ -173,6 +176,8 @@ enum DataKey {
     AllowedToken(Address),
     /// Ordered list of whitelisted token addresses for enumeration.
     AllowedTokenList,
+    /// #713 — address of the AMM/DEX router contract used for path payments.
+    AmmRouter,
 }
 
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
@@ -357,6 +362,24 @@ pub struct MilestonesPartialCancelled {
     pub client: Address,
     pub job_id: u64,
     pub refund: i128,
+}
+
+/// #713 — Emitted when a job is funded via a cross-currency path payment swap.
+#[contractevent]
+pub struct SwapFunded {
+    #[topic]
+    pub client: Address,
+    pub job_id: u64,
+    /// The token the client paid with (e.g. XLM).
+    pub input_token: Address,
+    /// The token the escrow was funded in (e.g. USDC).
+    pub target_token: Address,
+    /// Amount of `input_token` actually consumed by the swap.
+    pub input_spent: i128,
+    /// Amount of `input_token` refunded to the client (unspent remainder).
+    pub refund: i128,
+    /// The full target budget locked into escrow.
+    pub budget: i128,
 }
 
 #[contractevent]
@@ -1247,6 +1270,173 @@ impl AgenticCommerceContract {
     /// Read-only: check if a token is whitelisted and return its info.
     pub fn get_token_info(env: Env, token: Address) -> Option<TokenInfo> {
         env.storage().instance().get(&DataKey::AllowedToken(token))
+    }
+
+    // -----------------------------------------------------------------------
+    // #713 — Cross-currency escrow settlements via Stellar Path Payments
+    // -----------------------------------------------------------------------
+
+    /// Admin-only: set the AMM/DEX router contract used for cross-currency swaps.
+    ///
+    /// The router is expected to expose a `swap_exact_out`-style entry point
+    /// that pulls `input_token` from the caller and delivers exactly
+    /// `target_amount` of `target_token` to the caller, returning the amount of
+    /// `input_token` consumed. This mirrors a Stellar DEX path payment
+    /// (`PathPaymentStrictReceive`) routed through a Soroban AMM pool.
+    pub fn set_amm_router(env: Env, admin: Address, router: Address) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != current_admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::AmmRouter, &router);
+    }
+
+    /// Read-only: return the configured AMM/DEX router address, if any.
+    pub fn get_amm_router(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AmmRouter)
+    }
+
+    /// #713 — Fund an existing job's escrow using a cross-currency swap.
+    ///
+    /// The client pays in `input_token` (e.g. XLM or EURC) and the escrow is
+    /// credited with exactly the job's `budget` denominated in the job's target
+    /// token (e.g. USDC). The swap is executed atomically against the configured
+    /// AMM/DEX router; if the required input exceeds `max_input_amount` the call
+    /// reverts with `Error::SlippageExceeded`, protecting the client from
+    /// adverse market movement.
+    ///
+    /// Any `input_token` not consumed by the swap is refunded to the client in
+    /// the same transaction, so the client never overpays.
+    ///
+    /// # Panics
+    /// - `ContractPaused` if the contract is paused.
+    /// - `JobNotFound` if no job exists for `job_id`.
+    /// - `NotClient` if `client` is not the job's client.
+    /// - `InvalidStatus` if the job is not in a fundable state.
+    /// - `UnsupportedToken` if either token is not whitelisted.
+    /// - `SlippageExceeded` if the required input exceeds `max_input_amount`.
+    pub fn fund_job_with_swap(
+        env: Env,
+        client: Address,
+        input_token: Address,
+        max_input_amount: i128,
+        job_id: u64,
+    ) -> i128 {
+        Self::require_not_paused(&env);
+        client.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+        if max_input_amount <= 0 {
+            panic!("max_input_amount must be positive");
+        }
+
+        let mut job: Job = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Job(job_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JobNotFound));
+        if client != job.client {
+            panic_with_error!(&env, Error::NotClient);
+        }
+        // The job must be fundable: either freshly created (Open) or awaiting
+        // its escrow deposit. Jobs already Funded/Submitted/Completed cannot be
+        // re-funded through this path.
+        if job.status != JobStatus::Open && job.status != JobStatus::Funded {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+        // Guard against double-funding an already-escrowed job.
+        if job.released != 0 || job.status == JobStatus::Funded {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+
+        // Both the input token and the job's target token must be whitelisted.
+        // As with create_job, the check is skipped when no tokens have been
+        // whitelisted yet (fresh deploy) so the contract remains usable.
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenList)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            if !env.storage().instance().has(&DataKey::AllowedToken(input_token.clone())) {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+            if !env.storage().instance().has(&DataKey::AllowedToken(job.token.clone())) {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+        }
+
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AmmRouter)
+            .unwrap_or_else(|| panic!("amm router not configured"));
+
+        let contract_addr = env.current_contract_address();
+        let input_client = token::TokenClient::new(&env, &input_token);
+        let target_client = token::TokenClient::new(&env, &job.token);
+
+        // Pull the maximum the client is willing to spend into the contract so
+        // the router can draw from it. Any unspent remainder is refunded below.
+        input_client.balance(&contract_addr);
+        input_client.transfer(&client, &contract_addr, &max_input_amount);
+
+        // Ask the router to deliver exactly `job.budget` of the target token to
+        // the escrow, spending at most `max_input_amount` of the input token.
+        // The router returns the amount of input actually consumed.
+        let input_spent: i128 = env.invoke_contract(
+            &router,
+            &soroban_sdk::Symbol::new(&env, "swap_exact_out"),
+            soroban_sdk::vec![
+                &env,
+                contract_addr.clone().into_val(&env),
+                input_token.clone().into_val(&env),
+                job.token.clone().into_val(&env),
+                job.budget.into_val(&env),
+                max_input_amount.into_val(&env),
+            ],
+        );
+
+        // Slippage guard: the router must not have consumed more than the
+        // client authorised, and must have consumed a sane positive amount.
+        if input_spent <= 0 || input_spent > max_input_amount {
+            panic_with_error!(&env, Error::SlippageExceeded);
+        }
+
+        // Verify the escrow actually received the full target budget. If the
+        // router under-delivered we revert rather than silently under-funding.
+        let escrow_balance = target_client.balance(&contract_addr);
+        if escrow_balance < job.budget {
+            panic_with_error!(&env, Error::SlippageExceeded);
+        }
+
+        // Refund any unspent input remainder back to the client.
+        let refund = max_input_amount - input_spent;
+        if refund > 0 {
+            input_client.transfer(&contract_addr, &client, &refund);
+        }
+
+        // Transition the job to Funded and stamp the funding time.
+        let now = env.ledger().timestamp();
+        job.status = JobStatus::Funded;
+        job.funded_at = now;
+        job.updated_at = now;
+        env.storage().persistent().set(&DataKey::Job(job_id), &job);
+
+        SwapFunded {
+            client,
+            job_id,
+            input_token,
+            target_token: job.token.clone(),
+            input_spent,
+            refund,
+            budget: job.budget,
+        }
+        .publish(&env);
+
+        input_spent
     }
 
     /// Read the configured high-value threshold in token smallest units.

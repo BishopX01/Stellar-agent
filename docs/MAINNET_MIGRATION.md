@@ -63,6 +63,38 @@ that any new entry points added post-audit follow the same pattern. Pay particul
 - **OpenZeppelin** — Security audits and contract review; strong Rust/soroban-sdk familiarity.
 - **Kudelski Security** — Blockchain smart contract audits; prior Soroban ecosystem work.
 
+### Pre-Launch Verification Gate (`scripts/verify-mainnet.ts`)
+
+Before any mainnet deployment, the automated verification and smoke-test script
+`scripts/verify-mainnet.ts` **must** be run and must pass 100% of its safety checks. It reads
+the recorded deployment from `deployments/mainnet.json` and validates the live on-chain state
+against the audited release configuration.
+
+What it validates:
+
+1. **WASM bytecode hash match** — the deployed contract bytecode hash must match the audited
+   release WASM. Any mismatch is a hard failure.
+2. **`fee_bps == 100`** — the production fee must be exactly 1% (100 bps). Any other value
+   aborts the run.
+3. **Treasury is a multisig** — the treasury address must be a valid multisig account, never a
+   single-key EOA.
+4. **Canonical USDC SAC** — the configured SAC token address must be the canonical Circle USDC
+   Stellar Asset Contract.
+5. **Read-only entry-point simulations** — every entry point is invoked in read-only
+   simulation mode to confirm it is callable and returns the expected shape.
+
+On failure the script **aborts and raises a critical alarm** if any unexpected parameter or
+non-multisig address is detected. On success it produces:
+
+- A **cryptographically signed deployment audit certificate** (tamper-evident record of the
+  verified parameters and hashes).
+- A **human-readable audit verification markdown report** summarizing each check and its
+  result.
+
+> **MANDATORY GATE:** Running `scripts/verify-mainnet.ts` successfully is a mandatory gate in
+> the mainnet deployment runbook. No mainnet deploy may proceed until the verification script
+> has passed and its signed audit certificate has been archived.
+
 ### Automated Static Analysis (CodeQL)
 
 `.github/workflows/codeql.yml` runs GitHub CodeQL against the `javascript-typescript`
@@ -240,6 +272,8 @@ Use this checklist before any mainnet deployment:
 - [ ] `init()` called with a multisig admin and treasury address (never an EOA)
 - [ ] `fee_bps` set to intended production value
 - [ ] Emergency pause tested end-to-end on a mainnet fork
+- [ ] `scripts/verify-mainnet.ts` run successfully (mandatory gate) with signed audit
+      certificate archived and audit verification markdown report reviewed
 
 ### Infrastructure
 

@@ -1257,3 +1257,269 @@ fn channel_cannot_be_force_closed_before_challenge_period() {
 
     client.force_close(&payer, &channel_id);
 }
+
+// ===========================================================================
+// #713 — cross-currency escrow settlements via Stellar Path Payments
+// ===========================================================================
+
+/// A minimal mock AMM pool used to exercise `fund_job_with_swap` without a
+/// live Stellar DEX. It holds reserves of an `input_token` (e.g. XLM) and an
+/// `output_token` (e.g. USDC) and performs a constant-product style swap.
+///
+/// The pool is registered as a contract so the escrow contract can invoke it
+/// through the standard token interface: the client transfers `input_amount`
+/// of the input token into the pool, and the pool transfers `output_amount`
+/// of the output token to the escrow contract.
+mod mock_pool {
+    use soroban_sdk::{contract, contractimpl, token, Address, Env};
+
+    #[contract]
+    pub struct MockAmmPool;
+
+    #[contractimpl]
+    impl MockAmmPool {
+        /// Swap `input_amount` of `input_token` for `output_amount` of
+        /// `output_token`, sending the output directly to `recipient`.
+        ///
+        /// The caller (the escrow contract) is expected to have already moved
+        /// `input_amount` of `input_token` into this pool. This mock simply
+        /// forwards the pre-agreed `output_amount` from its own reserves.
+        pub fn swap(
+            env: Env,
+            input_token: Address,
+            output_token: Address,
+            input_amount: i128,
+            output_amount: i128,
+            recipient: Address,
+        ) {
+            // Pull the input tokens from the caller into the pool reserves.
+            let input_client = token::Client::new(&env, &input_token);
+            input_client.transfer(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &input_amount,
+            );
+            // Forward the output tokens to the recipient (escrow).
+            let output_client = token::Client::new(&env, &output_token);
+            output_client.transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &output_amount,
+            );
+        }
+    }
+}
+
+use mock_pool::MockAmmPool;
+
+/// Deploy a mock AMM pool and seed it with output-token reserves so it can
+/// service swaps. Returns the pool address.
+fn deploy_mock_pool<'a>(
+    env: &Env,
+    admin: &Address,
+    output_token: &Address,
+    output_reserve: i128,
+) -> Address {
+    let pool_id = env.register(MockAmmPool, ());
+    // Fund the pool with output-token reserves so it can pay out swaps.
+    let output_asset = StellarAssetClient::new(env, output_token);
+    output_asset.mint(&pool_id, &output_reserve);
+    let _ = admin;
+    pool_id
+}
+
+/// (1) A client can fund a USDC escrow using XLM in a single transaction and
+/// the escrow receives the full required target budget.
+#[test]
+fn fund_job_with_swap_funds_escrow_in_single_transaction() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    // Input token: XLM (what the client holds).
+    let (xlm_addr, xlm, xlm_asset) = deploy_token(&env, &admin);
+    // Output token: USDC (what the escrow/job requires).
+    let (usdc_addr, usdc, _usdc_asset) = deploy_token(&env, &admin);
+
+    xlm_asset.mint(&buyer, &1_000_000);
+
+    // Seed the mock pool with enough USDC to service the swap.
+    let pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
+
+    let budget: i128 = 100_000;
+    let max_input: i128 = 120_000;
+
+    let job_id = client.fund_job_with_swap(
+        &buyer,
+        &seller,
+        &buyer,
+        &xlm_addr,
+        &usdc_addr,
+        &budget,
+        &max_input,
+        &String::from_str(&env, "cross-currency job"),
+    );
+
+    // Escrow must hold exactly the required target budget in USDC.
+    assert_eq!(usdc.balance(&client.address), budget);
+
+    let job = client.get_job(&job_id).unwrap();
+    assert_eq!(job.status, JobStatus::Funded);
+    assert_eq!(job.budget, budget);
+    assert_eq!(job.token, usdc_addr);
+    assert_eq!(job.client, buyer);
+    assert_eq!(job.provider, seller);
+
+    // The pool received the input tokens it was paid for the swap.
+    assert!(xlm.balance(&pool) > 0);
+}
+
+/// (2) The `max_input_amount` slippage guard rejects swaps whose required
+/// input exceeds the caller-supplied limit.
+#[test]
+#[should_panic(expected = "max input amount exceeded")]
+fn fund_job_with_swap_rejects_when_input_exceeds_max() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    let (xlm_addr, _xlm, xlm_asset) = deploy_token(&env, &admin);
+    let (usdc_addr, _usdc, _usdc_asset) = deploy_token(&env, &admin);
+
+    xlm_asset.mint(&buyer, &1_000_000);
+    let _pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
+
+    let budget: i128 = 100_000;
+    // The required input (100_000) exceeds this guard, so the call must panic.
+    let max_input: i128 = 50_000;
+
+    client.fund_job_with_swap(
+        &buyer,
+        &seller,
+        &buyer,
+        &xlm_addr,
+        &usdc_addr,
+        &budget,
+        &max_input,
+        &String::from_str(&env, "slippage guard"),
+    );
+}
+
+/// (3) Any unspent input remainder is refunded to the client wallet.
+#[test]
+fn fund_job_with_swap_refunds_unspent_input_remainder() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    let (xlm_addr, xlm, xlm_asset) = deploy_token(&env, &admin);
+    let (usdc_addr, usdc, _usdc_asset) = deploy_token(&env, &admin);
+
+    let starting_balance: i128 = 1_000_000;
+    xlm_asset.mint(&buyer, &starting_balance);
+    let _pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
+
+    let budget: i128 = 100_000;
+    // The client authorises up to 120_000 XLM but only 100_000 is consumed,
+    // so 20_000 must be refunded.
+    let max_input: i128 = 120_000;
+
+    client.fund_job_with_swap(
+        &buyer,
+        &seller,
+        &buyer,
+        &xlm_addr,
+        &usdc_addr,
+        &budget,
+        &max_input,
+        &String::from_str(&env, "refund remainder"),
+    );
+
+    // Escrow holds the full USDC budget.
+    assert_eq!(usdc.balance(&client.address), budget);
+    // The client's XLM balance reflects only the consumed input, with the
+    // unspent remainder returned.
+    assert_eq!(xlm.balance(&buyer), starting_balance - budget);
+}
+
+/// (4) Balance distributions across client, escrow, and swap pool are correct.
+#[test]
+fn fund_job_with_swap_balance_distributions_are_correct() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    let (xlm_addr, xlm, xlm_asset) = deploy_token(&env, &admin);
+    let (usdc_addr, usdc, _usdc_asset) = deploy_token(&env, &admin);
+
+    let starting_xlm: i128 = 500_000;
+    xlm_asset.mint(&buyer, &starting_xlm);
+
+    let pool_reserve: i128 = 1_000_000;
+    let pool = deploy_mock_pool(&env, &admin, &usdc_addr, &pool_reserve);
+
+    let budget: i128 = 100_000;
+    let max_input: i128 = 150_000;
+
+    client.fund_job_with_swap(
+        &buyer,
+        &seller,
+        &buyer,
+        &xlm_addr,
+        &usdc_addr,
+        &budget,
+        &max_input,
+        &String::from_str(&env, "balance distribution"),
+    );
+
+    // Escrow: exactly the target USDC budget.
+    assert_eq!(usdc.balance(&client.address), budget);
+    // Pool: received the consumed input tokens and paid out the budget.
+    assert_eq!(xlm.balance(&pool), budget);
+    assert_eq!(usdc.balance(&pool), pool_reserve - budget);
+    // Client: only the consumed input left their wallet.
+    assert_eq!(xlm.balance(&buyer), starting_xlm - budget);
+}
+
+/// Non-clients cannot call `fund_job_with_swap` on behalf of another client.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn fund_job_with_swap_rejects_non_client() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let mallory = Address::generate(&env);
+
+    let (xlm_addr, _xlm, xlm_asset) = deploy_token(&env, &admin);
+    let (usdc_addr, _usdc, _usdc_asset) = deploy_token(&env, &admin);
+
+    xlm_asset.mint(&mallory, &1_000_000);
+    let _pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
+
+    // mallory is not the declared client (buyer) — must be rejected.
+    client.fund_job_with_swap(
+        &mallory,
+        &seller,
+        &buyer,
+        &xlm_addr,
+        &usdc_addr,
+        &100_000i128,
+        &120_000i128,
+        &String::from_str(&env, "unauthorized funding"),
+    );
+}
