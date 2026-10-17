@@ -37,11 +37,18 @@
     loading: { stats: false, wallets: false, agents: false, jobs: false },
     jobFilter: "Active",
     jobSearch: "",
+    jobDateFrom: "",
+    jobDateTo: "",
     agentSearch: "",   // #583 — agent name/description/tag filter
     agentPage: 1,
     agentPageSize: 24,
     agentTotal: 0,
     txPending: false,
+    // #755 — multi-tag / sort agent search state
+    agentFilters: { query: "", tags: [], sort: "Most Active" },
+    // #756 — sidebar wallet balance widget
+    walletBalances: null,
+    faucetPending: false,
   };
 
   // ── Debounce helper ──
@@ -53,6 +60,156 @@
       timer = setTimeout(function () { fn.apply(null, args); }, ms);
     };
   }
+
+  // ── Web Notifications (#754) ──
+  // Opt-in desktop notifications for background job status changes.
+  // Permission is requested at most once; a denial is remembered and never
+  // re-prompted.  All calls are guarded for browsers without the API.
+  var NOTIFY_PREF_KEY = "bear-notifications-enabled";
+  var NOTIFY_DENIED_KEY = "bear-notifications-denied";
+  var notifications = {
+    supported: typeof window !== "undefined" && "Notification" in window,
+    enabled: false,
+  };
+  try {
+    notifications.enabled = localStorage.getItem(NOTIFY_PREF_KEY) === "1";
+  } catch (e) {}
+
+  function notificationsDenied() {
+    try {
+      return localStorage.getItem(NOTIFY_DENIED_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setNotificationPref(enabled) {
+    notifications.enabled = !!enabled;
+    try {
+      localStorage.setItem(NOTIFY_PREF_KEY, enabled ? "1" : "0");
+    } catch (e) {}
+    if (!enabled) return;
+    if (!notifications.supported) {
+      toast("Desktop notifications are not supported in this browser", "error");
+      return;
+    }
+    if (Notification.permission === "granted") return;
+    if (Notification.permission === "denied" || notificationsDenied()) {
+      toast("Notifications are blocked — enable them in your browser settings", "error");
+      return;
+    }
+    // Request permission exactly once on opt-in.
+    try {
+      Notification.requestPermission().then(function (perm) {
+        if (perm === "denied") {
+          try { localStorage.setItem(NOTIFY_DENIED_KEY, "1"); } catch (e) {}
+          notifications.enabled = false;
+          try { localStorage.setItem(NOTIFY_PREF_KEY, "0"); } catch (e) {}
+          toast("Notifications were denied by the browser", "error");
+        } else if (perm === "granted") {
+          toast("Desktop notifications enabled");
+        }
+        syncNotificationToggle();
+      }).catch(function () {});
+    } catch (e) {
+      // Older Safari uses the callback form
+      try {
+        Notification.requestPermission(function (perm) {
+          if (perm === "denied") {
+            try { localStorage.setItem(NOTIFY_DENIED_KEY, "1"); } catch (e) {}
+            notifications.enabled = false;
+          }
+          syncNotificationToggle();
+        });
+      } catch (e2) {}
+    }
+  }
+
+  function syncNotificationToggle() {
+    var toggle = document.getElementById("notifications-toggle");
+    if (toggle) toggle.checked = !!notifications.enabled;
+    var status = document.getElementById("notifications-status");
+    if (status) {
+      if (!notifications.supported) status.textContent = "Not supported in this browser";
+      else if (Notification.permission === "denied") status.textContent = "Blocked by browser";
+      else if (notifications.enabled) status.textContent = "Enabled";
+      else status.textContent = "Disabled";
+    }
+  }
+
+  // Opens the jobs view and expands the specific job row.
+  function focusJob(jobId) {
+    try { window.focus(); } catch (e) {}
+    var target = "#/jobs";
+    if (getRoute() !== "/jobs") {
+      window.location.hash = target;
+    }
+    // Wait for the jobs view to render, then expand the row.
+    var attempts = 0;
+    function tryExpand() {
+      var row = document.getElementById("job-" + jobId);
+      if (row) {
+        if (!row.classList.contains("expanded")) row.classList.add("expanded");
+        try { row.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+        return;
+      }
+      if (attempts++ < 20) setTimeout(tryExpand, 250);
+    }
+    setTimeout(tryExpand, 300);
+  }
+
+  var NOTIFY_STATE_LABELS = {
+    Funded: "has been funded",
+    Submitted: "deliverable was submitted",
+    Completed: "was approved and funds released",
+    Approved: "was approved",
+  };
+
+  function notifyJobEvent(job, newStatus) {
+    if (!notifications.enabled) return;
+    if (!notifications.supported) return;
+    if (Notification.permission !== "granted") return;
+    var label = NOTIFY_STATE_LABELS[newStatus];
+    if (!label) return;
+    var title = "Bear Job #" + job.id + " " + newStatus;
+    var body = "Job #" + job.id + " " + label + (job.description ? ": " + job.description : "");
+    try {
+      var n = new Notification(title, {
+        body: body,
+        tag: "bear-job-" + job.id + "-" + newStatus,
+      });
+      n.onclick = function () {
+        try { window.focus(); } catch (e) {}
+        focusJob(job.id);
+        try { n.close(); } catch (e) {}
+      };
+    } catch (e) {
+      // Some browsers require a service worker; degrade silently.
+    }
+  }
+
+  // Compares the previous job snapshot against the freshly loaded one and
+  // fires notifications for transitions involving the connected wallet.
+  function detectJobTransitions(prevJobs, nextJobs) {
+    if (!notifications.enabled || !wallet.connected || !wallet.publicKey) return;
+    if (!Array.isArray(prevJobs) || !Array.isArray(nextJobs)) return;
+    var prevById = {};
+    for (var i = 0; i < prevJobs.length; i++) prevById[String(prevJobs[i].id)] = prevJobs[i];
+    var me = wallet.publicKey;
+    for (var k = 0; k < nextJobs.length; k++) {
+      var job = nextJobs[k];
+      var prev = prevById[String(job.id)];
+      var oldStatus = prev ? prev.status : null;
+      if (oldStatus === job.status) continue;
+      var involvesMe = job.client === me || job.provider === me || job.evaluator === me;
+      if (!involvesMe) continue;
+      notifyJobEvent(job, job.status);
+    }
+  }
+
+  window.__setNotificationsEnabled = function (enabled) {
+    setNotificationPref(enabled);
+  };
 
   // ── Stellar Wallets Kit integration ──
   const wallet = {
@@ -234,6 +391,8 @@
     var connectedEl = document.getElementById("wallet-connected");
     var modeLabel = document.getElementById("wallet-mode-label");
     var btnWrapper = document.getElementById("swk-button-wrapper");
+    // #756 — refresh the sidebar balance widget whenever wallet state changes
+    try { refreshWalletWidget(); } catch (e) {}
     if (wallet.connected && wallet.publicKey) {
       if (connectedEl) connectedEl.style.display = "flex";
       var addrDisplay = document.getElementById("wallet-addr-display");
@@ -325,6 +484,97 @@
 
   // Expose wallet functions globally
   window.__disconnectWallet = disconnectWallet;
+
+  // ── Sidebar Wallet Balance Widget (#756) ──
+  // Fetches XLM via Horizon and USDC via the backend Soroban token balance
+  // endpoint, renders them in the sidebar, and offers a one-click Friendbot
+  // faucet for testnet wallets.  Hidden entirely on Mainnet.
+  var HORIZON_TESTNET = "https://horizon-testnet.stellar.org";
+  var FRIENDBOT_URL = "https://friendbot.stellar.org";
+
+  function isMainnet() {
+    return wallet.network === "mainnet";
+  }
+
+  async function fetchXlmBalance(publicKey) {
+    try {
+      var res = await fetch(HORIZON_TESTNET + "/accounts/" + encodeURIComponent(publicKey));
+      if (!res.ok) return null;
+      var data = await res.json();
+      var balances = (data && data.balances) || [];
+      for (var i = 0; i < balances.length; i++) {
+        if (balances[i].asset_type === "native") return parseFloat(balances[i].balance);
+      }
+      return 0;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function fetchUsdcBalance(publicKey) {
+    try {
+      var data = await api("/balance/" + encodeURIComponent(publicKey), { _silent: true });
+      if (data && data.usdc != null) return parseFloat(data.usdc);
+      if (data && data.musd != null) return parseFloat(data.musd);
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function refreshWalletWidget() {
+    var widget = document.getElementById("wallet-balance-widget");
+    if (!widget) return;
+    if (!wallet.connected || !wallet.publicKey || isMainnet()) {
+      widget.style.display = "none";
+      return;
+    }
+    widget.style.display = "";
+    var xlmEl = document.getElementById("wallet-xlm-balance");
+    var usdcEl = document.getElementById("wallet-usdc-balance");
+    var results = await Promise.all([
+      fetchXlmBalance(wallet.publicKey),
+      fetchUsdcBalance(wallet.publicKey),
+    ]);
+    var xlm = results[0];
+    var usdc = results[1];
+    state.walletBalances = { xlm: xlm, usdc: usdc };
+    if (xlmEl) xlmEl.textContent = xlm == null ? "—" : xlm.toFixed(2);
+    if (usdcEl) usdcEl.textContent = usdc == null ? "—" : usdc.toFixed(2);
+  }
+
+  window.__fundViaFaucet = async function () {
+    if (state.faucetPending) return;
+    if (!wallet.connected || !wallet.publicKey) {
+      toast("Connect a wallet first", "error");
+      return;
+    }
+    if (isMainnet()) {
+      toast("Friendbot is only available on Testnet", "error");
+      return;
+    }
+    state.faucetPending = true;
+    var btn = document.getElementById("faucet-btn");
+    var originalHtml = btn ? btn.innerHTML : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Funding…';
+    }
+    try {
+      var res = await fetch(FRIENDBOT_URL + "/?addr=" + encodeURIComponent(wallet.publicKey));
+      if (!res.ok) throw new Error("Friendbot request failed (" + res.status + ")");
+      toast("Wallet funded with 10,000 testnet XLM");
+      await refreshWalletWidget();
+    } catch (e) {
+      notifyError(e);
+    } finally {
+      state.faucetPending = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+      }
+    }
+  };
 
   /**
    * Returns a display label for the currently connected wallet.
@@ -919,6 +1169,94 @@
       '</div>'
     );
   }
+
+  // ── CSV Export (#757) ──
+  // Builds a UTF-8 BOM-prefixed CSV from the currently filtered job records.
+  function csvEscapeCell(value) {
+    var s = String(value == null ? "" : value);
+    if (s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\n") !== -1 || s.indexOf("\r") !== -1) {
+      s = '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+
+  function formatCsvDate(unixSeconds) {
+    if (!unixSeconds) return "";
+    var d = new Date(Number(unixSeconds) * 1000);
+    if (isNaN(d.getTime())) return "";
+    return d.toISOString().slice(0, 10);
+  }
+
+  function buildTransactionCsv(jobs) {
+    var header = ["Date", "Job ID", "Type", "Counterparty", "Amount", "Status", "TxHash"];
+    var lines = [header.map(csvEscapeCell).join(",")];
+    var me = wallet.publicKey || "";
+    for (var i = 0; i < jobs.length; i++) {
+      var j = jobs[i];
+      var counterparty = "";
+      if (me && j.client === me) counterparty = j.provider || "";
+      else if (me && j.provider === me) counterparty = j.client || "";
+      else counterparty = j.client || j.provider || "";
+      lines.push(
+        [
+          formatCsvDate(j.created_at),
+          j.id,
+          "Escrow",
+          counterparty,
+          formatMusd(j.budget),
+          j.status || "",
+          j.txHash || j.tx_hash || "",
+        ]
+          .map(csvEscapeCell)
+          .join(","),
+      );
+    }
+    return "\uFEFF" + lines.join("\r\n");
+  }
+
+  function downloadBlob(content, filename, mime) {
+    var blob = new Blob([content], { type: mime });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  window.__exportHistoryCsv = function () {
+    var jobs = state.jobs || [];
+    var searchTerm = (state.jobSearch || "").toLowerCase().trim();
+    var from = state.jobDateFrom ? new Date(state.jobDateFrom).getTime() : null;
+    var to = state.jobDateTo ? new Date(state.jobDateTo).getTime() + 86400000 : null;
+    var filtered = jobs.filter(function (j) {
+      if (searchTerm) {
+        var hay = (
+          String(j.id) + " " + (j.description || "") + " " + (j.client || "") + " " + (j.provider || "")
+        ).toLowerCase();
+        if (hay.indexOf(searchTerm) === -1) return false;
+      }
+      if (from != null || to != null) {
+        var ts = Number(j.created_at) * 1000;
+        if (!Number.isFinite(ts)) return false;
+        if (from != null && ts < from) return false;
+        if (to != null && ts > to) return false;
+      }
+      return true;
+    });
+    if (filtered.length === 0) {
+      toast("No transactions to export", "error");
+      return;
+    }
+    var csv = buildTransactionCsv(filtered);
+    var walletPart = wallet.publicKey ? wallet.publicKey.slice(0, 8) : "demo";
+    var dateStr = new Date().toISOString().slice(0, 10);
+    var filename = "bear-transactions-" + walletPart + "-" + dateStr + ".csv";
+    downloadBlob(csv, filename, "text/csv;charset=utf-8");
+    toast("Exported " + filtered.length + " transactions");
+  };
 
   // ── Data Fetchers ──
   async function loadStats() {
