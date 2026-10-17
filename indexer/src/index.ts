@@ -1,6 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { rpc as StellarRpc } from "@stellar/stellar-sdk";
-import { openDatabase, EventStore, type QueryOptions, type ParsedEventRow } from "./db.js";
+import {
+  openDatabase,
+  EventStore,
+  runMigrations,
+  type QueryOptions,
+  type ParsedEventRow,
+  type MigrationOptions,
+  type MigrationResult,
+} from "./db.js";
 import { SorobanEventPoller, type PollerOptions } from "./poller.js";
 import {
   initTracing,
@@ -14,9 +22,7 @@ import {
   type ReputationBreakdown,
 } from "./reputation.js";
 
-export type { QueryOptions, ParsedEventRow };
-export type { TracingConfig };
-export type { AgentReputation, ReputationBreakdown };
+export type { QueryOptions, ParsedEventRow, MigrationOptions, MigrationResult };
 
 export type BearEventIndexerConfig = {
   /** Soroban RPC URL */
@@ -31,12 +37,12 @@ export type BearEventIndexerConfig = {
   startLedger?: number;
   /** Polling options */
   polling?: PollerOptions;
-  /** OpenTelemetry tracing configuration. Tracing is disabled when omitted. */
-  tracing?: TracingConfig;
-  /** Port for the reputation HTTP API. Default: 0 (disabled). */
-  apiPort?: number;
-  /** Host to bind the reputation HTTP API. Default: "127.0.0.1" */
-  apiHost?: string;
+  /**
+   * Migration options applied at startup. `openDatabase` runs pending
+   * migrations by default; set `dryRun` to preview without applying, or
+   * `rollbackTo` to revert to a previous schema version.
+   */
+  migrations?: MigrationOptions;
 };
 
 /**
@@ -61,10 +67,7 @@ export type BearEventIndexerConfig = {
 export class BearEventIndexer {
   private readonly store: EventStore;
   private readonly poller: SorobanEventPoller;
-  private readonly reputation: ReputationEngine;
-  private readonly apiPort: number;
-  private readonly apiHost: string;
-  private server: Server | null = null;
+  private readonly migrationResult: MigrationResult;
 
   constructor(config: BearEventIndexerConfig) {
     // Initialize OpenTelemetry before any instrumented work begins.
@@ -73,7 +76,10 @@ export class BearEventIndexer {
     const dbPath = config.dbPath ?? "./data/events.db";
     const startLedger = config.startLedger ?? 0;
 
-    const db = openDatabase(dbPath);
+    // openDatabase runs pending migrations (unless disabled) and throws if a
+    // migration fails, halting startup before any indexing begins.
+    const db = openDatabase(dbPath, config.migrations);
+    this.migrationResult = runMigrations(db, config.migrations);
     this.store = new EventStore(db);
     this.reputation = new ReputationEngine(db);
     this.apiPort = config.apiPort ?? 0;
@@ -100,6 +106,11 @@ export class BearEventIndexer {
     if (this.apiPort > 0) {
       await this.startApi();
     }
+  }
+
+  /** Returns the outcome of the migrations applied during construction. */
+  getMigrationResult(): MigrationResult {
+    return this.migrationResult;
   }
 
   /** Stop the indexer gracefully. */
@@ -225,7 +236,7 @@ export function createReputationHandler(
 }
 
 // Re-export lower-level primitives for advanced use-cases
-export { openDatabase, EventStore } from "./db.js";
+export { openDatabase, EventStore, runMigrations } from "./db.js";
 export { SorobanEventPoller } from "./poller.js";
 export { ReputationEngine } from "./reputation.js";
 export { initTracing, shutdownTracing, withSpan } from "./tracing.js";

@@ -13,8 +13,7 @@ import {
   validatePrompt,
   isMockLlm,
   MOCK_DELIVERABLES,
-  initTracing,
-  withSpan,
+  registerGracefulShutdown,
 } from "../shared.js";
 
 initTracing("seller-namer");
@@ -38,6 +37,13 @@ const startTime = Date.now();
 let jobsActive = 0;
 let jobsCompleted = 0;
 let jobsFailed = 0;
+
+// Tracks in-flight /job processing so graceful shutdown can wait for them.
+const activeTaskTracker = {
+  get active() {
+    return jobsActive;
+  },
+};
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -179,10 +185,4 @@ app.post("/job", limiter, async (req, res) => {
 });
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+registerGracefulShutdown(server, activeTaskTracker, null, { agentId: AGENT_ID });

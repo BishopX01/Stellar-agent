@@ -12,6 +12,8 @@ import {
   validateEnv,
   validatePrompt,
   isMockLlm,
+  registerGracefulShutdown,
+  createActiveTaskTracker,
   MOCK_DELIVERABLES,
   initTracing,
   withSpan,
@@ -35,6 +37,7 @@ const { app, seller, cfg } = await createSellerAgent({
 });
 
 const startTime = Date.now();
+const activeTaskTracker = createActiveTaskTracker();
 let jobsActive = 0;
 let jobsCompleted = 0;
 let jobsFailed = 0;
@@ -212,6 +215,7 @@ async function handleJob(
   res.json(response);
 
   jobsActive++;
+  const releaseTask = activeTaskTracker.track(`job:${jobId}`);
   try {
     console.log(`[${AGENT_ID}] Calling Groq...`);
     const research = await generate(task, resolvedDepth);
@@ -239,14 +243,9 @@ async function handleJob(
     console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
   } finally {
     jobsActive--;
+    releaseTask();
   }
 }
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+registerGracefulShutdown(server, activeTaskTracker, null, AGENT_ID);
