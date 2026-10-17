@@ -11,6 +11,7 @@ import {
   AgentConfigSchema,
   validateAgentConfig,
   autoRegister,
+  registerGracefulShutdown,
 } from "./shared.js";
 
 test("makeSellerResponse - returns standard response format with success true and execution_time_ms >= 0", () => {
@@ -385,4 +386,202 @@ test("autoRegister - throws on invalid config", async () => {
     },
     /Invalid agent config/,
   );
+});
+
+function makeFakeServer() {
+  let closeCalls = 0;
+  const server = {
+    close(cb?: (err?: Error) => void) {
+      closeCalls++;
+      if (cb) cb();
+    },
+  };
+  return { server, getCloseCalls: () => closeCalls };
+}
+
+function makeFakeTracker() {
+  let active = 0;
+  let waitCalls = 0;
+  return {
+    tracker: {
+      get activeCount() {
+        return active;
+      },
+      async waitForIdle() {
+        waitCalls++;
+        while (active > 0) {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+      },
+    },
+    setActive: (n: number) => {
+      active = n;
+    },
+    getWaitCalls: () => waitCalls,
+  };
+}
+
+function makeFakeDb() {
+  let closeCalls = 0;
+  return {
+    db: {
+      close() {
+        closeCalls++;
+      },
+    },
+    getCloseCalls: () => closeCalls,
+  };
+}
+
+test("registerGracefulShutdown - SIGTERM waits for in-flight task, closes server and db, exits 0", async () => {
+  const originalExit = process.exit;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  let exitCode: number | undefined;
+  // @ts-ignore
+  process.exit = (code?: number) => {
+    exitCode = code;
+    throw new Error(`process.exit called with ${code}`);
+  };
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server, getCloseCalls } = makeFakeServer();
+  const { tracker, setActive, getWaitCalls } = makeFakeTracker();
+  const { db, getCloseCalls: getDbCloseCalls } = makeFakeDb();
+
+  let taskCompleted = false;
+  setActive(1);
+  const task = (async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    taskCompleted = true;
+    setActive(0);
+  })();
+
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 5000,
+  });
+
+  try {
+    process.emit("SIGTERM");
+    // Allow the async shutdown handler to run to completion.
+    await new Promise((r) => setTimeout(r, 100));
+    await task;
+
+    assert.equal(taskCompleted, true);
+    assert.ok(getWaitCalls() >= 1);
+    assert.equal(getCloseCalls(), 1);
+    assert.equal(getDbCloseCalls(), 1);
+    assert.equal(exitCode, 0);
+  } finally {
+    unregister();
+    process.exit = originalExit;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("registerGracefulShutdown - SIGINT triggers graceful shutdown and exits 0", async () => {
+  const originalExit = process.exit;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  let exitCode: number | undefined;
+  // @ts-ignore
+  process.exit = (code?: number) => {
+    exitCode = code;
+    throw new Error(`process.exit called with ${code}`);
+  };
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server, getCloseCalls } = makeFakeServer();
+  const { tracker } = makeFakeTracker();
+  const { db, getCloseCalls: getDbCloseCalls } = makeFakeDb();
+
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 5000,
+  });
+
+  try {
+    process.emit("SIGINT");
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(getCloseCalls(), 1);
+    assert.equal(getDbCloseCalls(), 1);
+    assert.equal(exitCode, 0);
+  } finally {
+    unregister();
+    process.exit = originalExit;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("registerGracefulShutdown - exits non-zero when in-flight task exceeds timeout", async () => {
+  const originalExit = process.exit;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  let exitCode: number | undefined;
+  // @ts-ignore
+  process.exit = (code?: number) => {
+    exitCode = code;
+    throw new Error(`process.exit called with ${code}`);
+  };
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server, getCloseCalls } = makeFakeServer();
+  const { tracker, setActive } = makeFakeTracker();
+  const { db, getCloseCalls: getDbCloseCalls } = makeFakeDb();
+
+  // Simulate a task that never finishes within the timeout window.
+  setActive(1);
+
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 50,
+  });
+
+  try {
+    process.emit("SIGTERM");
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.equal(getCloseCalls(), 1);
+    assert.equal(getDbCloseCalls(), 1);
+    assert.notEqual(exitCode, 0);
+    assert.equal(typeof exitCode, "number");
+  } finally {
+    setActive(0);
+    unregister();
+    process.exit = originalExit;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("registerGracefulShutdown - unregister removes signal listeners", async () => {
+  const originalError = console.error;
+  const originalLog = console.log;
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server } = makeFakeServer();
+  const { tracker } = makeFakeTracker();
+  const { db } = makeFakeDb();
+
+  const before = process.listenerCount("SIGTERM");
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 5000,
+  });
+  assert.equal(process.listenerCount("SIGTERM"), before + 1);
+
+  try {
+    unregister();
+    assert.equal(process.listenerCount("SIGTERM"), before);
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+  }
 });
