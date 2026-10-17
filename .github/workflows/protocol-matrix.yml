@@ -1,0 +1,131 @@
+name: Protocol Matrix
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: protocol-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol-matrix:
+    name: Soroban ${{ matrix.protocol }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protocol: protocol-20
+            stellar_cli: "20.0.0"
+            soroban_sdk: "20.0.0"
+            rust: "stable"
+          - protocol: protocol-21
+            stellar_cli: "21.0.0"
+            soroban_sdk: "21.0.0"
+            rust: "stable"
+          - protocol: protocol-22
+            stellar_cli: "22.0.0"
+            soroban_sdk: "22.0.0"
+            rust: "stable"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Aggressive Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.protocol }}
+          cache-targets: true
+          cache-all-crates: true
+          cache-on-failure: true
+          workspaces: ". -> target"
+
+      - name: Cache stellar-cli binary
+        id: cache-stellar-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/stellar
+          key: stellar-cli-${{ runner.os }}-${{ matrix.stellar_cli }}
+
+      - name: Install stellar-cli ${{ matrix.stellar_cli }}
+        if: steps.cache-stellar-cli.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked stellar-cli --version ${{ matrix.stellar_cli }} --no-default-features --features opt
+
+      - name: Verify stellar-cli version
+        run: stellar --version
+
+      - name: Pin soroban-sdk ${{ matrix.soroban_sdk }}
+        run: |
+          if [ -f Cargo.toml ]; then
+            if grep -q "soroban-sdk" Cargo.toml; then
+              cargo update -p soroban-sdk --precise ${{ matrix.soroban_sdk }} || \
+                echo "soroban-sdk ${{ matrix.soroban_sdk }} not directly resolvable; continuing with manifest constraints"
+            else
+              echo "No soroban-sdk dependency found in Cargo.toml; skipping pin"
+            fi
+          else
+            echo "No Cargo.toml found; skipping pin"
+          fi
+
+      - name: cargo fmt check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        continue-on-error: true
+
+      - name: Run cargo test (${{ matrix.protocol }})
+        run: cargo test --workspace --all-features --verbose
+
+      - name: Build contracts with stellar contract build --optimize
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.toml ]; then
+            stellar contract build --optimize
+          else
+            echo "No Cargo.toml found; skipping contract build"
+          fi
+
+      - name: Upload optimized wasm artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-${{ matrix.protocol }}
+          path: |
+            target/wasm32-unknown-unknown/release/*.wasm
+            target/wasm32v1-none/release/*.wasm
+          if-no-files-found: ignore
+          retention-days: 7
+
+  compatibility-summary:
+    name: Compatibility summary
+    runs-on: ubuntu-latest
+    needs: protocol-matrix
+    if: always()
+    steps:
+      - name: Report matrix result
+        run: |
+          echo "Protocol matrix result: ${{ needs.protocol-matrix.result }}"
+          if [ "${{ needs.protocol-matrix.result }}" != "success" ]; then
+            echo "::error::One or more Soroban protocol matrix jobs failed. A protocol upgrade may break contract syntax or SDK compatibility."
+            exit 1
+          fi
+          echo "All Soroban protocol matrix jobs passed."

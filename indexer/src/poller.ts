@@ -17,10 +17,13 @@ export const BEAR_EVENT_TYPES = [
   "JobDisputed",
   "JobExpired",
   "JobRefunded",
+  "BatchJobsCreated",
   "Registered",
   "AgentDeregistered",
   "UriUpdated",
   "OwnerTransferred",
+  "BadgeIssued",
+  "BadgeRevoked",
 ] as const;
 
 export type BearEventType = (typeof BEAR_EVENT_TYPES)[number];
