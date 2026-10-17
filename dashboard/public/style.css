@@ -2591,3 +2591,301 @@ textarea:focus-visible,
   word-break: break-all;
   max-height: 220px;
 }
+
+/* ────────────────────────────────────────────
+   #754 — Notification Preferences Toggle
+   ──────────────────────────────────────────── */
+.notif-pref-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 4px;
+}
+.notif-pref-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.notif-pref-label svg {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.notif-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 38px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+.notif-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform 0.2s var(--ease), background 0.2s var(--ease);
+}
+.notif-toggle:hover {
+  border-color: var(--border-hover);
+}
+.notif-toggle[aria-checked="true"],
+.notif-toggle.active {
+  background: var(--accent-soft);
+  border-color: var(--border-accent);
+}
+.notif-toggle[aria-checked="true"]::after,
+.notif-toggle.active::after {
+  transform: translateX(16px);
+  background: var(--accent);
+}
+.notif-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.notif-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ────────────────────────────────────────────
+   #755 — Agent Filter Pills, Sort & Empty State
+   ──────────────────────────────────────────── */
+.agent-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.agent-filter-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+.filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s var(--ease);
+}
+.filter-pill:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.filter-pill.active {
+  background: var(--accent-soft);
+  border-color: var(--border-accent);
+  color: var(--accent);
+}
+.filter-pill .pill-count {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+.filter-pill.active .pill-count {
+  color: var(--accent);
+}
+.filter-pill-clear {
+  color: var(--text-dim);
+  border-style: dashed;
+}
+.filter-pill-clear:hover {
+  color: var(--status-cancelled);
+  border-color: rgba(248, 113, 113, 0.35);
+}
+.agent-sort-select {
+  appearance: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: var(--font);
+  font-weight: 500;
+  padding: 7px 30px 7px 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: border-color 0.15s, background 0.15s;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23868E96' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.agent-sort-select:hover {
+  border-color: var(--border-hover);
+  background-color: var(--bg-hover);
+}
+.agent-sort-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.agent-sort-select option {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+.empty-state .empty-clear-btn {
+  margin-top: 16px;
+}
+
+/* ────────────────────────────────────────────
+   #756 — Wallet Balance Widget & Faucet Button
+   ──────────────────────────────────────────── */
+.wallet-balance-widget {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+}
+.wallet-balance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+.wallet-balance-asset {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+.wallet-balance-asset::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.wallet-balance-asset.xlm::before {
+  background: var(--status-funded);
+}
+.wallet-balance-asset.usdc::before {
+  background: var(--status-submitted);
+}
+.wallet-balance-amount {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.wallet-balance-amount.loading {
+  color: var(--text-dim);
+}
+.faucet-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--border-accent);
+  transition: all 0.15s var(--ease);
+}
+.faucet-btn:hover:not(:disabled) {
+  background: var(--accent-glow);
+  border-color: var(--accent);
+}
+.faucet-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+.faucet-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.faucet-btn .spinner {
+  width: 12px;
+  height: 12px;
+  border-width: 2px;
+  margin: 0;
+}
+
+/* ────────────────────────────────────────────
+   #757 — CSV Export Button & Shared Spinner
+   ──────────────────────────────────────────── */
+.export-csv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: all 0.15s var(--ease);
+}
+.export-csv-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-hover);
+  background: var(--bg-hover);
+}
+.export-csv-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.export-csv-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.export-csv-btn svg {
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border-hover);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+.spinner.spinner-sm {
+  width: 12px;
+  height: 12px;
+  border-width: 2px;
+}

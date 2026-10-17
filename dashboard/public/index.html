@@ -149,6 +149,21 @@
           </div>
           <button class="disconnect-btn" onclick="window.__disconnectWallet()">Disconnect</button>
         </div>
+        <!-- Live wallet balance widget (#756) — hidden until testnet wallet connected -->
+        <div class="wallet-balance-widget" id="wallet-balance-widget" style="display: none">
+          <div class="wallet-balance-row">
+            <span class="wallet-balance-label">XLM</span>
+            <span class="wallet-balance-value" id="wallet-xlm-balance">0.00</span>
+          </div>
+          <div class="wallet-balance-row">
+            <span class="wallet-balance-label">USDC</span>
+            <span class="wallet-balance-value" id="wallet-usdc-balance">0.00</span>
+          </div>
+          <button class="faucet-btn" id="faucet-btn" onclick="window.__fundViaFriendbot()">
+            <span class="faucet-spinner" id="faucet-spinner" aria-hidden="true"></span>
+            <span class="faucet-label">Fund via Friendbot</span>
+          </button>
+        </div>
       </div>
       <div class="sidebar-footer">
         <div class="sidebar-footer-row">
@@ -180,6 +195,11 @@
               <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
             </svg>
           </button>
+        </div>
+        <!-- Desktop notification preferences toggle (#754) -->
+        <div class="notif-pref-row">
+          <label class="notif-pref-label" for="notif-toggle">Desktop notifications</label>
+          <input type="checkbox" id="notif-toggle" class="notif-toggle" onchange="window.__setNotificationsEnabled(this.checked)" />
         </div>
         <div class="testnet-badge" id="network-badge">
           <span class="badge-dot"></span>
