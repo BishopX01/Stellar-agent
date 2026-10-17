@@ -119,6 +119,104 @@ function ConnectButton() {
 }
 ```
 
+### `useWallet()`
+
+Multi-wallet connection hook that powers `<WalletConnectButton />`. It tracks the active provider (Freighter, xBull, or Albedo), the connected address, balance, and connection status, and exposes actions for connecting, switching wallets, and disconnecting.
+
+```tsx
+import { useWallet } from '@bear-protocol/react'
+
+function WalletStatus() {
+  const { connected, address, balance, provider, connect, switchWallet, disconnect } = useWallet()
+
+  if (!connected) return <button onClick={() => connect('freighter')}>Connect</button>
+
+  return (
+    <div>
+      <span>{provider}: {address?.slice(0, 6)}…{address?.slice(-4)}</span>
+      <span>{balance} XLM</span>
+      <button onClick={() => switchWallet('xbull')}>Switch</button>
+      <button onClick={disconnect}>Disconnect</button>
+    </div>
+  )
+}
+```
+
+## Components
+
+### `<WalletConnectButton />`
+
+A drop-in connect button with an avatar badge, truncated address, balance display, and a wallet selection modal. It works out of the box with a single line:
+
+```tsx
+import { WalletConnectButton } from '@bear-protocol/react'
+
+function Header() {
+  return <WalletConnectButton />
+}
+```
+
+When disconnected it renders a "Connect Wallet" trigger with the brand icon. Clicking it opens a responsive modal listing the supported providers (Freighter, xBull, and Albedo). When connected it shows the truncated address (`GABC…XYZ`), an avatar glyph, and the balance; clicking it opens a dropdown menu with **Copy Address**, **View on Explorer**, **Switch Wallet**, and **Disconnect**.
+
+Props:
+
+| Prop          | Type                                | Default     | Description                                                          |
+| ------------- | ----------------------------------- | ----------- | -------------------------------------------------------------------- |
+| `className`   | `string`                            | `undefined` | Extra class applied to the root element for custom styling.          |
+| `onConnect`   | `(address: string) => void`         | `undefined` | Called with the address after a successful connection.               |
+| `onDisconnect`| `() => void`                        | `undefined` | Called after the wallet is disconnected.                             |
+| `providers`   | `WalletProvider[]`                  | all         | Restrict or reorder the wallet providers shown in the modal.         |
+| `explorerUrl` | `(address: string) => string`       | network default | Customize the "View on Explorer" link target.                    |
+
+```tsx
+<WalletConnectButton
+  className="my-connect-button"
+  onConnect={(address) => console.log('connected', address)}
+  providers={['freighter', 'xbull']}
+/>
+```
+
+#### Custom styling
+
+All markup uses stable, prefixed class names (`bear-wallet-connect`, `bear-wallet-modal`, …) and CSS custom properties, so you can override the look without fighting specificity:
+
+```css
+.my-connect-button {
+  --bear-wallet-accent: #6d28d9;
+  --bear-wallet-radius: 9999px;
+  border-radius: var(--bear-wallet-radius);
+  background: var(--bear-wallet-accent);
+  color: white;
+}
+```
+
+#### Accessibility
+
+The modal and dropdown are fully keyboard accessible: focus is trapped inside the modal while open, `Escape` closes it, arrow keys move between providers, and focus is restored to the trigger on close. All interactive elements expose appropriate ARIA roles and labels.
+
+## SSR & Next.js
+
+The package is fully SSR-safe: no `window`, `document`, or `localStorage` access happens at module evaluation time, and the initial server render matches the client hydration state (wallets render as disconnected until hydration completes), so you get zero hydration mismatch warnings.
+
+Every hook and component entry point ships with a `'use client'` directive, so they work out of the box in the Next.js 14+ App Router. In a Server Component, just import and render them directly:
+
+```tsx
+// app/page.tsx (Server Component)
+import { WalletConnectButton } from '@bear-protocol/react'
+
+export default function Page() {
+  return <WalletConnectButton />
+}
+```
+
+Both the Pages Router and App Router are supported. A reference Next.js 14 app lives in `demo/nextjs-app` and is built in CI to verify clean SSR compilation.
+
+## Bundle size & tree-shaking
+
+The package is bundled with tsup as dual ESM + CJS output with TypeScript declarations. `@stellar/stellar-sdk`, `react`, and `react-dom` are peer dependencies and are never bundled. `sideEffects: false` is set so unused hooks and components are fully stripped by your bundler.
+
+The minified + gzipped bundle is guaranteed to stay **under 15 KB**, and a `bundlesize` check runs in CI on every pull request to enforce the limit.
+
 ### `useMarcFetch(keypair)`
 
 Wraps `marcFetch` and surfaces x402 payment status so you can render paywall UI while a request is being paid for.
@@ -167,9 +265,13 @@ https://bear-protocol.github.io/bear-protocol/
 
 ```bash
 npm install
-npm test        # Jest + React Testing Library
+npm test              # Vitest + React Testing Library (all hooks and components)
+npm run test:watch    # Vitest in watch mode
+npm run test:coverage # Vitest with coverage report (90%+ threshold)
 npm run storybook
 ```
+
+Tests run with Vitest in a jsdom environment (`vitest.config.ts`) and mock Soroban RPC / client responses to cover loading, success, and error states, unmount cleanup, and race-condition prevention on dependency changes.
 
 ## License
 
