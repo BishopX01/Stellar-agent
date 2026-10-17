@@ -25,6 +25,9 @@ pub enum Error {
     NotAdmin = 9,
     /// The token address is not on the approved whitelist.
     UnsupportedToken = 10,
+    /// #706 — the evaluator-asserted deliverable content hash does not match
+    /// the hash committed by the provider at submission time.
+    HashMismatch = 11,
 }
 
 /// Lifecycle states for a job escrow.
@@ -83,6 +86,10 @@ pub struct Job {
     pub status: JobStatus,
     pub description: String,
     pub deliverable: String,
+    /// #706 — SHA-256 content hash of the deliverable payload, committed by
+    /// the provider at `submit()` time. Immutable once set: `complete()` can
+    /// only assert equality against it, never overwrite it.
+    pub deliverable_hash: soroban_sdk::BytesN<32>,
     pub funded_at: u64,
     pub created_at: u64,
     pub updated_at: u64,
@@ -183,6 +190,8 @@ const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 const MIN_BUDGET: i128 = 1;
 /// #619 — maximum deliverable URI length to prevent storage griefing.
 const MAX_DELIVERABLE_LEN: u32 = 1024;
+/// #706 — maximum metadata URI length accepted alongside a content hash.
+const MAX_METADATA_URI_LEN: u32 = 1024;
 const MAX_EVALUATORS: u32 = 5;
 const DEFAULT_MULTI_EVAL_THRESHOLD: i128 = i128::MAX;
 const CHANNEL_DISPUTE_WINDOW_SECS: u64 = 24 * 60 * 60;
@@ -207,10 +216,16 @@ pub struct JobCreated {
 }
 
 /// Emitted when the provider submits a deliverable.
+///
+/// #706 — `deliverable_hash` is emitted as a topic so off-chain indexers can
+/// independently verify that the content they fetched matches the on-chain
+/// commitment, and detect any post-approval mutation of the deliverable.
 #[contractevent]
 pub struct JobSubmitted {
     #[topic]
     pub provider: Address,
+    #[topic]
+    pub deliverable_hash: soroban_sdk::BytesN<32>,
     pub job_id: u64,
 }
 
@@ -695,6 +710,8 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            // #706 — zero hash until the provider commits a real content hash.
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
@@ -809,6 +826,8 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            // #706 — zero hash until the provider commits a real content hash.
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
@@ -833,8 +852,21 @@ impl AgenticCommerceContract {
         next
     }
 
-    /// Provider submits the deliverable. Flips status Funded → Submitted.
-    pub fn submit(env: Env, caller: Address, id: u64, deliverable: String) {
+    /// Provider submits the deliverable together with its SHA-256 content hash.
+    /// Flips status Funded → Submitted.
+    ///
+    /// #706 — `deliverable_hash` is the SHA-256 digest of the deliverable
+    /// payload (32 bytes). It is stored immutably on the job: once submitted,
+    /// neither the provider nor the evaluator can change it. The evaluator can
+    /// later assert the hash in `complete()` to prove the content they reviewed
+    /// is exactly what was committed on-chain.
+    pub fn submit(
+        env: Env,
+        caller: Address,
+        id: u64,
+        deliverable: String,
+        deliverable_hash: soroban_sdk::BytesN<32>,
+    ) {
         Self::require_not_paused(&env); // #29
         caller.require_auth();
         let mut job: Job = env
@@ -861,13 +893,22 @@ impl AgenticCommerceContract {
         if deliverable.len() > MAX_DELIVERABLE_LEN {
             panic!("deliverable too long");
         }
+        // #706 — reject the all-zero digest: it is the sentinel used for
+        // "no hash committed yet" and must never be accepted as a real
+        // SHA-256 commitment.
+        let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        if deliverable_hash == zero_hash {
+            panic!("deliverable hash cannot be zero");
+        }
         job.status = JobStatus::Submitted;
         job.deliverable = deliverable;
+        job.deliverable_hash = deliverable_hash.clone();
         job.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobSubmitted {
             provider: caller,
+            deliverable_hash,
             job_id: id,
         }
         .publish(&env);
@@ -881,7 +922,17 @@ impl AgenticCommerceContract {
     /// still produce a non-zero fee. A minimum 1-unit floor is applied when
     /// the proportional fee rounds to zero but both `budget` and `fee_bps`
     /// are positive (#539).
-    pub fn complete(env: Env, caller: Address, id: u64) {
+    ///
+    /// #706 — the evaluator may pass `expected_hash` to attest that the
+    /// content they reviewed matches the hash committed at submission time.
+    /// If provided and it differs from the stored `deliverable_hash`, the call
+    /// panics with `Error::HashMismatch` and no funds move.
+    pub fn complete(
+        env: Env,
+        caller: Address,
+        id: u64,
+        expected_hash: Option<soroban_sdk::BytesN<32>>,
+    ) {
         Self::require_not_paused(&env); // #29
         caller.require_auth();
         let mut job: Job = env
@@ -898,6 +949,13 @@ impl AgenticCommerceContract {
         // #22 — evaluator may resolve a job in either Submitted or Disputed state.
         if job.status != JobStatus::Submitted && job.status != JobStatus::Disputed {
             panic_with_error!(&env, Error::InvalidStatus);
+        }
+        // #706 — optional content-hash attestation. Reject any assertion that
+        // does not match the immutable hash committed by the provider.
+        if let Some(expected) = expected_hash {
+            if expected != job.deliverable_hash {
+                panic_with_error!(&env, Error::HashMismatch);
+            }
         }
         // #23 — use the fee_bps snapshotted at job creation time so admin
         // changes to the global rate don't retroactively alter this job.
@@ -1701,6 +1759,8 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            // #706 — zero hash until the provider commits a real content hash.
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
@@ -1761,7 +1821,7 @@ impl AgenticCommerceContract {
         if is_blank {
             panic!("deliverable cannot be empty");
         }
-        if deliverable.len() > MAX_DELIVERABLE_LEN {
+        if deliverable.len() > MAX_METADATA_URI_LEN {
             panic!("deliverable too long");
         }
         let mut milestones: Vec<Milestone> = env

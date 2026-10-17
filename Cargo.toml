@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "contracts/agent-identity",
     "contracts/agentic-commerce",
+    "contracts/fuzz",
 ]
 
 [workspace.package]

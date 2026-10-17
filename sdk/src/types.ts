@@ -129,6 +129,17 @@ export interface Job {
   description: string;
   /** IPFS/URL link to the submitted work (empty until submitted). */
   deliverable: string;
+  /**
+   * SHA-256 content hash of the submitted deliverable (#706).
+   *
+   * Mirrors the on-chain `deliverable_hash: BytesN<32>` field. Stored as a
+   * 32-byte `Uint8Array` so it round-trips cleanly through `scValToNative`
+   * (Soroban `Bytes`/`BytesN` decode to `Uint8Array` in the JS SDK).
+   *
+   * Empty (all-zero / zero-length) until the provider submits a deliverable.
+   * Immutable once submitted — the contract rejects any later mutation.
+   */
+  deliverable_hash: Uint8Array;
   /** Unix timestamp when the job was funded. */
   funded_at: bigint;
   /** Unix timestamp when the job was created. */
@@ -419,4 +430,80 @@ export interface Milestone {
 export interface MilestoneInput {
   amount: bigint;
   description: string;
+}
+
+// ---------------------------------------------------------------------------
+// #706 — SHA-256 deliverable content hash verification
+// ---------------------------------------------------------------------------
+
+/**
+ * A 32-byte SHA-256 content hash, as committed on-chain via `BytesN<32>`.
+ *
+ * Accepts either the raw 32-byte buffer (`Uint8Array`) or a 64-character
+ * lowercase/uppercase hex string. Use {@link normalizeDeliverableHash} to
+ * convert a hex string into the canonical `Uint8Array` form before passing
+ * it to `submit()`.
+ *
+ * @example
+ * ```ts
+ * const hash: DeliverableHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+ * ```
+ */
+export type DeliverableHash = Uint8Array | string;
+
+/**
+ * Optional assertion passed to `complete()` so the evaluator can attest that
+ * the content they actually evaluated matches the hash committed at
+ * `submit()` time (#706).
+ *
+ * When provided, the contract compares `expectedHash` against the stored
+ * `deliverable_hash` and rejects the call with a mismatch error if they
+ * differ. Omit it to complete without an integrity assertion.
+ *
+ * @example
+ * ```ts
+ * await commerce.complete(evaluatorKeypair, jobId, {
+ *   expectedHash: sha256(deliverableBuffer),
+ * });
+ * ```
+ */
+export interface CompleteOptions {
+  /**
+   * The SHA-256 hash the evaluator asserts matches the submitted deliverable.
+   * Must equal the on-chain `deliverable_hash` or the transaction reverts.
+   */
+  expectedHash?: DeliverableHash;
+}
+
+/**
+ * Normalise a {@link DeliverableHash} into the canonical 32-byte
+ * `Uint8Array` expected by the contract's `BytesN<32>` parameter.
+ *
+ * - `Uint8Array` input is validated for length and returned as-is.
+ * - Hex string input (with or without a leading `0x`) is decoded.
+ *
+ * @throws {Error} If the input is not exactly 32 bytes / 64 hex characters.
+ */
+export function normalizeDeliverableHash(hash: DeliverableHash): Uint8Array {
+  if (hash instanceof Uint8Array) {
+    if (hash.length !== 32) {
+      throw new Error(
+        `deliverable hash must be exactly 32 bytes, received ${hash.length}`,
+      );
+    }
+    return hash;
+  }
+
+  const hex = hash.startsWith("0x") ? hash.slice(2) : hash;
+  if (hex.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error(
+      "deliverable hash must be a 64-character hex string or a 32-byte Uint8Array",
+    );
+  }
+
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
 }
