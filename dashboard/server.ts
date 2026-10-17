@@ -42,6 +42,11 @@ import {
   requireAuth,
   requireMatchingWallet,
 } from "./lib/auth.js";
+import {
+  createMatchmakingEngine,
+  type MatchmakingEngine,
+  type AgentDocument,
+} from "./lib/matchmaking.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -176,6 +181,58 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
 const identityContract = new Contract(cfg.identityContract);
 const commerceContract = new Contract(cfg.commerceContract);
 
+// ── #736: Semantic matchmaking engine ────────────────────────────────────────
+// Embeddings are generated lazily and cached in a vector index (sqlite-vec when
+// available, otherwise an in-memory cosine index). When the embedding engine is
+// disabled via EMBEDDINGS_ENABLED=false, the engine transparently falls back to
+// lexical (token-overlap) search so the endpoint keeps working.
+const matchmaking: MatchmakingEngine = createMatchmakingEngine({
+  enabled: process.env.EMBEDDINGS_ENABLED !== "false",
+  dimensions: Number(process.env.EMBEDDING_DIMENSIONS ?? 384),
+  model: process.env.EMBEDDING_MODEL ?? "Xenova/all-MiniLM-L6-v2",
+  sqlitePath: process.env.VECTOR_DB_PATH,
+});
+
+/** Build the text document that represents an agent for embedding purposes. */
+function agentToDocument(agent: {
+  id?: unknown;
+  owner?: unknown;
+  uri?: unknown;
+  [key: string]: unknown;
+}): AgentDocument {
+  const id = String(agent.id ?? agent.owner ?? "");
+  const parts: string[] = [];
+  if (agent.uri) parts.push(String(agent.uri));
+  for (const key of ["name", "description", "capabilities", "skills", "tags", "category"]) {
+    const value = agent[key];
+    if (typeof value === "string" && value.trim()) parts.push(value);
+    else if (Array.isArray(value)) parts.push(value.map(String).join(" "));
+  }
+  return { id, text: parts.join(" \n ").trim() || id };
+}
+
+/** Index a batch of agents into the matchmaking engine. */
+async function indexAgents(agents: Array<Record<string, unknown>>): Promise<void> {
+  const docs = agents.map((agent) => agentToDocument(agent));
+  await matchmaking.upsert(docs);
+}
+
+/** Index a single agent (called after registration). */
+async function indexAgent(agent: Record<string, unknown>): Promise<void> {
+  await matchmaking.upsert([agentToDocument(agent)]);
+}
+
+/** Warm the index on startup so the first match request is fast. */
+async function warmMatchmakingIndex(): Promise<void> {
+  try {
+    const agents = (await getAllAgents()) as unknown as Array<Record<string, unknown>>;
+    await indexAgents(agents);
+    console.log(`[matchmaking] indexed ${agents.length} agents (mode=${matchmaking.mode})`);
+  } catch (err) {
+    console.warn("[matchmaking] failed to warm index:", (err as Error).message);
+  }
+}
+
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
@@ -299,6 +356,11 @@ const jobsQuerySchema = z.object({
 const agentsQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(24),
+});
+
+const agentMatchSchema = z.object({
+  query: z.string().min(1, "query must be a non-empty string"),
+  topK: z.coerce.number().int().positive().max(100).default(10),
 });
 
 function parseBudget(value: string | number | undefined, defaultValue = 10_000_000n): bigint {
@@ -666,6 +728,196 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
+// GET /api/stats/historical — 30-day protocol analytics for the dashboard charts.
+// Aggregates daily volume, job counts, active jobs and settlement times from the
+// cached discovery helpers, plus top-earning agents and month-over-month deltas.
+const HISTORICAL_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+type HistoricalJob = {
+  id?: unknown;
+  status?: unknown;
+  budget?: unknown;
+  createdAt?: unknown;
+  completedAt?: unknown;
+  provider?: unknown;
+  seller?: unknown;
+};
+
+function toMs(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string") {
+    const asNum = Number(value);
+    if (Number.isFinite(asNum) && /^[0-9]+$/.test(value)) {
+      // Heuristic: treat large integers as unix seconds/ms, otherwise parse as date.
+      if (asNum > 1e12) return asNum;
+      if (asNum > 1e9) return asNum * 1000;
+    }
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function toBigIntSafe(value: unknown): bigint {
+  if (value === null || value === undefined) return 0n;
+  try {
+    return BigInt(value as string | number | bigint);
+  } catch {
+    return 0n;
+  }
+}
+
+function dayKey(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+app.get("/api/stats/historical", async (_req, res) => {
+  try {
+    const [agents, jobs] = await Promise.all([getAllAgents(), getAllJobs()]);
+    const now = Date.now();
+    const windowStart = now - HISTORICAL_DAYS * DAY_MS;
+    const prevWindowStart = windowStart - HISTORICAL_DAYS * DAY_MS;
+
+    // Pre-build the ordered list of day buckets (oldest → newest).
+    const buckets = new Map<
+      string,
+      { date: string; volume: bigint; jobCount: number; activeJobs: number; settlementSum: number; settlementCount: number }
+    >();
+    for (let i = HISTORICAL_DAYS - 1; i >= 0; i--) {
+      const key = dayKey(now - i * DAY_MS);
+      buckets.set(key, {
+        date: key,
+        volume: 0n,
+        jobCount: 0,
+        activeJobs: 0,
+        settlementSum: 0,
+        settlementCount: 0,
+      });
+    }
+
+    const earningsByProvider = new Map<string, bigint>();
+    let currentVolume = 0n;
+    let currentJobs = 0;
+    let currentSettlementSum = 0;
+    let currentSettlementCount = 0;
+    let prevVolume = 0n;
+    let prevJobs = 0;
+    let prevSettlementSum = 0;
+    let prevSettlementCount = 0;
+
+    for (const raw of jobs as HistoricalJob[]) {
+      const createdMs = toMs(raw.createdAt);
+      const completedMs = toMs(raw.completedAt);
+      const status = typeof raw.status === "string" ? raw.status : "";
+      const budget = toBigIntSafe(raw.budget);
+      const isActive = status === "Funded" || status === "Submitted" || status === "Active";
+
+      // Daily buckets only cover the current 30-day window.
+      if (createdMs !== null && createdMs >= windowStart && createdMs <= now) {
+        const bucket = buckets.get(dayKey(createdMs));
+        if (bucket) {
+          bucket.jobCount += 1;
+          bucket.volume += budget;
+          if (isActive) bucket.activeJobs += 1;
+        }
+      }
+
+      // Settlement time measured from creation to completion.
+      const settlementMs =
+        createdMs !== null && completedMs !== null && completedMs >= createdMs
+          ? completedMs - createdMs
+          : null;
+      if (settlementMs !== null && completedMs !== null) {
+        if (completedMs >= windowStart && completedMs <= now) {
+          const bucket = buckets.get(dayKey(completedMs));
+          if (bucket) {
+            bucket.settlementSum += settlementMs;
+            bucket.settlementCount += 1;
+          }
+          currentSettlementSum += settlementMs;
+          currentSettlementCount += 1;
+        } else if (completedMs >= prevWindowStart && completedMs < windowStart) {
+          prevSettlementSum += settlementMs;
+          prevSettlementCount += 1;
+        }
+      }
+
+      // Aggregate volume/jobs for current vs previous window (by creation date).
+      if (createdMs !== null) {
+        if (createdMs >= windowStart && createdMs <= now) {
+          currentVolume += budget;
+          currentJobs += 1;
+        } else if (createdMs >= prevWindowStart && createdMs < windowStart) {
+          prevVolume += budget;
+          prevJobs += 1;
+        }
+      }
+
+      // Top-earning agents: completed jobs credited to the provider.
+      if (status === "Completed" && completedMs !== null && completedMs >= windowStart) {
+        const provider = String(raw.provider ?? raw.seller ?? "");
+        if (provider) {
+          earningsByProvider.set(provider, (earningsByProvider.get(provider) ?? 0n) + budget);
+        }
+      }
+    }
+
+    const days = Array.from(buckets.values()).map((b) => ({
+      date: b.date,
+      volume: b.volume.toString(),
+      jobCount: b.jobCount,
+      activeJobs: b.activeJobs,
+      avgSettlementMs: b.settlementCount > 0 ? Math.round(b.settlementSum / b.settlementCount) : 0,
+    }));
+
+    const agentById = new Map<string, unknown>();
+    for (const agent of agents as Array<Record<string, unknown>>) {
+      const owner = String(agent.owner ?? agent.address ?? agent.publicKey ?? "");
+      if (owner) agentById.set(owner, agent.id ?? null);
+    }
+
+    const topAgents = Array.from(earningsByProvider.entries())
+      .map(([owner, earnings]) => ({
+        id: agentById.get(owner) ?? null,
+        owner,
+        earnings: earnings.toString(),
+      }))
+      .sort((a, b) => (BigInt(b.earnings) > BigInt(a.earnings) ? 1 : -1))
+      .slice(0, 10);
+
+    const currentAvgSettlementMs =
+      currentSettlementCount > 0 ? Math.round(currentSettlementSum / currentSettlementCount) : 0;
+    const prevAvgSettlementMs =
+      prevSettlementCount > 0 ? Math.round(prevSettlementSum / prevSettlementCount) : 0;
+
+    const pctDelta = (current: number, previous: number): number | null => {
+      if (previous === 0) return current === 0 ? 0 : null;
+      return Math.round(((current - previous) / previous) * 1000) / 10;
+    };
+
+    res.json({
+      days,
+      topAgents,
+      totals: {
+        volume: currentVolume.toString(),
+        jobs: currentJobs,
+        avgSettlementMs: currentAvgSettlementMs,
+      },
+      deltas: {
+        volumePct: pctDelta(Number(currentVolume), Number(prevVolume)),
+        jobsPct: pctDelta(currentJobs, prevJobs),
+        avgSettlementPct: pctDelta(currentAvgSettlementMs, prevAvgSettlementMs),
+      },
+    });
+  } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 app.get("/api/audit-trail", requireAuth, (_req, res) => {
   res.json(auditTrail.slice().reverse());
 });
@@ -744,6 +996,26 @@ app.get("/api/agents", async (req, res) => {
   }
 });
 
+// POST /api/agents/match — semantic agent discovery (#736)
+app.post("/api/agents/match", async (req, res) => {
+  try {
+    const parsed = agentMatchSchema.parse(req.body);
+    const started = process.hrtime.bigint();
+    const results = await matchmaking.match(parsed.query, parsed.topK);
+    const latencyMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+    res.json({
+      query: parsed.query,
+      topK: parsed.topK,
+      mode: matchmaking.mode,
+      latencyMs: Number(latencyMs.toFixed(2)),
+      results,
+    });
+  } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // POST /api/agents/register
 app.post(
   "/api/agents/register",
@@ -766,6 +1038,12 @@ app.post(
       const kp = getKeypair(parsed.wallet);
       const agentId = await identity.register(kp, parsed.uri || "ipfs://dashboard-agent");
       invalidateAgents();
+      // Index the newly registered agent for semantic discovery.
+      await indexAgent({
+        id: agentId.toString(),
+        owner: kp.publicKey(),
+        uri: parsed.uri || "ipfs://dashboard-agent",
+      }).catch((err) => console.warn("[matchmaking] index failed:", (err as Error).message));
       res.json({ agentId: agentId.toString() });
     } catch (err: unknown) {
       handleRouteError(err, res);
@@ -1187,6 +1465,242 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
   }
 });
 
+// --- #738: Revenue analytics & transaction accounting export ---
+
+const revenueReportQuerySchema = z.object({
+  wallet: stellarAddressSchema,
+  from: z.coerce.number().int().nonnegative().optional(),
+  to: z.coerce.number().int().nonnegative().optional(),
+  format: z.enum(["csv", "json"]).default("json"),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(1000).default(100),
+});
+
+type RevenueRow = {
+  timestamp: number;
+  transactionHash: string;
+  ledger: number;
+  jobId: string;
+  role: "provider" | "client";
+  token: string;
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+};
+
+type RevenueAggregate = {
+  period: string;
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+  count: number;
+};
+
+/** Escape a single CSV field per RFC 4180 (quote if it contains , " \r or \n). */
+function csvEscape(value: unknown): string {
+  const str = value === null || value === undefined ? "" : String(value);
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+/** Serialize rows to RFC 4180 CSV with CRLF line endings. */
+function toCsv(headers: string[], rows: Array<Array<unknown>>): string {
+  const lines = [headers.map(csvEscape).join(",")];
+  for (const row of rows) {
+    lines.push(row.map(csvEscape).join(","));
+  }
+  return lines.join("\r\n") + "\r\n";
+}
+
+/** Format a Unix timestamp (seconds) as an ISO-8601 UTC date-time string. */
+function formatTimestamp(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function dayKey(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 10);
+}
+
+function monthKey(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 7);
+}
+
+function aggregateRevenue(rows: RevenueRow[], keyFn: (ts: number) => string): RevenueAggregate[] {
+  const buckets = new Map<string, { gross: bigint; fee: bigint; net: bigint; count: number }>();
+  for (const row of rows) {
+    const key = keyFn(row.timestamp);
+    const bucket = buckets.get(key) ?? { gross: 0n, fee: 0n, net: 0n, count: 0 };
+    bucket.gross += BigInt(row.grossAmount);
+    bucket.fee += BigInt(row.feeAmount);
+    bucket.net += BigInt(row.netAmount);
+    bucket.count += 1;
+    buckets.set(key, bucket);
+  }
+  return Array.from(buckets.entries())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([period, b]) => ({
+      period,
+      grossAmount: b.gross.toString(),
+      feeAmount: b.fee.toString(),
+      netAmount: b.net.toString(),
+      count: b.count,
+    }));
+}
+
+/**
+ * Extract accounting rows from a JobCompleted event payload. The event data is
+ * expected to carry the job id, provider, client, token, gross budget and fee.
+ * Amounts are normalized to raw token units (strings) so gross - fee = net
+ * reconciles exactly with on-chain transfers.
+ */
+function extractRevenueRow(
+  event: any,
+  wallet: string,
+): RevenueRow | null {
+  const data = event?.data ?? event?.value ?? event ?? {};
+  const jobId = data.jobId ?? data.job_id ?? event?.jobId ?? event?.job_id;
+  const provider = data.provider ?? event?.provider;
+  const client = data.client ?? data.buyer ?? event?.client ?? event?.buyer;
+  const token = data.token ?? event?.token ?? cfg.usdcToken;
+  const grossRaw = data.budget ?? data.grossAmount ?? data.gross_amount ?? event?.budget;
+  const feeRaw = data.fee ?? data.feeAmount ?? data.fee_amount ?? 0;
+
+  if (jobId === undefined || jobId === null) return null;
+  if (grossRaw === undefined || grossRaw === null) return null;
+
+  let role: "provider" | "client" | null = null;
+  if (provider === wallet) role = "provider";
+  else if (client === wallet) role = "client";
+  if (!role) return null;
+
+  const gross = BigInt(grossRaw);
+  const fee = BigInt(feeRaw);
+  const net = gross - fee;
+
+  const ledger = Number(event?.ledger ?? event?.ledgerSequence ?? 0);
+  const txHash = String(event?.txHash ?? event?.transactionHash ?? event?.tx_hash ?? "");
+  const ts = Number(event?.timestamp ?? event?.closedAt ?? event?.ledgerClosedAt ?? 0);
+  const timestamp = Number.isFinite(ts) && ts > 0 ? ts : Math.floor(Date.now() / 1000);
+
+  return {
+    timestamp,
+    transactionHash: txHash,
+    ledger,
+    jobId: String(jobId),
+    role,
+    token: String(token),
+    grossAmount: gross.toString(),
+    feeAmount: fee.toString(),
+    netAmount: net.toString(),
+  };
+}
+
+// GET /api/reports/revenue — export revenue ledger as CSV or JSON
+app.get("/api/reports/revenue", async (req, res) => {
+  try {
+    const parsed = revenueReportQuerySchema.parse(req.query);
+    if (parsed.from !== undefined && parsed.to !== undefined && parsed.from > parsed.to) {
+      res.status(400).json({ error: "'from' must be less than or equal to 'to'" });
+      return;
+    }
+
+    const allEvents = await events.getEvents();
+    const rows: RevenueRow[] = [];
+    for (const ev of allEvents as any[]) {
+      const name = ev?.type ?? ev?.name ?? ev?.topic?.[0];
+      if (name !== "JobCompleted" && name !== "job_completed") continue;
+      const row = extractRevenueRow(ev, parsed.wallet);
+      if (!row) continue;
+      if (parsed.from !== undefined && row.timestamp < parsed.from) continue;
+      if (parsed.to !== undefined && row.timestamp > parsed.to) continue;
+      rows.push(row);
+    }
+
+    rows.sort((a, b) => a.timestamp - b.timestamp);
+
+    const daily = aggregateRevenue(rows, dayKey);
+    const monthly = aggregateRevenue(rows, monthKey);
+
+    const totalGross = rows.reduce((acc, r) => acc + BigInt(r.grossAmount), 0n);
+    const totalFee = rows.reduce((acc, r) => acc + BigInt(r.feeAmount), 0n);
+    const totalNet = rows.reduce((acc, r) => acc + BigInt(r.netAmount), 0n);
+
+    const total = rows.length;
+    const offset = (parsed.page - 1) * parsed.pageSize;
+    const pageRows = rows.slice(offset, offset + parsed.pageSize);
+
+    const headers = [
+      "Timestamp",
+      "TransactionHash",
+      "Ledger",
+      "JobId",
+      "Role",
+      "Token",
+      "GrossAmount",
+      "FeeAmount",
+      "NetAmount",
+    ];
+
+    const filename = `revenue-report-${parsed.wallet.slice(0, 8)}-${Date.now()}`;
+
+    if (parsed.format === "csv") {
+      const csvRows = pageRows.map((r) => [
+        formatTimestamp(r.timestamp),
+        r.transactionHash,
+        r.ledger,
+        r.jobId,
+        r.role,
+        r.token,
+        r.grossAmount,
+        r.feeAmount,
+        r.netAmount,
+      ]);
+      const csv = toCsv(headers, csvRows);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}.csv"`);
+      res.send(csv);
+      return;
+    }
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}.json"`);
+    res.json({
+      wallet: parsed.wallet,
+      from: parsed.from ?? null,
+      to: parsed.to ?? null,
+      pagination: {
+        page: parsed.page,
+        pageSize: parsed.pageSize,
+        total,
+        hasNext: offset + parsed.pageSize < total,
+      },
+      totals: {
+        grossAmount: totalGross.toString(),
+        feeAmount: totalFee.toString(),
+        netAmount: totalNet.toString(),
+        count: total,
+      },
+      daily,
+      monthly,
+      rows: pageRows.map((r) => ({
+        Timestamp: formatTimestamp(r.timestamp),
+        TransactionHash: r.transactionHash,
+        Ledger: r.ledger,
+        JobId: r.jobId,
+        Role: r.role,
+        Token: r.token,
+        GrossAmount: r.grossAmount,
+        FeeAmount: r.feeAmount,
+        NetAmount: r.netAmount,
+      })),
+    });
+  } catch (err: unknown) {
+    handleRouteError(err, res);
+  }
+});
+
 // GET /api/balance/:pubkey — get XLM + MUSD balance for any public key
 app.get("/api/balance/:pubkey", async (req, res) => {
   try {
@@ -1225,4 +1739,7 @@ app.listen(PORT, () => {
   console.log(`Bear Dashboard → http://localhost:${PORT}`);
   console.log(`  Buyer:  ${buyerKeypair.publicKey()}`);
   console.log(`  Seller: ${sellerKeypair.publicKey()}`);
+  void warmMatchmakingIndex();
 });
+
+export { app, matchmaking };

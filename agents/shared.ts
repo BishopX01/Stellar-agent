@@ -171,6 +171,150 @@ export interface BuyerAgentDeps {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Tracks in-flight jobs so they can be awaited during graceful shutdown.
+ */
+export interface ActiveTaskTracker {
+  track: (task: Promise<unknown>) => Promise<unknown>;
+  untrack: (task: Promise<unknown>) => void;
+  awaitAll: (timeoutMs: number) => Promise<boolean>;
+  size: () => number;
+}
+
+/**
+ * Create an ActiveTaskTracker. Tasks passed to `track` are awaited by `awaitAll`.
+ * `awaitAll` resolves to true if all tasks settled before the timeout, false otherwise.
+ */
+export function createActiveTaskTracker(): ActiveTaskTracker {
+  const tasks = new Set<Promise<unknown>>();
+
+  const untrack = (task: Promise<unknown>) => {
+    tasks.delete(task);
+  };
+
+  return {
+    track(task: Promise<unknown>) {
+      tasks.add(task);
+      task.then(
+        () => untrack(task),
+        () => untrack(task),
+      );
+      return task;
+    },
+    untrack,
+    async awaitAll(timeoutMs: number): Promise<boolean> {
+      if (tasks.size === 0) return true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      });
+      const settled = Promise.allSettled([...tasks]).then(() => true as const);
+      try {
+        return await Promise.race([settled, timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+    size() {
+      return tasks.size;
+    },
+  };
+}
+
+export interface GracefulShutdownServer {
+  close: (callback?: (err?: Error) => void) => unknown;
+}
+
+export interface GracefulShutdownDb {
+  close: () => void;
+}
+
+export interface GracefulShutdownOptions {
+  timeoutMs?: number;
+  logger?: Pick<Console, "log" | "warn" | "error">;
+  exit?: (code: number) => void;
+}
+
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15000;
+
+/**
+ * Flush any buffered log output. Console writes are synchronous for TTYs and
+ * pipes in Node, so this is a no-op hook that can be overridden by callers.
+ */
+function flushLogs(logger: Pick<Console, "log" | "warn" | "error">): void {
+  try {
+    (logger as { flush?: () => void }).flush?.();
+  } catch {
+    // ignore flush errors during shutdown
+  }
+}
+
+/**
+ * Install SIGTERM/SIGINT handlers that gracefully drain in-flight work.
+ * Idempotent: repeated calls are ignored after the first registration.
+ */
+export function registerGracefulShutdown(
+  server: GracefulShutdownServer,
+  activeTaskTracker: ActiveTaskTracker,
+  db?: GracefulShutdownDb,
+  options: GracefulShutdownOptions = {},
+): () => void {
+  const logger = options.logger ?? console;
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+
+  let shuttingDown = false;
+
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.log(`[shutdown] received ${signal}, draining in-flight tasks...`);
+
+    const serverClosed = new Promise<void>((resolve) => {
+      try {
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
+
+    const drained = await activeTaskTracker.awaitAll(timeoutMs);
+    await serverClosed;
+
+    if (!drained) {
+      logger.warn(
+        `[shutdown] timed out after ${timeoutMs}ms with ${activeTaskTracker.size()} task(s) still running`,
+      );
+      flushLogs(logger);
+      exit(1);
+      return;
+    }
+
+    if (db) {
+      try {
+        db.close();
+      } catch (err) {
+        logger.error("[shutdown] failed to close database", err);
+      }
+    }
+
+    flushLogs(logger);
+    logger.log("[shutdown] complete");
+    exit(0);
+  };
+
+  const onSigterm = () => void shutdown("SIGTERM");
+  const onSigint = () => void shutdown("SIGINT");
+
+  process.once("SIGTERM", onSigterm);
+  process.once("SIGINT", onSigint);
+
+  return () => {
+    process.removeListener("SIGTERM", onSigterm);
+    process.removeListener("SIGINT", onSigint);
+  };
+}
+
+/**
  * Run the full buyer flow: classify -> registry lookup -> select -> escrow -> poll.
  */
 export async function runBuyerAgent(

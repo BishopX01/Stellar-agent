@@ -1034,14 +1034,292 @@
     overlay.className = "modal-overlay";
     const modal = document.createElement("div");
     modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
     modal.innerHTML = contentHtml; // Safe: only called with our own static template strings
     overlay.appendChild(modal);
     overlay.addEventListener("click", (e) => {
       if (e.target === overlay) overlay.remove();
     });
     document.body.appendChild(overlay);
+    // #748 — focus trapping and keyboard handlers for accessibility
+    trapModalFocus(overlay);
     return overlay;
   }
+
+  // #748 — Focus trap: keep Tab cycling inside the modal, Escape closes it.
+  function trapModalFocus(overlay) {
+    var modal = overlay.querySelector(".modal");
+    if (!modal) return;
+    var previousActive = document.activeElement;
+    function focusables() {
+      return Array.prototype.slice
+        .call(
+          modal.querySelectorAll(
+            'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ),
+        )
+        .filter(function (el) {
+          return el.offsetParent !== null || el === document.activeElement;
+        });
+    }
+    function onKeyDown(e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeModal(overlay);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      var items = focusables();
+      if (items.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      var first = items[0];
+      var last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    function closeModal(el) {
+      document.removeEventListener("keydown", onKeyDown, true);
+      el.remove();
+      if (previousActive && typeof previousActive.focus === "function") {
+        try {
+          previousActive.focus();
+        } catch (err) {}
+      }
+    }
+    overlay.__closeModal = function () {
+      closeModal(overlay);
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    // Move focus into the modal
+    var items = focusables();
+    if (items.length > 0) {
+      try {
+        items[0].focus();
+      } catch (err) {}
+    }
+  }
+
+  // ── Pre-flight Transaction Simulation (#746) ──
+  // Wraps the Stellar SDK rpc.Server.simulateTransaction() so the dashboard can
+  // show estimated fees, resource consumption and balance diffs before the
+  // wallet signature prompt is opened.
+
+  // Resolve the configured RPC URL (falls back to the public testnet endpoint).
+  function getRpcUrl() {
+    if (window.__BEAR_RPC_URL) return window.__BEAR_RPC_URL;
+    var meta = document.querySelector('meta[name="bear-rpc-url"]');
+    if (meta && meta.getAttribute("content")) return meta.getAttribute("content");
+    return "https://soroban-testnet.stellar.org";
+  }
+
+  // Lazily construct an rpc.Server from the Stellar SDK (UMD global `StellarSdk`).
+  var _rpcServer = null;
+  function getRpcServer() {
+    if (_rpcServer) return _rpcServer;
+    var sdk = window.StellarSdk || window.Stellar;
+    if (!sdk || !sdk.rpc || typeof sdk.rpc.Server !== "function") {
+      throw new Error("Stellar SDK rpc.Server is not available");
+    }
+    _rpcServer = new sdk.rpc.Server(getRpcUrl(), { allowHttp: getRpcUrl().indexOf("http://") === 0 });
+    return _rpcServer;
+  }
+
+  /**
+   * Simulate a transaction XDR against the configured Soroban RPC server.
+   * Returns the raw simulation result (or throws on transport errors).
+   */
+  async function simulateTransaction(txXdr) {
+    var server = getRpcServer();
+    var sdk = window.StellarSdk || window.Stellar;
+    var tx = sdk.TransactionBuilder.fromXDR(txXdr, sdk.Networks.TESTNET);
+    return await server.simulateTransaction(tx);
+  }
+
+  /**
+   * Parse a simulateTransaction() result into a display-friendly summary.
+   * Extracts CPU instructions, memory bytes, min resource fee and balance diffs.
+   */
+  function parseSimulationResult(result) {
+    var out = {
+      success: true,
+      cpuInsns: 0,
+      memBytes: 0,
+      minResourceFee: "0",
+      networkFeeXlm: "0.0000000",
+      balanceDiffs: [],
+      error: null,
+    };
+    if (!result) {
+      out.success = false;
+      out.error = "Empty simulation result";
+      return out;
+    }
+    // Soroban RPC returns { error } on failure, or { transactionData, cost, ... } on success.
+    if (result.error) {
+      out.success = false;
+      out.error = result.error;
+      return out;
+    }
+    var cost = result.cost || (result.result && result.result.cost) || {};
+    out.cpuInsns = Number(cost.cpuInsns || cost.cpu_insns || 0) || 0;
+    out.memBytes = Number(cost.memBytes || cost.mem_bytes || 0) || 0;
+    var minFee = result.minResourceFee != null ? result.minResourceFee : result.min_resource_fee;
+    out.minResourceFee = minFee != null ? String(minFee) : "0";
+    // Convert stroops (1 XLM = 10,000,000 stroops) to XLM.
+    var stroops = Number(out.minResourceFee);
+    if (Number.isFinite(stroops)) {
+      out.networkFeeXlm = (stroops / 10000000).toFixed(7);
+    }
+    // Extract balance diffs from the returned ledger entries / events when present.
+    var diffs = result.balanceDiffs || result.balance_diffs;
+    if (Array.isArray(diffs)) {
+      out.balanceDiffs = diffs.map(function (d) {
+        return {
+          asset: d.asset || d.token || "XLM",
+          amount: String(d.amount != null ? d.amount : d.delta != null ? d.delta : "0"),
+          address: d.address || d.account || "",
+        };
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Extract a Soroban contract error code/message from a failed simulation.
+   * Returns { code, message } or null when no error is present.
+   */
+  function extractSimulationError(result) {
+    if (!result) return null;
+    var raw = result.error;
+    if (!raw && result.status && result.status !== "SUCCESS") raw = result.status;
+    if (!raw) return null;
+    var text = typeof raw === "string" ? raw : errorText(raw);
+    var code = extractSorobanCode(text);
+    return {
+      code: code,
+      message: formatSorobanError(text),
+      raw: text,
+    };
+  }
+
+  // Render the pre-flight confirmation modal. Resolves true when the user
+  // confirms, false when they cancel.
+  function showSimulationModal(details) {
+    return new Promise(function (resolve) {
+      var sim = details.simulation || {};
+      var failed = sim.success === false;
+      var body;
+      if (failed) {
+        var err = extractSimulationError({ error: sim.error });
+        body =
+          '<div class="sim-error" role="alert">' +
+          '<div class="sim-error-title">Transaction would fail</div>' +
+          '<div class="sim-error-msg">' +
+          escapeHtml(err ? err.message : "Simulation failed") +
+          "</div>" +
+          (err && err.code != null
+            ? '<div class="sim-error-code">Contract error code: ' + escapeHtml(String(err.code)) + "</div>"
+            : "") +
+          "</div>";
+      } else {
+        var diffsHtml = "";
+        if (Array.isArray(sim.balanceDiffs) && sim.balanceDiffs.length > 0) {
+          diffsHtml = '<div class="sim-section"><div class="sim-section-title">Projected Balances</div>';
+          for (var i = 0; i < sim.balanceDiffs.length; i++) {
+            var d = sim.balanceDiffs[i];
+            diffsHtml +=
+              '<div class="sim-row"><span class="sim-row-label">' +
+              escapeHtml(d.asset) +
+              "</span><span class=\"sim-row-value\">" +
+              escapeHtml(d.amount) +
+              "</span></div>";
+          }
+          diffsHtml += "</div>";
+        }
+        body =
+          '<div class="sim-section">' +
+          '<div class="sim-row"><span class="sim-row-label">Action</span><span class="sim-row-value">' +
+          escapeHtml(details.action || "Transaction") +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Target Contract</span><span class="sim-row-value sim-mono">' +
+          escapeHtml(details.targetContract || "—") +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Budget Amount</span><span class="sim-row-value">' +
+          escapeHtml(details.budgetAmount || "—") +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Network Fee</span><span class="sim-row-value">' +
+          escapeHtml(sim.networkFeeXlm) +
+          " XLM</span></div>" +
+          "</div>" +
+          '<div class="sim-section"><div class="sim-section-title">Resource Consumption</div>' +
+          '<div class="sim-row"><span class="sim-row-label">CPU Instructions</span><span class="sim-row-value">' +
+          escapeHtml(String(sim.cpuInsns)) +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Memory</span><span class="sim-row-value">' +
+          escapeHtml(String(sim.memBytes)) +
+          " bytes</span></div>" +
+          "</div>" +
+          diffsHtml;
+      }
+      var actions = failed
+        ? '<button class="btn btn-secondary" data-sim-cancel>Close</button>'
+        : '<button class="btn btn-secondary" data-sim-cancel>Cancel</button>' +
+          '<button class="btn btn-primary" data-sim-confirm>Confirm &amp; Sign</button>';
+      var overlay = showModal(
+        '<h2 class="modal-title">Review Transaction</h2>' + body + '<div class="modal-actions">' + actions + "</div>",
+      );
+      function finish(value) {
+        if (overlay.__closeModal) overlay.__closeModal();
+        else overlay.remove();
+        resolve(value);
+      }
+      var cancelBtn = overlay.querySelector("[data-sim-cancel]");
+      if (cancelBtn) cancelBtn.addEventListener("click", function () { finish(false); });
+      var confirmBtn = overlay.querySelector("[data-sim-confirm]");
+      if (confirmBtn) confirmBtn.addEventListener("click", function () { finish(true); });
+    });
+  }
+
+  // Build, simulate, and (on user confirmation) sign & submit a transaction.
+  // Returns the submit result, or null when the user cancels / simulation fails.
+  async function simulateThenSubmit(buildEndpoint, params, details) {
+    await ensureSession();
+    var buildRes = await api(buildEndpoint, {
+      method: "POST",
+      body: { publicKey: wallet.publicKey, ...params },
+    });
+    var simulation;
+    try {
+      var raw = await simulateTransaction(buildRes.xdr);
+      simulation = parseSimulationResult(raw);
+    } catch (e) {
+      simulation = { success: false, error: errorText(e) };
+    }
+    var confirmed = await showSimulationModal({
+      action: details && details.action,
+      targetContract: details && details.targetContract,
+      budgetAmount: details && details.budgetAmount,
+      simulation: simulation,
+    });
+    if (!confirmed || simulation.success === false) return null;
+    // User confirmed a successful simulation — now open the wallet prompt.
+    var signedXdr = await signWalletTransaction(buildRes.xdr);
+    return await apiClientSubmit(signedXdr);
+  }
+
+  // Expose parsers for unit testing (#746)
+  window.__parseSimulationResult = parseSimulationResult;
+  window.__extractSimulationError = extractSimulationError;
+  window.__simulateTransaction = simulateTransaction;
+  window.__showSimulationModal = showSimulationModal;
 
   // ── Skeleton Loaders (#582) ──
   function skeletonCards(n) {
@@ -2302,15 +2580,24 @@
     const providerVal = providerEl && providerEl.value.trim() ? providerEl.value.trim() : undefined;
     const overlay = document.querySelector(".modal-overlay");
     if (overlay) overlay.remove();
-    showTxOverlay("Creating job on Stellar...");
     try {
       if (wallet.connected) {
         const params = { description: description, budget: budget };
         if (providerVal) params.provider = providerVal;
-        const res = await signAndSubmit("/build/createJob", params);
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/createJob", params, {
+          action: "Create Job",
+          targetContract: "Bear Escrow",
+          budgetAmount: formatMusd(budget) + " MUSD",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
         hideTxOverlay();
         toast("Job created! tx: " + (res.hash || "").slice(0, 8) + "...");
       } else {
+        showTxOverlay("Creating job on Stellar...");
         const body = { wallet: walletVal, description: description, budget: budget };
         if (providerVal) body.provider = providerVal;
         const res = await api("/jobs/create", { method: "POST", body: body });
@@ -2330,14 +2617,25 @@
   window.__submitJob = async function (id) {
     if (state.txPending) return;
     state.txPending = true;
-    showTxOverlay("Submitting work...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/submit", {
-          jobId: id,
-          deliverable: "ipfs://dashboard-delivery-" + id,
-        });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit(
+          "/build/submit",
+          { jobId: id, deliverable: "ipfs://dashboard-delivery-" + id },
+          {
+            action: "Submit Work",
+            targetContract: "Bear Escrow",
+            budgetAmount: "—",
+          },
+        );
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Submitting work...");
         await api("/jobs/" + id + "/submit", {
           method: "POST",
           body: { wallet: "seller", deliverable: "ipfs://dashboard-delivery-" + id },
@@ -2358,11 +2656,21 @@
   window.__completeJob = async function (id) {
     if (state.txPending) return;
     state.txPending = true;
-    showTxOverlay("Completing job & releasing funds...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/complete", { jobId: id });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/complete", { jobId: id }, {
+          action: "Complete Job (Release Funds)",
+          targetContract: "Bear Escrow",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Completing job & releasing funds...");
         await api("/jobs/" + id + "/complete", { method: "POST", body: { wallet: "buyer" } });
       }
       hideTxOverlay();
@@ -2380,11 +2688,21 @@
   window.__approveJob = async function (id) {
     if (state.txPending) return;
     state.txPending = true;
-    showTxOverlay("Recording evaluator approval...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/approve", { jobId: id });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/approve", { jobId: id }, {
+          action: "Approve Job",
+          targetContract: "Bear Escrow",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Recording evaluator approval...");
         await api("/jobs/" + id + "/approve", { method: "POST", body: { wallet: "buyer" } });
       }
       hideTxOverlay();
@@ -2405,11 +2723,21 @@
     if (!confirmed) return;
 
     state.txPending = true;
-    showTxOverlay("Cancelling job & refunding...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/cancel", { jobId: id });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/cancel", { jobId: id }, {
+          action: "Cancel Job (Refund)",
+          targetContract: "Bear Escrow",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Cancelling job & refunding...");
         await api("/jobs/" + id + "/cancel", { method: "POST", body: { wallet: "buyer" } });
       }
       hideTxOverlay();
@@ -2451,16 +2779,25 @@
     const walletVal = walletEl ? walletEl.value : "buyer";
     const overlay = document.querySelector(".modal-overlay");
     if (overlay) overlay.remove();
-    showTxOverlay("Registering agent on Stellar...");
     try {
       let agentId = null;
       if (wallet.connected) {
         // Pass 'connected' so the server uses the caller's public key regardless
         // of which wallet adapter (Freighter, Albedo, xBull…) is active. (#584)
-        const res = await signAndSubmit("/agents/register", { wallet: "connected", uri: uri });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/agents/register", { wallet: "connected", uri: uri }, {
+          action: "Register Agent",
+          targetContract: "Agent Registry",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
         hideTxOverlay();
         toast("Agent registered! tx: " + (res.hash || "").slice(0, 8) + "...");
       } else {
+        showTxOverlay("Registering agent on Stellar...");
         const res = await api("/agents/register", {
           method: "POST",
           body: { wallet: walletVal, uri: uri },

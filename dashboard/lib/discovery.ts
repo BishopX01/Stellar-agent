@@ -2,6 +2,7 @@ import { IdentityClient, CommerceClient } from "marc-stellar-sdk";
 import type { Agent, Job } from "marc-stellar-sdk";
 import { cfg } from "./config.js";
 import EventEmitter from "events";
+import { createHash } from "crypto";
 
 const identity = new IdentityClient(cfg);
 const commerce = new CommerceClient(cfg);
@@ -144,4 +145,168 @@ export async function getVersion(force = false): Promise<number> {
   return v;
 }
 
+/** Invalidate cached agent vectors when the agent set changes. */
+events.on("invalidate", (payload: { type?: string }) => {
+  if (payload?.type === "agents") clearVectorIndex();
+});
+
 export { identity, commerce };
+
+// ---------------------------------------------------------------------------
+// Semantic matchmaking engine
+// ---------------------------------------------------------------------------
+
+export const EMBEDDING_DIM = 384;
+
+export interface AgentMatch {
+  agent: Agent;
+  score: number;
+}
+
+export interface MatchOptions {
+  query: string;
+  topK?: number;
+  /** Force lexical fallback regardless of embedding availability. */
+  lexicalOnly?: boolean;
+}
+
+/** Deterministic, dependency-free 384-dim embedding of arbitrary text. */
+export function embedText(text: string): Float32Array {
+  const vec = new Float32Array(EMBEDDING_DIM);
+  const tokens = tokenize(text);
+  if (tokens.length === 0) return vec;
+  for (const token of tokens) {
+    const digest = createHash("sha256").update(token).digest();
+    // Use two independent hashes per token to reduce collisions.
+    for (let h = 0; h < 2; h++) {
+      const idx = digest.readUInt32BE(h * 4) % EMBEDDING_DIM;
+      const sign = digest[h * 4 + 8] & 1 ? 1 : -1;
+      vec[idx] += sign * (1 / Math.sqrt(tokens.length));
+    }
+  }
+  return normalize(vec);
+}
+
+function tokenize(text: string): string[] {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length > 1);
+}
+
+function normalize(vec: Float32Array): Float32Array {
+  let norm = 0;
+  for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm);
+  if (norm === 0) return vec;
+  for (let i = 0; i < vec.length; i++) vec[i] /= norm;
+  return vec;
+}
+
+export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  const len = Math.min(a.length, b.length);
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < len; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+/** Build the text used to embed an agent's metadata. */
+export function agentEmbeddingText(agent: Agent): string {
+  const parts: string[] = [];
+  const anyAgent = agent as unknown as Record<string, unknown>;
+  for (const key of ["name", "description", "capabilities", "skills", "tags", "category"]) {
+    const value = anyAgent[key];
+    if (typeof value === "string" && value.trim()) parts.push(value);
+    else if (Array.isArray(value)) parts.push(value.filter((v) => typeof v === "string").join(" "));
+  }
+  return parts.join(" ").trim();
+}
+
+interface VectorEntry {
+  id: string;
+  vector: Float32Array;
+  text: string;
+}
+
+const vectorIndex = new Map<string, VectorEntry>();
+
+function agentKey(agent: Agent): string {
+  const anyAgent = agent as unknown as Record<string, unknown>;
+  return String(anyAgent.id ?? anyAgent.address ?? anyAgent.name ?? "");
+}
+
+/** Index (or re-index) a set of agents into the in-memory vector store. */
+export function indexAgents(agents: Agent[]): void {
+  for (const agent of agents) {
+    const key = agentKey(agent);
+    if (!key) continue;
+    const text = agentEmbeddingText(agent);
+    vectorIndex.set(key, { id: key, vector: embedText(text), text });
+  }
+}
+
+export function clearVectorIndex(): void {
+  vectorIndex.clear();
+}
+
+export function vectorIndexSize(): number {
+  return vectorIndex.size;
+}
+
+function lexicalScore(query: string, agent: Agent): number {
+  const q = query.toLowerCase().trim();
+  if (!q) return 0;
+  const haystack = agentEmbeddingText(agent).toLowerCase();
+  if (!haystack) return 0;
+  const qTokens = tokenize(q);
+  if (qTokens.length === 0) return haystack.includes(q) ? 1 : 0;
+  let hits = 0;
+  for (const token of qTokens) if (haystack.includes(token)) hits++;
+  return hits / qTokens.length;
+}
+
+function rankByCosine(queryVec: Float32Array, agents: Agent[], topK: number): AgentMatch[] {
+  const scored: AgentMatch[] = [];
+  for (const agent of agents) {
+    const key = agentKey(agent);
+    const entry = vectorIndex.get(key);
+    const vector = entry ? entry.vector : embedText(agentEmbeddingText(agent));
+    scored.push({ agent, score: cosineSimilarity(queryVec, vector) });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, topK);
+}
+
+function rankLexical(query: string, agents: Agent[], topK: number): AgentMatch[] {
+  const scored: AgentMatch[] = agents.map((agent) => ({ agent, score: lexicalScore(query, agent) }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, topK);
+}
+
+/**
+ * Match agents against a natural-language query.
+ * Uses cosine similarity over embeddings when enabled, otherwise falls back
+ * to lexical scoring.
+ */
+export async function matchAgents(opts: MatchOptions): Promise<AgentMatch[]> {
+  const topK = Math.max(1, Math.min(opts.topK ?? 10, 100));
+  const agents = await getAllAgents();
+  const useEmbeddings = cfg.embeddingsEnabled && !opts.lexicalOnly;
+
+  if (!useEmbeddings) {
+    return rankLexical(opts.query, agents, topK);
+  }
+
+  // Keep the index fresh for the current agent set.
+  indexAgents(agents);
+  const queryVec = embedText(opts.query);
+  return rankByCosine(queryVec, agents, topK);
+}
