@@ -14,6 +14,56 @@
     <script src="https://cdn.jsdelivr.net/gh/jamesbachini/Stellar-Wallets-Kit-Boilerplate@main/vanilla/stellar-kit-bundle/dist/wallet-kit-bundle.umd.js"></script>
   </head>
   <body>
+    <!-- Global offline / error status banner (#750) -->
+    <div class="status-banner-container" id="status-banner-container" aria-live="assertive">
+      <div class="status-banner status-banner-offline" id="offline-banner" role="alert" hidden>
+        <span class="status-banner-icon" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M1 1l22 22" />
+            <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55" />
+            <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39" />
+            <path d="M10.71 5.05A16 16 0 0 1 22.58 9" />
+            <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88" />
+            <path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
+            <line x1="12" y1="20" x2="12.01" y2="20" />
+          </svg>
+        </span>
+        <span class="status-banner-text" id="offline-banner-text">Network Disconnected — Retrying connection to Stellar RPC...</span>
+        <button class="status-banner-action" id="offline-banner-retry" type="button">Retry now</button>
+      </div>
+      <div class="status-banner status-banner-rpc" id="rpc-banner" role="status" hidden>
+        <span class="status-banner-icon" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="12" />
+            <line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+        </span>
+        <span class="status-banner-text" id="rpc-banner-text">Stellar RPC unavailable — retrying...</span>
+        <button class="status-banner-action" id="rpc-banner-retry" type="button">Retry now</button>
+      </div>
+    </div>
+
+    <!-- Global error view (#750) -->
+    <div class="error-view" id="error-view" role="alertdialog" aria-modal="true" aria-labelledby="error-view-title" hidden>
+      <div class="error-view-card">
+        <div class="error-view-icon" aria-hidden="true">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+            <line x1="12" y1="9" x2="12" y2="13" />
+            <line x1="12" y1="17" x2="12.01" y2="17" />
+          </svg>
+        </div>
+        <h2 class="error-view-title" id="error-view-title">Something went wrong</h2>
+        <p class="error-view-message" id="error-view-message">An unexpected error occurred while loading the dashboard.</p>
+        <pre class="error-view-detail" id="error-view-detail" hidden></pre>
+        <div class="error-view-actions">
+          <button class="btn btn-primary" id="error-view-retry" type="button">Retry</button>
+          <button class="btn btn-secondary" id="error-view-dismiss" type="button">Dismiss</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Sidebar -->
     <aside class="sidebar" id="sidebar">
       <div class="sidebar-header">
@@ -91,6 +141,22 @@
             <path d="M16 3.13a4 4 0 0 1 0 7.75" />
           </svg>
           Agents
+        </a>
+        <a href="#/playground" class="nav-item" data-route="/playground">
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="16 18 22 12 16 6" />
+            <polyline points="8 6 2 12 8 18" />
+          </svg>
+          x402 Playground
         </a>
         <a href="#/history" class="nav-item" data-route="/history">
           <svg
@@ -233,6 +299,168 @@
         <span class="capability-badge-tag"></span>
         <span class="capability-badge-score"></span>
       </span>
+    </template>
+
+    <!-- x402 Playground view container (#751) -->
+    <section class="playground-view" id="playground-view" hidden>
+      <div class="playground-header">
+        <h1 class="playground-title">x402 Playground</h1>
+        <p class="playground-subtitle">Simulate HTTP 402 payment requirements and test automated micro-settlements.</p>
+      </div>
+      <div class="playground-grid">
+        <form class="playground-form" id="x402-form">
+          <label class="form-field">
+            <span class="form-label">Target Endpoint URL</span>
+            <input type="url" id="x402-endpoint" class="form-input" placeholder="https://api.example.com/paid-resource" required />
+          </label>
+          <label class="form-field">
+            <span class="form-label">HTTP Method</span>
+            <select id="x402-method" class="form-input">
+              <option value="GET" selected>GET</option>
+              <option value="POST">POST</option>
+              <option value="PUT">PUT</option>
+              <option value="DELETE">DELETE</option>
+            </select>
+          </label>
+          <label class="form-field">
+            <span class="form-label">Request Body (JSON)</span>
+            <textarea id="x402-body" class="form-input form-textarea" rows="6" placeholder='{ "query": "hello" }'></textarea>
+          </label>
+          <label class="form-field">
+            <span class="form-label">Payer Keypair / Wallet</span>
+            <select id="x402-payer-mode" class="form-input">
+              <option value="wallet" selected>Connected wallet</option>
+              <option value="ephemeral">Ephemeral test keypair</option>
+            </select>
+          </label>
+          <div class="playground-actions">
+            <button type="submit" class="btn btn-primary" id="x402-send">Send Request</button>
+            <button type="button" class="btn btn-secondary" id="x402-reset">Reset</button>
+          </div>
+        </form>
+        <div class="playground-results">
+          <div class="playground-panel">
+            <h3 class="playground-panel-title">Payment Requirements</h3>
+            <pre class="playground-pre" id="x402-requirements">No request sent yet.</pre>
+          </div>
+          <div class="playground-panel">
+            <h3 class="playground-panel-title">Request / Response Headers</h3>
+            <div class="playground-headers">
+              <pre class="playground-pre" id="x402-request-headers"></pre>
+              <pre class="playground-pre" id="x402-response-headers"></pre>
+            </div>
+          </div>
+          <div class="playground-panel">
+            <h3 class="playground-panel-title">Response</h3>
+            <pre class="playground-pre" id="x402-response-body">No response yet.</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- IPFS metadata uploader modal (#752) -->
+    <div class="modal-overlay" id="metadata-modal" role="dialog" aria-modal="true" aria-labelledby="metadata-modal-title" hidden>
+      <div class="modal metadata-modal">
+        <div class="modal-header">
+          <h2 class="modal-title" id="metadata-modal-title">Create Agent Metadata</h2>
+          <button class="modal-close" id="metadata-modal-close" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body metadata-modal-body">
+          <form class="metadata-form" id="metadata-form">
+            <label class="form-field">
+              <span class="form-label">Agent Name *</span>
+              <input type="text" id="metadata-name" class="form-input" required />
+            </label>
+            <label class="form-field">
+              <span class="form-label">Description *</span>
+              <textarea id="metadata-description" class="form-input form-textarea" rows="3" required></textarea>
+            </label>
+            <div class="form-field">
+              <span class="form-label">Image Upload</span>
+              <div class="dropzone" id="metadata-dropzone" tabindex="0" role="button" aria-label="Drag and drop image or click to browse">
+                <span class="dropzone-text">Drag &amp; drop an image here, or click to browse</span>
+                <input type="file" id="metadata-image-input" accept="image/*" hidden />
+              </div>
+              <img class="dropzone-preview" id="metadata-image-preview" alt="Agent image preview" hidden />
+            </div>
+            <label class="form-field">
+              <span class="form-label">Tags (comma separated)</span>
+              <input type="text" id="metadata-tags" class="form-input" placeholder="defi, trading, audit" />
+            </label>
+            <label class="form-field">
+              <span class="form-label">Endpoints (comma separated)</span>
+              <input type="text" id="metadata-endpoints" class="form-input" placeholder="https://agent.example.com/api" />
+            </label>
+            <label class="form-field">
+              <span class="form-label">Capabilities (comma separated)</span>
+              <input type="text" id="metadata-capabilities" class="form-input" placeholder="swap, quote, settle" />
+            </label>
+            <div class="metadata-validation" id="metadata-validation" aria-live="polite"></div>
+            <div class="modal-actions">
+              <button type="button" class="btn btn-secondary" id="metadata-cancel">Cancel</button>
+              <button type="submit" class="btn btn-primary" id="metadata-submit" disabled>Publish to IPFS</button>
+            </div>
+          </form>
+          <aside class="metadata-preview">
+            <h3 class="playground-panel-title">Live Preview</h3>
+            <div class="agent-card-preview" id="metadata-preview-card">
+              <div class="agent-card-preview-name" id="metadata-preview-name">Agent Name</div>
+              <div class="agent-card-preview-desc" id="metadata-preview-description">Description</div>
+              <div class="agent-card-preview-tags" id="metadata-preview-tags"></div>
+            </div>
+            <pre class="playground-pre" id="metadata-json-preview"></pre>
+            <div class="metadata-ipfs-uri" id="metadata-ipfs-uri" hidden></div>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dispute submission modal (#753) -->
+    <div class="modal-overlay" id="dispute-modal" role="dialog" aria-modal="true" aria-labelledby="dispute-modal-title" hidden>
+      <div class="modal dispute-modal">
+        <div class="modal-header">
+          <h2 class="modal-title" id="dispute-modal-title">Open Dispute</h2>
+          <button class="modal-close" id="dispute-modal-close" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <form class="dispute-form" id="dispute-form">
+            <label class="form-field">
+              <span class="form-label">Reason *</span>
+              <select id="dispute-reason" class="form-input" required>
+                <option value="" disabled selected>Select a reason</option>
+                <option value="incomplete">Incomplete Deliverable</option>
+                <option value="low-quality">Low Quality</option>
+                <option value="plagiarism">Plagiarism</option>
+                <option value="late">Late Submission</option>
+                <option value="other">Other</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span class="form-label">Explanation *</span>
+              <textarea id="dispute-notes" class="form-input form-textarea" rows="4" required placeholder="Describe why you are disputing this deliverable..."></textarea>
+            </label>
+            <div class="form-field">
+              <span class="form-label">Evidence Attachments</span>
+              <input type="file" id="dispute-evidence-input" class="form-input" multiple />
+              <ul class="dispute-evidence-list" id="dispute-evidence-list"></ul>
+            </div>
+            <div class="dispute-validation" id="dispute-validation" aria-live="polite"></div>
+            <div class="modal-actions">
+              <button type="button" class="btn btn-secondary" id="dispute-cancel">Cancel</button>
+              <button type="submit" class="btn btn-primary" id="dispute-submit" disabled>Submit Dispute</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dispute evidence card (job detail view) (#753) -->
+    <template id="dispute-evidence-card-template">
+      <div class="dispute-evidence-card">
+        <div class="dispute-evidence-reason"></div>
+        <div class="dispute-evidence-notes"></div>
+        <ul class="dispute-evidence-links"></ul>
+      </div>
     </template>
 
     <!-- Toast container -->

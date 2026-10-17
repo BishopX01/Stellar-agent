@@ -381,6 +381,31 @@ app.get("/health", async (_req, res) => {
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
+// GET /api/health — RPC availability probe used by the dashboard startup
+// healthcheck and reconnect logic. Tries every configured RPC provider.
+app.get("/api/health", async (_req, res) => {
+  const startedAt = Date.now();
+  try {
+    const ledger = await withRpcFallback((rpcServer) => rpcServer.getLatestLedger());
+    res.json({
+      status: "ok",
+      rpc: "ok",
+      ledger: ledger.sequence,
+      latencyMs: Date.now() - startedAt,
+      providers: rpcUrls.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: unknown) {
+    res.status(503).json({
+      status: "degraded",
+      rpc: "unavailable",
+      error: (err as Error).message,
+      latencyMs: Date.now() - startedAt,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 // --- Authentication Endpoints ---
 
 /** GET /api/auth/challenge — Request a nonce to sign for wallet verification */
@@ -1184,6 +1209,168 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// --- IPFS pinning (agent metadata uploader + dispute evidence bundles) ---
+
+const IPFS_PIN_ENDPOINT = process.env.IPFS_PIN_ENDPOINT ?? "https://api.pinata.cloud/pinning/pinJSONToIPFS";
+const IPFS_PIN_TOKEN = process.env.IPFS_PIN_TOKEN ?? process.env.PINATA_JWT ?? "";
+const IPFS_GATEWAY = process.env.IPFS_GATEWAY ?? "https://ipfs.io/ipfs";
+const MAX_IPFS_PAYLOAD_BYTES = Number(process.env.MAX_IPFS_PAYLOAD_BYTES ?? 512 * 1024);
+
+const ipfsPinSchema = z
+  .object({
+    kind: z.enum(["agent-metadata", "dispute-evidence"]).default("agent-metadata"),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    evidence: z
+      .object({
+        reason: z.string().min(1).max(200),
+        notes: z.string().max(10_000).optional(),
+        links: z.array(z.string().url()).max(20).optional(),
+        files: z
+          .array(
+            z.object({
+              name: z.string().min(1).max(255),
+              contentType: z.string().min(1).max(128).optional(),
+              data: z.string().min(1),
+            }),
+          )
+          .max(10)
+          .optional(),
+      })
+      .optional(),
+    image: z
+      .object({
+        name: z.string().min(1).max(255),
+        contentType: z.string().min(1).max(128).optional(),
+        data: z.string().min(1),
+      })
+      .optional(),
+    name: z.string().min(1).max(200).optional(),
+  })
+  .refine((data) => data.metadata || data.evidence, {
+    message: "Provide either a metadata document or an evidence bundle",
+  });
+
+type IpfsPinResult = { cid: string; uri: string; gatewayUrl: string; size: number };
+
+/** Pin a JSON document to IPFS and return its ipfs:// URI. */
+async function pinJsonToIpfs(document: unknown, name: string): Promise<IpfsPinResult> {
+  const body = JSON.stringify(document);
+  const size = Buffer.byteLength(body, "utf8");
+  if (size > MAX_IPFS_PAYLOAD_BYTES) {
+    throw new Error(`IPFS payload too large (${size} bytes, max ${MAX_IPFS_PAYLOAD_BYTES})`);
+  }
+
+  if (!IPFS_PIN_TOKEN) {
+    // No pinning credentials configured: derive a deterministic content address
+    // so the dashboard flow still works in local/demo environments.
+    const cid = `local-${crypto.createHash("sha256").update(body).digest("hex").slice(0, 46)}`;
+    return { cid, uri: `ipfs://${cid}`, gatewayUrl: `${IPFS_GATEWAY}/${cid}`, size };
+  }
+
+  const resp = await fetch(IPFS_PIN_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${IPFS_PIN_TOKEN}`,
+    },
+    body: JSON.stringify({
+      pinataContent: document,
+      pinataMetadata: { name },
+    }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`IPFS pin failed (${resp.status}): ${text.slice(0, 300)}`);
+  }
+  const data = (await resp.json()) as { IpfsHash?: string };
+  const cid = data.IpfsHash;
+  if (!cid) throw new Error("IPFS pin response missing IpfsHash");
+  return { cid, uri: `ipfs://${cid}`, gatewayUrl: `${IPFS_GATEWAY}/${cid}`, size };
+}
+
+// POST /api/ipfs/pin — pin agent metadata and/or a dispute evidence bundle
+app.post(
+  "/api/ipfs/pin",
+  rateLimitMutating,
+  optionalAuthMiddleware,
+  async (req, res) => {
+    try {
+      const parsed = ipfsPinSchema.parse(req.body);
+      const document: Record<string, unknown> = {
+        kind: parsed.kind,
+        createdAt: new Date().toISOString(),
+      };
+      if (parsed.metadata) document.metadata = parsed.metadata;
+      if (parsed.evidence) document.evidence = parsed.evidence;
+      if (parsed.image) document.image = parsed.image;
+
+      const label = parsed.name ?? `${parsed.kind}-${Date.now()}`;
+      const pinned = await pinJsonToIpfs(document, label);
+      res.json({ ...pinned, kind: parsed.kind });
+    } catch (err: unknown) {
+      if (respondWithValidationError(err, res)) return;
+      res.status(502).json({ error: (err as Error).message });
+    }
+  },
+);
+
+// --- x402 playground proxy (avoids browser CORS restrictions) ---
+
+const x402ProbeSchema = z.object({
+  url: z.string().url(),
+  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
+  headers: z.record(z.string(), z.string()).optional(),
+  body: z.string().max(256 * 1024).optional(),
+});
+
+const X402_PROBE_TIMEOUT_MS = Number(process.env.X402_PROBE_TIMEOUT_MS ?? 15_000);
+
+// POST /api/x402/probe — forward a playground request and return raw status,
+// headers and body so the client can decode X-Payment-Requirements.
+app.post("/api/x402/probe", rateLimitMutating, async (req, res) => {
+  try {
+    const parsed = x402ProbeSchema.parse(req.body);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), X402_PROBE_TIMEOUT_MS);
+    const startedAt = Date.now();
+    try {
+      const upstream = await fetch(parsed.url, {
+        method: parsed.method,
+        headers: {
+          Accept: "application/json",
+          ...(parsed.body ? { "Content-Type": "application/json" } : {}),
+          ...(parsed.headers ?? {}),
+        },
+        body: parsed.method === "GET" || parsed.method === "HEAD" ? undefined : parsed.body,
+        signal: controller.signal,
+        redirect: "manual",
+      });
+      const bodyText = await upstream.text();
+      const headers: Record<string, string> = {};
+      upstream.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+      res.json({
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+        body: bodyText,
+        durationMs: Date.now() - startedAt,
+        request: { url: parsed.url, method: parsed.method },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
+    const message =
+      err instanceof Error && err.name === "AbortError"
+        ? `Upstream request timed out after ${X402_PROBE_TIMEOUT_MS}ms`
+        : (err as Error).message;
+    res.status(502).json({ error: message });
   }
 });
 
