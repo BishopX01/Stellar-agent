@@ -134,6 +134,17 @@ app.use("/app", (_req: Request, res: Response, next: NextFunction) => {
         /<script src="app\.js"/g,
         `<script nonce="${nonce}" src="app.js"`,
       );
+      // Add nonce to the inline theme-init script in <head> (#758). This must run
+      // before CSS paints to avoid a flash of the wrong theme.
+      html = html.replace(
+        /<script(\s+id="theme-init")>/g,
+        `<script nonce="${nonce}"$1>`,
+      );
+      // Add nonce to the inline network-init script in <head> (#761).
+      html = html.replace(
+        /<script(\s+id="network-init")>/g,
+        `<script nonce="${nonce}"$1>`,
+      );
       // Add nonce to Google Fonts link tags
       html = html.replace(
         /<link\s+(rel="preconnect"\s+href="https:\/\/fonts\.(googleapis|gstatic)\.com[^>]*)>/g,
@@ -150,6 +161,96 @@ app.use("/app", (_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+// ── #761: Dynamic network presets ────────────────────────────────────────────
+// Each preset bundles the RPC endpoints, network passphrase, and contract
+// addresses needed to talk to a given Stellar network. The active network is
+// selected per-request via the `x-bear-network` header (falling back to the
+// server default) so the dashboard can switch networks on the fly.
+type NetworkPreset = {
+  id: "testnet" | "futurenet" | "mainnet";
+  label: string;
+  networkPassphrase: string;
+  rpcUrl: string;
+  rpcUrls: string[];
+  identityContract: string;
+  commerceContract: string;
+  usdcToken: string;
+  horizonUrl: string;
+  isMainnet: boolean;
+};
+
+const NETWORK_PRESETS: Record<NetworkPreset["id"], NetworkPreset> = {
+  testnet: {
+    id: "testnet",
+    label: "Testnet",
+    networkPassphrase: Networks.TESTNET,
+    rpcUrl: cfg.rpcUrl,
+    rpcUrls,
+    identityContract: cfg.identityContract,
+    commerceContract: cfg.commerceContract,
+    usdcToken: cfg.usdcToken,
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    isMainnet: false,
+  },
+  futurenet: {
+    id: "futurenet",
+    label: "Futurenet",
+    networkPassphrase: Networks.FUTURENET,
+    rpcUrl: process.env.FUTURENET_RPC_URL ?? "https://rpc-futurenet.stellar.org",
+    rpcUrls: [process.env.FUTURENET_RPC_URL ?? "https://rpc-futurenet.stellar.org"],
+    identityContract: process.env.FUTURENET_IDENTITY_CONTRACT ?? cfg.identityContract,
+    commerceContract: process.env.FUTURENET_COMMERCE_CONTRACT ?? cfg.commerceContract,
+    usdcToken: process.env.FUTURENET_USDC_TOKEN ?? cfg.usdcToken,
+    horizonUrl: "https://horizon-futurenet.stellar.org",
+    isMainnet: false,
+  },
+  mainnet: {
+    id: "mainnet",
+    label: "Mainnet",
+    networkPassphrase: Networks.PUBLIC,
+    rpcUrl: process.env.MAINNET_RPC_URL ?? "https://soroban-rpc.mainnet.stellar.org",
+    rpcUrls: [process.env.MAINNET_RPC_URL ?? "https://soroban-rpc.mainnet.stellar.org"],
+    identityContract: process.env.MAINNET_IDENTITY_CONTRACT ?? cfg.identityContract,
+    commerceContract: process.env.MAINNET_COMMERCE_CONTRACT ?? cfg.commerceContract,
+    usdcToken:
+      process.env.MAINNET_USDC_TOKEN ??
+      "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    horizonUrl: "https://horizon.stellar.org",
+    isMainnet: true,
+  },
+};
+
+const DEFAULT_NETWORK_ID: NetworkPreset["id"] =
+  (process.env.DEFAULT_NETWORK as NetworkPreset["id"]) ?? "testnet";
+
+function resolveNetworkId(value: unknown): NetworkPreset["id"] {
+  if (typeof value === "string" && value in NETWORK_PRESETS) {
+    return value as NetworkPreset["id"];
+  }
+  return DEFAULT_NETWORK_ID;
+}
+
+/** Resolve the active network preset for a request from the x-bear-network header. */
+function getRequestNetwork(req: Request): NetworkPreset {
+  const header = req.header("x-bear-network");
+  return NETWORK_PRESETS[resolveNetworkId(header)];
+}
+
+/** Public, client-safe view of a network preset. */
+function publicNetworkInfo(preset: NetworkPreset) {
+  return {
+    id: preset.id,
+    label: preset.label,
+    networkPassphrase: preset.networkPassphrase,
+    rpcUrl: preset.rpcUrl,
+    horizonUrl: preset.horizonUrl,
+    identityContract: preset.identityContract,
+    commerceContract: preset.commerceContract,
+    usdcToken: preset.usdcToken,
+    isMainnet: preset.isMainnet,
+  };
+}
+
 const server = new rpc.Server(cfg.rpcUrl, {
   allowHttp: cfg.rpcUrl.startsWith("http://"),
 });
@@ -165,6 +266,23 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
   let lastError: unknown;
   for (const candidate of rpcFallbackServers) {
     try {
+      return await operation(candidate);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("All Stellar RPC providers failed");
+}
+
+/** Run an RPC operation against a specific network's endpoints, with fallback. */
+async function withNetworkRpc<T>(
+  preset: NetworkPreset,
+  operation: (server: rpc.Server) => Promise<T>,
+): Promise<T> {
+  let lastError: unknown;
+  for (const url of preset.rpcUrls) {
+    try {
+      const candidate = new rpc.Server(url, { allowHttp: url.startsWith("http://") });
       return await operation(candidate);
     } catch (err) {
       lastError = err;
@@ -546,10 +664,10 @@ const HORIZON_URL =
     ? "https://horizon.stellar.org"
     : "https://horizon-testnet.stellar.org");
 
-/** Get XLM balance from Horizon */
-async function getXlmBalance(pubkey: string): Promise<string> {
+/** Get XLM balance from Horizon (optionally for a specific network) */
+async function getXlmBalance(pubkey: string, horizonUrl: string = HORIZON_URL): Promise<string> {
   try {
-    const resp = await fetch(`${HORIZON_URL}/accounts/${pubkey}`);
+    const resp = await fetch(`${horizonUrl}/accounts/${pubkey}`);
     if (!resp.ok) return "0";
     const data = (await resp.json()) as {
       balances: Array<{ asset_type: string; balance: string }>;
@@ -562,18 +680,22 @@ async function getXlmBalance(pubkey: string): Promise<string> {
 }
 
 /** Simulate a read-only contract call with no arguments and return its native value */
-async function simulateReadCall(contract: Contract, method: string): Promise<unknown> {
+async function simulateReadCall(
+  contract: Contract,
+  method: string,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<unknown> {
   const op = contract.call(method);
   const ephemeral = Keypair.random();
   const dummy = new Account(ephemeral.publicKey(), "0");
   const tx = new TransactionBuilder(dummy, {
     fee: BASE_FEE,
-    networkPassphrase: cfg.networkPassphrase,
+    networkPassphrase: preset.networkPassphrase,
   })
     .addOperation(op)
     .setTimeout(30)
     .build();
-  const sim = await withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx));
+  const sim = await withNetworkRpc(preset, (rpcServer) => rpcServer.simulateTransaction(tx));
   if (rpc.Api.isSimulationError(sim)) return null;
   const result = (sim as rpc.Api.SimulateTransactionSuccessResponse).result;
   if (!result) return null;
@@ -583,13 +705,19 @@ async function simulateReadCall(contract: Contract, method: string): Promise<unk
 const tokenDecimalsCache = new Map<string, number>();
 
 /** Query and cache a SAC token's `decimals()` value, defaulting to 7 on failure */
-async function getTokenDecimals(tokenAddress: string): Promise<number> {
-  const cached = tokenDecimalsCache.get(tokenAddress);
+async function getTokenDecimals(
+  tokenAddress: string,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<number> {
+  const cacheKey = `${preset.id}:${tokenAddress}`;
+  const cached = tokenDecimalsCache.get(cacheKey);
   if (cached !== undefined) return cached;
   try {
-    const decimals = Number(await simulateReadCall(new Contract(tokenAddress), "decimals"));
+    const decimals = Number(
+      await simulateReadCall(new Contract(tokenAddress), "decimals", preset),
+    );
     if (!Number.isFinite(decimals)) return 7;
-    tokenDecimalsCache.set(tokenAddress, decimals);
+    tokenDecimalsCache.set(cacheKey, decimals);
     return decimals;
   } catch {
     return 7;
@@ -597,26 +725,29 @@ async function getTokenDecimals(tokenAddress: string): Promise<number> {
 }
 
 /** Get MUSD (SAC) balance via Soroban simulate */
-async function getTokenBalance(pubkey: string): Promise<string> {
+async function getTokenBalance(
+  pubkey: string,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<string> {
   try {
-    const contract = new Contract(cfg.usdcToken);
+    const contract = new Contract(preset.usdcToken);
     const op = contract.call("balance", new Address(pubkey).toScVal());
     const ephemeral = Keypair.random();
     const dummy = new Account(ephemeral.publicKey(), "0");
     const tx = new TransactionBuilder(dummy, {
       fee: BASE_FEE,
-      networkPassphrase: cfg.networkPassphrase,
+      networkPassphrase: preset.networkPassphrase,
     })
       .addOperation(op)
       .setTimeout(30)
       .build();
-    const sim = await withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx));
+    const sim = await withNetworkRpc(preset, (rpcServer) => rpcServer.simulateTransaction(tx));
     if (rpc.Api.isSimulationError(sim)) return "0";
     const result = (sim as rpc.Api.SimulateTransactionSuccessResponse).result;
     if (!result) return "0";
     const raw = scValToNative(result.retval);
     const val = BigInt(raw);
-    const decimals = await getTokenDecimals(cfg.usdcToken);
+    const decimals = await getTokenDecimals(preset.usdcToken, preset);
     if (decimals === 0) return val.toString();
     const divisor = 10n ** BigInt(decimals);
     const whole = val / divisor;
@@ -637,6 +768,18 @@ app.get("/api/demo-mode", (_req, res) => {
       buyer: buyerKeypair.publicKey(),
       seller: sellerKeypair.publicKey(),
     }),
+  });
+});
+
+// GET /api/network — active network + available presets for the switcher (#761).
+// The active network is resolved from the `x-bear-network` header so the client
+// can confirm which preset its requests are being served against.
+app.get("/api/network", (req, res) => {
+  const active = getRequestNetwork(req);
+  res.json({
+    active: publicNetworkInfo(active),
+    defaultNetwork: DEFAULT_NETWORK_ID,
+    presets: Object.values(NETWORK_PRESETS).map(publicNetworkInfo),
   });
 });
 
@@ -709,15 +852,16 @@ app.get("/api/stream", (req, res) => {
 });
 
 // GET /api/wallets
-app.get("/api/wallets", async (_req, res) => {
+app.get("/api/wallets", async (req, res) => {
   try {
+    const preset = getRequestNetwork(req);
     const buyerPub = buyerKeypair.publicKey();
     const sellerPub = sellerKeypair.publicKey();
     const [buyerXlm, sellerXlm, buyerMusd, sellerMusd] = await Promise.all([
-      getXlmBalance(buyerPub),
-      getXlmBalance(sellerPub),
-      getTokenBalance(buyerPub),
-      getTokenBalance(sellerPub),
+      getXlmBalance(buyerPub, preset.horizonUrl),
+      getXlmBalance(sellerPub, preset.horizonUrl),
+      getTokenBalance(buyerPub, preset),
+      getTokenBalance(sellerPub, preset),
     ]);
     res.json({
       buyer: { address: buyerPub, xlm: buyerXlm, musd: buyerMusd },
@@ -990,16 +1134,20 @@ app.post("/api/claim-refund", optionalAuthMiddleware, requireDashboardWallet, as
 const pendingTxHashes = new Set<string>();
 
 /** Build an unsigned, simulated transaction and return its XDR */
-async function buildTxXdr(publicKey: string, op: xdr.Operation): Promise<string> {
-  const account = await withRpcFallback((rpcServer) => rpcServer.getAccount(publicKey));
+async function buildTxXdr(
+  publicKey: string,
+  op: xdr.Operation,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<string> {
+  const account = await withNetworkRpc(preset, (rpcServer) => rpcServer.getAccount(publicKey));
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
-    networkPassphrase: cfg.networkPassphrase,
+    networkPassphrase: preset.networkPassphrase,
   })
     .addOperation(op)
     .setTimeout(30)
     .build();
-  const prepared = await withRpcFallback((rpcServer) => rpcServer.prepareTransaction(tx));
+  const prepared = await withNetworkRpc(preset, (rpcServer) => rpcServer.prepareTransaction(tx));
   const hash = prepared.hash().toString("hex");
   pendingTxHashes.add(hash);
   return prepared.toXDR();
@@ -1148,8 +1296,9 @@ app.post("/api/build/cancel", rateLimitMutating, optionalAuthMiddleware, require
 // POST /api/submit — submit a Freighter-signed transaction
 app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, res) => {
   try {
+    const preset = getRequestNetwork(req);
     const parsed = submitXdrSchema.parse(req.body);
-    const tx = TransactionBuilder.fromXDR(parsed.signedXdr, cfg.networkPassphrase);
+    const tx = TransactionBuilder.fromXDR(parsed.signedXdr, preset.networkPassphrase);
     const submitHash = tx.hash().toString("hex");
     if (!pendingTxHashes.has(submitHash)) {
       res.status(400).json({ error: "Transaction XDR was not generated by this server" });
@@ -1157,14 +1306,14 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
     }
     pendingTxHashes.delete(submitHash);
 
-    const sent = await withRpcFallback((rpcServer) => rpcServer.sendTransaction(tx));
+    const sent = await withNetworkRpc(preset, (rpcServer) => rpcServer.sendTransaction(tx));
     if (sent.status === "ERROR") {
       throw new Error(`submit failed: ${sent.errorResult}`);
     }
-    let getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+    let getResp = await withNetworkRpc(preset, (rpcServer) => rpcServer.getTransaction(sent.hash));
     while (getResp.status === "NOT_FOUND") {
       await new Promise((r) => setTimeout(r, 1000));
-      getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+      getResp = await withNetworkRpc(preset, (rpcServer) => rpcServer.getTransaction(sent.hash));
     }
     if (getResp.status !== "SUCCESS") {
       throw new Error(`tx failed: ${getResp.status}`);
@@ -1190,10 +1339,11 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
 // GET /api/balance/:pubkey — get XLM + MUSD balance for any public key
 app.get("/api/balance/:pubkey", async (req, res) => {
   try {
+    const preset = getRequestNetwork(req);
     const params = z.object({ pubkey: stellarAddressSchema }).parse(req.params);
     const [xlm, musd] = await Promise.all([
-      getXlmBalance(params.pubkey),
-      getTokenBalance(params.pubkey),
+      getXlmBalance(params.pubkey, preset.horizonUrl),
+      getTokenBalance(params.pubkey, preset),
     ]);
     res.json({ address: params.pubkey, xlm, musd });
   } catch (err: unknown) {
