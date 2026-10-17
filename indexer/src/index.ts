@@ -1,8 +1,16 @@
 import { rpc as StellarRpc } from "@stellar/stellar-sdk";
-import { openDatabase, EventStore, type QueryOptions, type ParsedEventRow } from "./db.js";
+import {
+  openDatabase,
+  EventStore,
+  runMigrations,
+  type QueryOptions,
+  type ParsedEventRow,
+  type MigrationOptions,
+  type MigrationResult,
+} from "./db.js";
 import { SorobanEventPoller, type PollerOptions } from "./poller.js";
 
-export type { QueryOptions, ParsedEventRow };
+export type { QueryOptions, ParsedEventRow, MigrationOptions, MigrationResult };
 
 export type BearEventIndexerConfig = {
   /** Soroban RPC URL */
@@ -17,6 +25,12 @@ export type BearEventIndexerConfig = {
   startLedger?: number;
   /** Polling options */
   polling?: PollerOptions;
+  /**
+   * Migration options applied at startup. `openDatabase` runs pending
+   * migrations by default; set `dryRun` to preview without applying, or
+   * `rollbackTo` to revert to a previous schema version.
+   */
+  migrations?: MigrationOptions;
 };
 
 /**
@@ -41,12 +55,16 @@ export type BearEventIndexerConfig = {
 export class BearEventIndexer {
   private readonly store: EventStore;
   private readonly poller: SorobanEventPoller;
+  private readonly migrationResult: MigrationResult;
 
   constructor(config: BearEventIndexerConfig) {
     const dbPath = config.dbPath ?? "./data/events.db";
     const startLedger = config.startLedger ?? 0;
 
-    const db = openDatabase(dbPath);
+    // openDatabase runs pending migrations (unless disabled) and throws if a
+    // migration fails, halting startup before any indexing begins.
+    const db = openDatabase(dbPath, config.migrations);
+    this.migrationResult = runMigrations(db, config.migrations);
     this.store = new EventStore(db);
 
     const rpcServer = new StellarRpc.Server(config.rpcUrl, {
@@ -65,6 +83,11 @@ export class BearEventIndexer {
   /** Start continuous indexing. Resolves once the first poll completes. */
   async start(): Promise<void> {
     await this.poller.start();
+  }
+
+  /** Returns the outcome of the migrations applied during construction. */
+  getMigrationResult(): MigrationResult {
+    return this.migrationResult;
   }
 
   /** Stop the indexer gracefully. */
@@ -116,5 +139,5 @@ export class BearEventIndexer {
 }
 
 // Re-export lower-level primitives for advanced use-cases
-export { openDatabase, EventStore } from "./db.js";
+export { openDatabase, EventStore, runMigrations } from "./db.js";
 export { SorobanEventPoller } from "./poller.js";

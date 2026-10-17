@@ -1187,6 +1187,242 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
   }
 });
 
+// --- #738: Revenue analytics & transaction accounting export ---
+
+const revenueReportQuerySchema = z.object({
+  wallet: stellarAddressSchema,
+  from: z.coerce.number().int().nonnegative().optional(),
+  to: z.coerce.number().int().nonnegative().optional(),
+  format: z.enum(["csv", "json"]).default("json"),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(1000).default(100),
+});
+
+type RevenueRow = {
+  timestamp: number;
+  transactionHash: string;
+  ledger: number;
+  jobId: string;
+  role: "provider" | "client";
+  token: string;
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+};
+
+type RevenueAggregate = {
+  period: string;
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+  count: number;
+};
+
+/** Escape a single CSV field per RFC 4180 (quote if it contains , " \r or \n). */
+function csvEscape(value: unknown): string {
+  const str = value === null || value === undefined ? "" : String(value);
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+/** Serialize rows to RFC 4180 CSV with CRLF line endings. */
+function toCsv(headers: string[], rows: Array<Array<unknown>>): string {
+  const lines = [headers.map(csvEscape).join(",")];
+  for (const row of rows) {
+    lines.push(row.map(csvEscape).join(","));
+  }
+  return lines.join("\r\n") + "\r\n";
+}
+
+/** Format a Unix timestamp (seconds) as an ISO-8601 UTC date-time string. */
+function formatTimestamp(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function dayKey(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 10);
+}
+
+function monthKey(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 7);
+}
+
+function aggregateRevenue(rows: RevenueRow[], keyFn: (ts: number) => string): RevenueAggregate[] {
+  const buckets = new Map<string, { gross: bigint; fee: bigint; net: bigint; count: number }>();
+  for (const row of rows) {
+    const key = keyFn(row.timestamp);
+    const bucket = buckets.get(key) ?? { gross: 0n, fee: 0n, net: 0n, count: 0 };
+    bucket.gross += BigInt(row.grossAmount);
+    bucket.fee += BigInt(row.feeAmount);
+    bucket.net += BigInt(row.netAmount);
+    bucket.count += 1;
+    buckets.set(key, bucket);
+  }
+  return Array.from(buckets.entries())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([period, b]) => ({
+      period,
+      grossAmount: b.gross.toString(),
+      feeAmount: b.fee.toString(),
+      netAmount: b.net.toString(),
+      count: b.count,
+    }));
+}
+
+/**
+ * Extract accounting rows from a JobCompleted event payload. The event data is
+ * expected to carry the job id, provider, client, token, gross budget and fee.
+ * Amounts are normalized to raw token units (strings) so gross - fee = net
+ * reconciles exactly with on-chain transfers.
+ */
+function extractRevenueRow(
+  event: any,
+  wallet: string,
+): RevenueRow | null {
+  const data = event?.data ?? event?.value ?? event ?? {};
+  const jobId = data.jobId ?? data.job_id ?? event?.jobId ?? event?.job_id;
+  const provider = data.provider ?? event?.provider;
+  const client = data.client ?? data.buyer ?? event?.client ?? event?.buyer;
+  const token = data.token ?? event?.token ?? cfg.usdcToken;
+  const grossRaw = data.budget ?? data.grossAmount ?? data.gross_amount ?? event?.budget;
+  const feeRaw = data.fee ?? data.feeAmount ?? data.fee_amount ?? 0;
+
+  if (jobId === undefined || jobId === null) return null;
+  if (grossRaw === undefined || grossRaw === null) return null;
+
+  let role: "provider" | "client" | null = null;
+  if (provider === wallet) role = "provider";
+  else if (client === wallet) role = "client";
+  if (!role) return null;
+
+  const gross = BigInt(grossRaw);
+  const fee = BigInt(feeRaw);
+  const net = gross - fee;
+
+  const ledger = Number(event?.ledger ?? event?.ledgerSequence ?? 0);
+  const txHash = String(event?.txHash ?? event?.transactionHash ?? event?.tx_hash ?? "");
+  const ts = Number(event?.timestamp ?? event?.closedAt ?? event?.ledgerClosedAt ?? 0);
+  const timestamp = Number.isFinite(ts) && ts > 0 ? ts : Math.floor(Date.now() / 1000);
+
+  return {
+    timestamp,
+    transactionHash: txHash,
+    ledger,
+    jobId: String(jobId),
+    role,
+    token: String(token),
+    grossAmount: gross.toString(),
+    feeAmount: fee.toString(),
+    netAmount: net.toString(),
+  };
+}
+
+// GET /api/reports/revenue — export revenue ledger as CSV or JSON
+app.get("/api/reports/revenue", async (req, res) => {
+  try {
+    const parsed = revenueReportQuerySchema.parse(req.query);
+    if (parsed.from !== undefined && parsed.to !== undefined && parsed.from > parsed.to) {
+      res.status(400).json({ error: "'from' must be less than or equal to 'to'" });
+      return;
+    }
+
+    const allEvents = await events.getEvents();
+    const rows: RevenueRow[] = [];
+    for (const ev of allEvents as any[]) {
+      const name = ev?.type ?? ev?.name ?? ev?.topic?.[0];
+      if (name !== "JobCompleted" && name !== "job_completed") continue;
+      const row = extractRevenueRow(ev, parsed.wallet);
+      if (!row) continue;
+      if (parsed.from !== undefined && row.timestamp < parsed.from) continue;
+      if (parsed.to !== undefined && row.timestamp > parsed.to) continue;
+      rows.push(row);
+    }
+
+    rows.sort((a, b) => a.timestamp - b.timestamp);
+
+    const daily = aggregateRevenue(rows, dayKey);
+    const monthly = aggregateRevenue(rows, monthKey);
+
+    const totalGross = rows.reduce((acc, r) => acc + BigInt(r.grossAmount), 0n);
+    const totalFee = rows.reduce((acc, r) => acc + BigInt(r.feeAmount), 0n);
+    const totalNet = rows.reduce((acc, r) => acc + BigInt(r.netAmount), 0n);
+
+    const total = rows.length;
+    const offset = (parsed.page - 1) * parsed.pageSize;
+    const pageRows = rows.slice(offset, offset + parsed.pageSize);
+
+    const headers = [
+      "Timestamp",
+      "TransactionHash",
+      "Ledger",
+      "JobId",
+      "Role",
+      "Token",
+      "GrossAmount",
+      "FeeAmount",
+      "NetAmount",
+    ];
+
+    const filename = `revenue-report-${parsed.wallet.slice(0, 8)}-${Date.now()}`;
+
+    if (parsed.format === "csv") {
+      const csvRows = pageRows.map((r) => [
+        formatTimestamp(r.timestamp),
+        r.transactionHash,
+        r.ledger,
+        r.jobId,
+        r.role,
+        r.token,
+        r.grossAmount,
+        r.feeAmount,
+        r.netAmount,
+      ]);
+      const csv = toCsv(headers, csvRows);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}.csv"`);
+      res.send(csv);
+      return;
+    }
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}.json"`);
+    res.json({
+      wallet: parsed.wallet,
+      from: parsed.from ?? null,
+      to: parsed.to ?? null,
+      pagination: {
+        page: parsed.page,
+        pageSize: parsed.pageSize,
+        total,
+        hasNext: offset + parsed.pageSize < total,
+      },
+      totals: {
+        grossAmount: totalGross.toString(),
+        feeAmount: totalFee.toString(),
+        netAmount: totalNet.toString(),
+        count: total,
+      },
+      daily,
+      monthly,
+      rows: pageRows.map((r) => ({
+        Timestamp: formatTimestamp(r.timestamp),
+        TransactionHash: r.transactionHash,
+        Ledger: r.ledger,
+        JobId: r.jobId,
+        Role: r.role,
+        Token: r.token,
+        GrossAmount: r.grossAmount,
+        FeeAmount: r.feeAmount,
+        NetAmount: r.netAmount,
+      })),
+    });
+  } catch (err: unknown) {
+    handleRouteError(err, res);
+  }
+});
+
 // GET /api/balance/:pubkey — get XLM + MUSD balance for any public key
 app.get("/api/balance/:pubkey", async (req, res) => {
   try {
