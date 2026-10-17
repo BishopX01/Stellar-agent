@@ -28,15 +28,23 @@ function App() {
 
 ## Hooks
 
-### `useAgent(id)`
+### `useAgent(id, options?)`
 
 Read-only hook wrapping `IdentityClient.getAgent()`. Returns the agent record along with `loading` and `error` state.
+
+Requests are cached in memory and deduplicated: mounting many components with the same `id` triggers a single RPC call, and cached data is returned immediately (stale-while-revalidate) while fresh data is fetched in the background.
+
+Options:
+
+| Option   | Type     | Default | Description                                                        |
+| -------- | -------- | ------- | ------------------------------------------------------------------ |
+| `ttlMs`  | `number` | `60000` | How long cached data is considered fresh before revalidating.      |
 
 ```tsx
 import { useAgent } from '@bear-protocol/react'
 
 function AgentCard({ agentId }: { agentId: string }) {
-  const { agent, loading, error } = useAgent(agentId)
+  const { agent, loading, error } = useAgent(agentId, { ttlMs: 30_000 })
 
   if (loading) return <Spinner />
   if (error) return <ErrorBanner error={error} />
@@ -133,6 +141,27 @@ function PaidResource({ keypair }: { keypair: Keypair }) {
   )
 }
 ```
+
+## Types
+
+The package ships exhaustive TypeScript types for every hook and component, with `isolatedModules` and `declarationMap` enabled. Hook option and result interfaces (`UseAgentOptions`, `UseAgentResult`, `UseJobResult`, `UseCommerceResult`, …) and component prop interfaces are exported from the package root, and essential core types (`Agent`, `Job`, `JobStatus`, `MarcConfig`, …) are re-exported directly from `marc-stellar-sdk` so you don't need to import from both packages.
+
+```tsx
+import type { Agent, Job, JobStatus, UseAgentOptions } from '@bear-protocol/react'
+```
+
+## Storybook
+
+An interactive Storybook showcase documents every component and hook with live controls, dark/light theme toggles, and copy-pasteable code snippets for each story.
+
+```bash
+npm run storybook        # start the local dev server (http://localhost:6006)
+npm run build-storybook  # build the static documentation site into storybook-static/
+```
+
+The static site is built and deployed to GitHub Pages from CI. Once deployed it is available at:
+
+https://bear-protocol.github.io/bear-protocol/
 
 ## Development
 

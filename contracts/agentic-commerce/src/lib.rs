@@ -89,6 +89,14 @@ pub struct Job {
     /// #23 — fee_bps snapshotted at job creation so admin changes to the
     /// global fee rate do not retroactively affect already-funded jobs.
     pub fee_bps: u32,
+    /// #716 — SLA deadline (ledger timestamp). 0 means no SLA is configured.
+    pub sla_deadline: u64,
+    /// #716 — penalty in basis points charged per full hour of overdue
+    /// submission. 0 means no penalty is configured.
+    pub penalty_bps_per_hour: u32,
+    /// #716 — ledger timestamp recorded when the provider submitted the
+    /// deliverable. 0 until `submit()` is called.
+    pub submitted_at: u64,
 }
 
 /// Evaluator quorum stored separately from `Job` to preserve existing job XDR.
@@ -186,6 +194,10 @@ const MAX_DELIVERABLE_LEN: u32 = 1024;
 const MAX_EVALUATORS: u32 = 5;
 const DEFAULT_MULTI_EVAL_THRESHOLD: i128 = i128::MAX;
 const CHANNEL_DISPUTE_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// #716 — maximum SLA penalty as a fraction of budget (50%).
+const MAX_SLA_PENALTY_BPS: u32 = 5_000;
+/// #716 — seconds per hour, used for overdue duration math.
+const SECS_PER_HOUR: u64 = 3_600;
 
 // --- Events ---
 
@@ -256,6 +268,17 @@ pub struct JobCancelled {
     #[topic]
     pub client: Address,
     pub job_id: u64,
+}
+
+/// #716 — Emitted when an SLA breach penalty is deducted from the provider
+/// payout and returned to the client.
+#[contractevent]
+pub struct SlaPenaltyApplied {
+    #[topic]
+    pub job_id: u64,
+    pub overdue_hours: u64,
+    pub penalty_bps: u32,
+    pub penalty: i128,
 }
 
 /// #22 — Emitted when a client opens a dispute on a submitted deliverable.
@@ -445,6 +468,38 @@ impl AgenticCommerceContract {
         if fee == 0 { 1 } else { fee }
     }
 
+    /// #716 — Compute the SLA penalty for a job given its submission time.
+    ///
+    /// Returns `(overdue_hours, penalty_bps, penalty_amount)`. When there is no
+    /// SLA configured, the submission was on time, or no penalty rate is set,
+    /// all values are zero. Any partial hour overdue rounds up to a full hour.
+    /// The accumulated penalty is capped at `MAX_SLA_PENALTY_BPS` (50%).
+    fn compute_sla_penalty(job: &Job) -> (u64, u32, i128) {
+        if job.sla_deadline == 0
+            || job.penalty_bps_per_hour == 0
+            || job.submitted_at <= job.sla_deadline
+        {
+            return (0, 0, 0);
+        }
+        let overdue_secs = job.submitted_at - job.sla_deadline;
+        // Round up to at least one full hour for any partial hour overdue.
+        let overdue_hours = (overdue_secs + SECS_PER_HOUR - 1) / SECS_PER_HOUR;
+        let raw_bps = overdue_hours
+            .checked_mul(job.penalty_bps_per_hour as u64)
+            .unwrap_or(u64::MAX);
+        let penalty_bps = if raw_bps > MAX_SLA_PENALTY_BPS as u64 {
+            MAX_SLA_PENALTY_BPS
+        } else {
+            raw_bps as u32
+        };
+        let penalty = job
+            .budget
+            .checked_mul(penalty_bps as i128)
+            .expect("sla penalty overflow")
+            / BPS_DENOM;
+        (overdue_hours, penalty_bps, penalty)
+    }
+
     fn voucher_message(env: &Env, voucher: &ChannelVoucher) -> soroban_sdk::Bytes {
         let mut message = soroban_sdk::Bytes::from_slice(env, b"BEAR_CHANNEL_V1");
         message.extend_from_array(&voucher.channel_id.to_be_bytes());
@@ -621,6 +676,8 @@ impl AgenticCommerceContract {
         token: Address,
         budget: i128,
         description: String,
+        sla_deadline: u64,
+        penalty_bps_per_hour: u32,
     ) -> u64 {
         Self::require_not_paused(&env); // #29
         client_addr.require_auth();
@@ -699,6 +756,9 @@ impl AgenticCommerceContract {
             created_at: now,
             updated_at: now,
             fee_bps: snapshotted_fee_bps, // #23
+            sla_deadline,                 // #716
+            penalty_bps_per_hour,         // #716
+            submitted_at: 0,              // #716
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
@@ -724,6 +784,8 @@ impl AgenticCommerceContract {
         token: Address,
         budget: i128,
         description: String,
+        sla_deadline: u64,
+        penalty_bps_per_hour: u32,
     ) -> u64 {
         Self::require_not_paused(&env);
         client_addr.require_auth();
@@ -813,6 +875,9 @@ impl AgenticCommerceContract {
             created_at: now,
             updated_at: now,
             fee_bps,
+            sla_deadline,         // #716
+            penalty_bps_per_hour, // #716
+            submitted_at: 0,      // #716
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
         env.storage().persistent().set(
@@ -861,9 +926,11 @@ impl AgenticCommerceContract {
         if deliverable.len() > MAX_DELIVERABLE_LEN {
             panic!("deliverable too long");
         }
+        let now = env.ledger().timestamp();
         job.status = JobStatus::Submitted;
         job.deliverable = deliverable;
-        job.updated_at = env.ledger().timestamp();
+        job.submitted_at = now; // #716
+        job.updated_at = now;
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobSubmitted {
@@ -899,10 +966,13 @@ impl AgenticCommerceContract {
         if job.status != JobStatus::Submitted && job.status != JobStatus::Disputed {
             panic_with_error!(&env, Error::InvalidStatus);
         }
+        // #716 — apply SLA penalty (if any) before computing the fee.
+        let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(&job);
+        let penalized_budget = job.budget - penalty;
         // #23 — use the fee_bps snapshotted at job creation time so admin
         // changes to the global rate don't retroactively alter this job.
-        let fee: i128 = Self::compute_fee(job.budget, job.fee_bps);
-        let payout: i128 = job.budget - fee;
+        let fee: i128 = Self::compute_fee(penalized_budget, job.fee_bps);
+        let payout: i128 = penalized_budget - fee;
 
         job.status = JobStatus::Completed;
         job.released = job.budget; // full budget has been paid out
@@ -911,6 +981,16 @@ impl AgenticCommerceContract {
 
         let token_client = token::TokenClient::new(&env, &job.token);
         let contract_addr = env.current_contract_address();
+        if penalty > 0 {
+            token_client.transfer(&contract_addr, &job.client, &penalty);
+            SlaPenaltyApplied {
+                job_id: id,
+                overdue_hours,
+                penalty_bps,
+                penalty,
+            }
+            .publish(&env);
+        }
         token_client.transfer(&contract_addr, &job.provider, &payout);
         if fee > 0 {
             let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
@@ -982,14 +1062,27 @@ impl AgenticCommerceContract {
     }
 
     fn settle_job(env: &Env, job: &mut Job, id: u64, evaluator: Address) {
-        let fee = Self::compute_fee(job.budget, job.fee_bps);
-        let payout = job.budget - fee;
+        // #716 — apply SLA penalty (if any) before computing the fee.
+        let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(job);
+        let penalized_budget = job.budget - penalty;
+        let fee = Self::compute_fee(penalized_budget, job.fee_bps);
+        let payout = penalized_budget - fee;
         job.status = JobStatus::Completed;
         job.released = job.budget;
         job.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Job(id), job);
         let token_client = token::TokenClient::new(env, &job.token);
         let contract_addr = env.current_contract_address();
+        if penalty > 0 {
+            token_client.transfer(&contract_addr, &job.client, &penalty);
+            SlaPenaltyApplied {
+                job_id: id,
+                overdue_hours,
+                penalty_bps,
+                penalty,
+            }
+            .publish(env);
+        }
         token_client.transfer(&contract_addr, &job.provider, &payout);
         if fee > 0 {
             let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
@@ -1580,10 +1673,13 @@ impl AgenticCommerceContract {
         if now < job.updated_at + REFUND_TIMEOUT_SECS {
             panic!("timeout not reached");
         }
+        // #716 — apply SLA penalty (if any) before computing the fee.
+        let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(&job);
+        let penalized_budget = job.budget - penalty;
         // #28 — overflow-safe fee: divide first, then multiply.
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
-        let fee: i128 = Self::compute_fee(job.budget, fee_bps);
-        let payout: i128 = job.budget - fee;
+        let fee: i128 = Self::compute_fee(penalized_budget, fee_bps);
+        let payout: i128 = penalized_budget - fee;
 
         job.status = JobStatus::Completed;
         job.released = job.budget;
@@ -1592,6 +1688,16 @@ impl AgenticCommerceContract {
 
         let token_client = token::TokenClient::new(&env, &job.token);
         let contract_addr = env.current_contract_address();
+        if penalty > 0 {
+            token_client.transfer(&contract_addr, &job.client, &penalty);
+            SlaPenaltyApplied {
+                job_id: id,
+                overdue_hours,
+                penalty_bps,
+                penalty,
+            }
+            .publish(&env);
+        }
         token_client.transfer(&contract_addr, &job.provider, &payout);
         if fee > 0 {
             let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
@@ -1705,6 +1811,9 @@ impl AgenticCommerceContract {
             created_at: now,
             updated_at: now,
             fee_bps: snapshotted_fee_bps,
+            sla_deadline: 0,         // #716 — milestone jobs have no SLA by default
+            penalty_bps_per_hour: 0, // #716
+            submitted_at: 0,         // #716
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
         // Normalise milestone indices to match their position in the Vec.

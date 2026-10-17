@@ -46,6 +46,8 @@ fn create_job_stores_and_returns_description() {
         &token_addr,
         &100_000i128,
         &description,
+        &0u64,
+        &0u32,
     );
 
     let job = client.get_job(&job_id).unwrap();
@@ -115,6 +117,8 @@ fn create_job_transfers_budget_into_escrow() {
         &token_addr,
         &budget,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
 
     assert_eq!(job_id, 1);
@@ -159,6 +163,8 @@ fn submit_flips_status_and_records_deliverable() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
 
     client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
@@ -198,6 +204,8 @@ fn submit_rejects_non_provider() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     client.submit(&mallory, &id, &String::from_str(&env, "ipfs://hax.json"));
 }
@@ -220,6 +228,8 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
 
     let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -243,6 +253,8 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
     client.complete(&buyer, &id);
@@ -288,6 +300,8 @@ fn complete_rejects_non_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
     client.complete(&mallory, &id);
@@ -310,6 +324,8 @@ fn cancel_refunds_buyer_when_not_yet_submitted() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     assert_eq!(token.balance(&buyer), 900_000);
 
@@ -351,6 +367,8 @@ fn cancel_rejects_non_client() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     client.cancel(&mallory, &id);
 }
@@ -408,6 +426,8 @@ fn create_job_rejects_call_before_init() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job before init"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -436,6 +456,8 @@ fn create_job_rejects_client_as_provider() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "self-escrow attempt"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -460,6 +482,8 @@ fn create_job_rejects_provider_as_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "provider-as-evaluator attempt"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -483,6 +507,8 @@ fn create_job_allows_client_as_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "buyer self-evaluates"),
+        &0u64,
+        &0u32,
     );
 
     let job = client.get_job(&job_id).unwrap();
@@ -544,6 +570,8 @@ fn complete_panics_on_double_complete() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
     client.complete(&buyer, &id); // first complete — OK
@@ -572,6 +600,8 @@ fn complete_panics_when_called_by_non_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
     // impostor is neither buyer nor seller — must be rejected
@@ -601,6 +631,8 @@ fn submit_panics_when_called_by_non_provider() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     // interloper tries to submit on seller's behalf
     client.submit(&interloper, &id, &String::from_str(&env, "deliverable"));
@@ -672,9 +704,36 @@ fn jobs_by_provider_returns_only_that_providers_jobs() {
     stellar_token.mint(&buyer, &1_000_000);
 
     let desc = String::from_str(&env, "job");
-    let id_a1 = client.create_job(&buyer, &seller_a, &buyer, &token_addr, &1_000i128, &desc);
-    client.create_job(&buyer, &seller_b, &buyer, &token_addr, &1_000i128, &desc);
-    let id_a2 = client.create_job(&buyer, &seller_a, &buyer, &token_addr, &1_000i128, &desc);
+    let id_a1 = client.create_job(
+        &buyer,
+        &seller_a,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    client.create_job(
+        &buyer,
+        &seller_b,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    let id_a2 = client.create_job(
+        &buyer,
+        &seller_a,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
 
     let seller_a_jobs = client.jobs_by_provider(&seller_a, &1u64, &10u32);
     assert_eq!(seller_a_jobs.len(), 2);
@@ -696,8 +755,26 @@ fn jobs_by_client_returns_only_that_clients_jobs() {
     stellar_token.mint(&buyer_b, &1_000_000);
 
     let desc = String::from_str(&env, "job");
-    client.create_job(&buyer_a, &seller, &buyer_a, &token_addr, &1_000i128, &desc);
-    let id_b = client.create_job(&buyer_b, &seller, &buyer_b, &token_addr, &1_000i128, &desc);
+    client.create_job(
+        &buyer_a,
+        &seller,
+        &buyer_a,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    let id_b = client.create_job(
+        &buyer_b,
+        &seller,
+        &buyer_b,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
 
     let buyer_b_jobs = client.jobs_by_client(&buyer_b, &1u64, &10u32);
     assert_eq!(buyer_b_jobs.len(), 1);
@@ -716,9 +793,36 @@ fn jobs_by_provider_respects_limit_and_start_id() {
     stellar_token.mint(&buyer, &1_000_000);
 
     let desc = String::from_str(&env, "job");
-    client.create_job(&buyer, &seller, &buyer, &token_addr, &1_000i128, &desc);
-    let id2 = client.create_job(&buyer, &seller, &buyer, &token_addr, &1_000i128, &desc);
-    client.create_job(&buyer, &seller, &buyer, &token_addr, &1_000i128, &desc);
+    client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    let id2 = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
 
     // limit=1 from the start returns only the first match.
     let first_page = client.jobs_by_provider(&seller, &1u64, &1u32);
@@ -762,6 +866,8 @@ fn cancel_panics_on_already_cancelled_job() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     client.cancel(&buyer, &id); // first cancel — OK
     client.cancel(&buyer, &id); // second cancel — must panic
@@ -806,6 +912,8 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
         &token_addr,
         &budget,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
     client.complete(&buyer, &id);
@@ -845,6 +953,8 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
         &token_addr,
         &budget,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
     client.complete(&buyer, &id);
@@ -887,6 +997,8 @@ fn create_job_panics_when_contract_is_paused() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "should fail"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -916,6 +1028,8 @@ fn unpause_restores_create_job() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "post-unpause job"),
+        &0u64,
+        &0u32,
     );
     assert!(id > 0);
 }
@@ -1143,6 +1257,8 @@ fn high_value_job_requires_multi_eval_creation() {
         &token,
         &100_000,
         &String::from_str(&env, "must use evaluator quorum"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -1256,4 +1372,217 @@ fn channel_cannot_be_force_closed_before_challenge_period() {
     let channel_id = client.open_channel(&payer, &provider, &token_addr, &100_000, &voucher_key);
 
     client.force_close(&payer, &channel_id);
+}
+
+// ===========================================================================
+// #716 — SLA breach penalty deduction
+// ===========================================================================
+
+/// On-time submission (submitted_at <= sla_deadline) must yield the full
+/// agreed payout with no penalty deducted.
+#[test]
+fn sla_on_time_submission_pays_full_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    env.ledger().set_timestamp(1_000);
+    let sla_deadline: u64 = 2_000;
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "sla on time"),
+        &sla_deadline,
+        &100u32, // 1% per hour
+    );
+
+    // Submit exactly at the deadline — not late.
+    env.ledger().set_timestamp(sla_deadline);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+
+    env.ledger().set_timestamp(sla_deadline + 10_000);
+    client.complete(&buyer, &id);
+
+    // No penalty: 1% fee on 100_000 → 1_000 fee, 99_000 payout.
+    assert_eq!(token.balance(&seller), 99_000);
+    assert_eq!(token.balance(&treasury), 1_000);
+    assert_eq!(token.balance(&buyer), 900_000);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+/// A late submission by N hours deducts exactly N * penalty_bps_per_hour bps
+/// from the provider payout and transfers that amount to the client. The fee
+/// is computed on the reduced amount.
+#[test]
+fn sla_late_submission_deducts_hourly_penalty_to_client() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let sla_deadline: u64 = 1_000;
+    let penalty_bps_per_hour: u32 = 100; // 1% per hour
+    env.ledger().set_timestamp(500);
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "sla late"),
+        &sla_deadline,
+        &penalty_bps_per_hour,
+    );
+
+    // Submit 3 hours late (3 * 3600 seconds after the deadline).
+    env.ledger().set_timestamp(sla_deadline + 3 * 3_600);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+
+    env.ledger().set_timestamp(sla_deadline + 3 * 3_600 + 100);
+    client.complete(&buyer, &id);
+
+    // Penalty = 3 * 100 bps = 300 bps = 3% of 100_000 = 3_000.
+    // Reduced amount = 97_000. Fee = 1% of 97_000 = 970. Payout = 96_030.
+    assert_eq!(token.balance(&seller), 96_030);
+    assert_eq!(token.balance(&treasury), 970);
+    // Client gets the penalty back: 900_000 (post-escrow) + 3_000.
+    assert_eq!(token.balance(&buyer), 903_000);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+/// The penalty must be capped at 50% of budget even when the accumulated
+/// hourly penalty would exceed that.
+#[test]
+fn sla_penalty_is_capped_at_fifty_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let sla_deadline: u64 = 1_000;
+    let penalty_bps_per_hour: u32 = 1_000; // 10% per hour
+    env.ledger().set_timestamp(500);
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "sla capped"),
+        &sla_deadline,
+        &penalty_bps_per_hour,
+    );
+
+    // Submit 20 hours late → 20 * 1_000 = 20_000 bps, capped at 5_000 bps.
+    env.ledger().set_timestamp(sla_deadline + 20 * 3_600);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+
+    env.ledger().set_timestamp(sla_deadline + 20 * 3_600 + 100);
+    client.complete(&buyer, &id);
+
+    // Penalty capped at 50% = 50_000. Reduced amount = 50_000.
+    // Fee = 1% of 50_000 = 500. Payout = 49_500.
+    assert_eq!(token.balance(&seller), 49_500);
+    assert_eq!(token.balance(&treasury), 500);
+    assert_eq!(token.balance(&buyer), 950_000);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+/// Multi-party balances (client, provider, treasury, contract) must all be
+/// correct after a penalized completion.
+#[test]
+fn sla_penalized_completion_balances_are_consistent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let sla_deadline: u64 = 10_000;
+    let penalty_bps_per_hour: u32 = 250; // 2.5% per hour
+    env.ledger().set_timestamp(1_000);
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "sla multi-party"),
+        &sla_deadline,
+        &penalty_bps_per_hour,
+    );
+    assert_eq!(token.balance(&client.address), 100_000);
+    assert_eq!(token.balance(&buyer), 900_000);
+
+    // Submit 4 hours late → 4 * 250 = 1_000 bps = 10% = 10_000 penalty.
+    env.ledger().set_timestamp(sla_deadline + 4 * 3_600);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+
+    env.ledger().set_timestamp(sla_deadline + 4 * 3_600 + 50);
+    client.complete(&buyer, &id);
+
+    // Reduced amount = 90_000. Fee = 1% of 90_000 = 900. Payout = 89_100.
+    assert_eq!(token.balance(&seller), 89_100);
+    assert_eq!(token.balance(&treasury), 900);
+    assert_eq!(token.balance(&buyer), 910_000);
+    assert_eq!(token.balance(&client.address), 0);
+
+    // Conservation: total tokens across all parties unchanged.
+    let total = token.balance(&seller)
+        + token.balance(&treasury)
+        + token.balance(&buyer)
+        + token.balance(&client.address);
+    assert_eq!(total, 1_000_000);
+}
+
+/// sla_deadline = 0 disables penalty enforcement entirely.
+#[test]
+fn sla_zero_deadline_disables_penalty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    env.ledger().set_timestamp(1_000);
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "sla disabled"),
+        &0u64,
+        &1_000u32, // would be a huge penalty if enforced
+    );
+
+    // Submit far in the future — no penalty should apply.
+    env.ledger().set_timestamp(1_000_000);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+
+    env.ledger().set_timestamp(1_000_000 + 100);
+    client.complete(&buyer, &id);
+
+    // Full payout: 1% fee on 100_000 → 1_000 fee, 99_000 payout.
+    assert_eq!(token.balance(&seller), 99_000);
+    assert_eq!(token.balance(&treasury), 1_000);
+    assert_eq!(token.balance(&buyer), 900_000);
+    assert_eq!(token.balance(&client.address), 0);
 }
