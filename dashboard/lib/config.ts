@@ -108,6 +108,22 @@ export function getConfigForNetwork(networkId?: string | null): MarcConfig {
 
 export const DEMO_MODE = process.env.DEMO_MODE === "true";
 
+// SEP-0010 (Stellar Web Authentication) configuration.
+// The server signing keypair signs challenge transactions; wallets verify the
+// home_domain and server signature before prompting the user to sign.
+export const homeDomain = process.env.DASHBOARD_HOME_DOMAIN ?? "localhost";
+
+export const serverSigningKeypair = Keypair.fromSecret(
+  process.env.DASHBOARD_SIGNING_SECRET || DEMO_BUYER_SECRET,
+);
+
+// Secret used to sign/verify dashboard session JWTs (24h expiration).
+export const jwtSecret = process.env.DASHBOARD_JWT_SECRET || "demo-dashboard-jwt-secret";
+
+// Challenge transaction validity window (seconds) and JWT lifetime (seconds).
+export const challengeTimeoutSeconds = Number(process.env.DASHBOARD_CHALLENGE_TIMEOUT ?? 300);
+export const jwtExpiresInSeconds = Number(process.env.DASHBOARD_JWT_EXPIRES_IN ?? 24 * 60 * 60);
+
 // In DEMO_MODE, use fixed test keypairs so no secrets are required.
 // These are well-known Stellar testnet keys safe for local demos only.
 const DEMO_BUYER_SECRET = "SDKXSHMO3BR6P7BRH6KNZ7RWHKK4PDACKTUTIHM7J56T55RHT53QHFBX";

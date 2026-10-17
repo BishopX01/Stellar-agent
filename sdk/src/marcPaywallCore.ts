@@ -13,6 +13,13 @@
  * @module marcPaywallCore
  */
 
+import {
+  extractTraceContext,
+  startSpan,
+  withSpan,
+  type MarcSpan,
+} from "./tracing.js";
+
 /**
  * Framework-agnostic configuration options for MARC x402 payment middleware.
  *
@@ -109,4 +116,89 @@ export interface PaymentCheckResponse {
    * Only present when `authorized` is `false`.
    */
   responseBody?: string;
+}
+
+/**
+ * A span handle for a protected request, created from the inbound
+ * `traceparent` header (if present) so that the paywall's verification and
+ * settlement work is correlated with the caller's distributed trace.
+ */
+export interface PaymentRequestSpan {
+  /** The active server span for the protected request. */
+  span: MarcSpan;
+  /**
+   * Run the x402 payment verification step inside a child span.
+   * The child span records errors and ends automatically.
+   */
+  verify<T>(fn: () => Promise<T> | T): Promise<T>;
+  /**
+   * Run the x402 payment settlement step inside a child span.
+   * The child span records errors and ends automatically.
+   */
+  settle<T>(fn: () => Promise<T> | T): Promise<T>;
+  /** End the server span. Safe to call more than once. */
+  end(): void;
+}
+
+/**
+ * Start a server span for an inbound protected request.
+ *
+ * Extracts W3C trace context (`traceparent` / `tracestate`) from the request
+ * headers so the paywall participates in the caller's distributed trace, then
+ * creates a `marc.paywall.request` server span as a child of that context.
+ *
+ * @param request - Normalized inbound request data.
+ * @returns A {@link PaymentRequestSpan} with helpers for verification and
+ *   settlement child spans.
+ *
+ * @example
+ * ```typescript
+ * const reqSpan = startPaymentRequestSpan(request);
+ * try {
+ *   const result = await reqSpan.verify(() => checkPayment(request));
+ *   if (result.authorized) {
+ *     await reqSpan.settle(() => settlePayment(request));
+ *   }
+ * } finally {
+ *   reqSpan.end();
+ * }
+ * ```
+ */
+export function startPaymentRequestSpan(
+  request: PaymentCheckRequest,
+): PaymentRequestSpan {
+  const parentContext = extractTraceContext(request.headers);
+  const span = startSpan(
+    "marc.paywall.request",
+    {
+      attributes: {
+        "http.request.method": request.method,
+        "url.path": request.url,
+      },
+      kind: "server",
+    },
+    parentContext,
+  );
+
+  let ended = false;
+
+  return {
+    span,
+    verify: <T>(fn: () => Promise<T> | T): Promise<T> =>
+      withSpan("marc.paywall.verify", fn, {
+        parent: span,
+        attributes: { "marc.paywall.step": "verify" },
+      }),
+    settle: <T>(fn: () => Promise<T> | T): Promise<T> =>
+      withSpan("marc.paywall.settle", fn, {
+        parent: span,
+        attributes: { "marc.paywall.step": "settle" },
+      }),
+    end: () => {
+      if (!ended) {
+        ended = true;
+        span.end();
+      }
+    },
+  };
 }

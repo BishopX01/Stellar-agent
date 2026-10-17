@@ -20,8 +20,54 @@ import {
 import { retryWithBackoff } from "../shared.js";
 import { watchFile, unwatchFile, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
+import { context, propagation, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 
 const DEFAULT_JOB_BUDGET = 10_000_000n;
+
+// ── OpenTelemetry tracing (issue #726) ────────────────────────────────────────
+// The tracer is a no-op until a provider is registered (see tracing.ts). All
+// spans created here are cheap when tracing is disabled.
+const tracer = trace.getTracer("marc-buyer-agent", "0.1.0");
+
+/**
+ * Inject the active trace context (traceparent/tracestate) into outbound HTTP
+ * headers so downstream services can continue the distributed trace.
+ */
+function injectTraceHeaders(headers: Record<string, string> = {}): Record<string, string> {
+  propagation.inject(context.active(), headers);
+  return headers;
+}
+
+/**
+ * Wrap a fetch call in a client span and propagate traceparent headers.
+ */
+async function tracedFetch(
+  input: string | URL,
+  init: RequestInit = {},
+  spanName = "HTTP request",
+): Promise<Response> {
+  return tracer.startActiveSpan(
+    spanName,
+    { kind: SpanKind.CLIENT, attributes: { "http.url": String(input) } },
+    async (span) => {
+      try {
+        const headers = injectTraceHeaders({
+          ...((init.headers as Record<string, string>) ?? {}),
+        });
+        const res = await fetch(input, { ...init, headers });
+        span.setAttribute("http.status_code", res.status);
+        if (!res.ok) span.setStatus({ code: SpanStatusCode.ERROR });
+        return res;
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    },
+  );
+}
 
 // ── LLM configuration ─────────────────────────────────────────────────────────
 // Provider/model are env-configurable per issue #650. Supported providers:
@@ -94,44 +140,66 @@ function extractJson(text: string): string {
 }
 
 async function callLlm(prompt: string): Promise<string> {
-  if (LLM_PROVIDER === "anthropic") {
-    const key = process.env.ANTHROPIC_API_KEY;
-    if (!key) throw new Error("ANTHROPIC_API_KEY not set");
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: LLM_MODEL,
-        max_tokens: 512,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    if (!res.ok) throw new Error(`anthropic ${res.status}`);
-    const data = (await res.json()) as { content: { text: string }[] };
-    return data.content.map((c) => c.text).join("");
-  }
+  return tracer.startActiveSpan(
+    "llm.chat",
+    { kind: SpanKind.CLIENT, attributes: { "llm.provider": LLM_PROVIDER, "llm.model": LLM_MODEL } },
+    async (span) => {
+      try {
+        if (LLM_PROVIDER === "anthropic") {
+          const key = process.env.ANTHROPIC_API_KEY;
+          if (!key) throw new Error("ANTHROPIC_API_KEY not set");
+          const res = await tracedFetch(
+            "https://api.anthropic.com/v1/messages",
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+              },
+              body: JSON.stringify({
+                model: LLM_MODEL,
+                max_tokens: 512,
+                messages: [{ role: "user", content: prompt }],
+              }),
+            },
+            "llm.anthropic.messages",
+          );
+          if (!res.ok) throw new Error(`anthropic ${res.status}`);
+          const data = (await res.json()) as { content: { text: string }[] };
+          return data.content.map((c) => c.text).join("");
+        }
 
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error("OPENAI_API_KEY not set");
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${key}`,
+        const key = process.env.OPENAI_API_KEY;
+        if (!key) throw new Error("OPENAI_API_KEY not set");
+        const res = await tracedFetch(
+          "https://api.openai.com/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${key}`,
+            },
+            body: JSON.stringify({
+              model: LLM_MODEL,
+              messages: [{ role: "user", content: prompt }],
+              response_format: { type: "json_object" },
+            }),
+          },
+          "llm.openai.chat",
+        );
+        if (!res.ok) throw new Error(`openai ${res.status}`);
+        const data = (await res.json()) as { choices: { message: { content: string } }[] };
+        return data.choices[0]?.message?.content ?? "";
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        throw err;
+      } finally {
+        span.end();
+      }
     },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      messages: [{ role: "user", content: prompt }],
-      response_format: { type: "json_object" },
-    }),
-  });
-  if (!res.ok) throw new Error(`openai ${res.status}`);
-  const data = (await res.json()) as { choices: { message: { content: string } }[] };
-  return data.choices[0]?.message?.content ?? "";
+  );
 }
 
 /**
@@ -199,26 +267,39 @@ const cfg: MarcConfig = {
 };
 
 async function getUsdc(pubkey: string): Promise<string> {
-  try {
-    const server = new rpc.Server(cfg.rpcUrl, { allowHttp: false });
-    const op = new Contract(cfg.usdcToken).call("balance", new Address(pubkey).toScVal());
-    const dummy = new Account(Keypair.random().publicKey(), "0");
-    const tx = new TransactionBuilder(dummy, {
-      fee: BASE_FEE,
-      networkPassphrase: cfg.networkPassphrase,
-    })
-      .addOperation(op)
-      .setTimeout(30)
-      .build();
-    const sim = await server.simulateTransaction(tx);
-    if (rpc.Api.isSimulationError(sim)) return "?.??";
-    const val = BigInt(
-      scValToNative((sim as rpc.Api.SimulateTransactionSuccessResponse).result!.retval),
-    );
-    return `${val / 10_000_000n}.${(val % 10_000_000n).toString().padStart(7, "0").slice(0, 2)}`;
-  } catch {
-    return "?.??";
-  }
+  return tracer.startActiveSpan(
+    "soroban.simulate.balance",
+    { kind: SpanKind.CLIENT, attributes: { "rpc.url": cfg.rpcUrl, "stellar.contract": cfg.usdcToken } },
+    async (span) => {
+      try {
+        const server = new rpc.Server(cfg.rpcUrl, { allowHttp: false });
+        const op = new Contract(cfg.usdcToken).call("balance", new Address(pubkey).toScVal());
+        const dummy = new Account(Keypair.random().publicKey(), "0");
+        const tx = new TransactionBuilder(dummy, {
+          fee: BASE_FEE,
+          networkPassphrase: cfg.networkPassphrase,
+        })
+          .addOperation(op)
+          .setTimeout(30)
+          .build();
+        const sim = await server.simulateTransaction(tx);
+        if (rpc.Api.isSimulationError(sim)) {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: "simulation error" });
+          return "?.??";
+        }
+        const val = BigInt(
+          scValToNative((sim as rpc.Api.SimulateTransactionSuccessResponse).result!.retval),
+        );
+        return `${val / 10_000_000n}.${(val % 10_000_000n).toString().padStart(7, "0").slice(0, 2)}`;
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        return "?.??";
+      } finally {
+        span.end();
+      }
+    },
+  );
 }
 
 // ── TUI ───────────────────────────────────────────────────────────────────────
@@ -387,7 +468,7 @@ function watchSellerLog(picked: any) {
 
 async function loadAgents() {
   try {
-    agents = await fetch(REGISTRY).then((r) => r.json());
+    agents = await tracedFetch(REGISTRY, {}, "registry.list").then((r) => r.json());
     renderAgents();
   } catch {
     agentsBox.setContent("{red-fg}Registry not running — start agents/registry first{/red-fg}");
@@ -440,51 +521,71 @@ screen.key(["down", "j"], () => {
  * to submit within the timeout.
  */
 async function runSmartJob(description: string): Promise<BuyerResult | null> {
-  log(`{cyan-fg}Classifying task via ${LLM_PROVIDER}/${LLM_MODEL}...{/cyan-fg}`);
-  const { capabilities, summary } = await classifyTask(description);
-  log(`{gray-fg}capabilities: ${capabilities.join(", ")}{/gray-fg}`);
+  return tracer.startActiveSpan(
+    "buyer.smart_job",
+    { attributes: { "job.description": description } },
+    async (span) => {
+      try {
+        log(`{cyan-fg}Classifying task via ${LLM_PROVIDER}/${LLM_MODEL}...{/cyan-fg}`);
+        const { capabilities, summary } = await classifyTask(description);
+        log(`{gray-fg}capabilities: ${capabilities.join(", ")}{/gray-fg}`);
 
-  const available = agents.length > 0 ? agents : await fetch(REGISTRY).then((r) => r.json());
-  const selection = selectProvider(available, capabilities);
-  if (!selection) {
-    log("{red-fg}No matching provider found in registry{/red-fg}");
-    return null;
-  }
+        const available =
+          agents.length > 0
+            ? agents
+            : await tracedFetch(REGISTRY, {}, "registry.list").then((r) => r.json());
+        const selection = selectProvider(available, capabilities);
+        if (!selection) {
+          log("{red-fg}No matching provider found in registry{/red-fg}");
+          span.setStatus({ code: SpanStatusCode.ERROR, message: "no provider" });
+          return null;
+        }
 
-  const provider = selection.agent;
-  log(
-    `{green-fg}Selected provider:{/green-fg} ${provider.name} (score ${selection.score.toFixed(2)})`,
+        const provider = selection.agent;
+        span.setAttribute("job.provider", provider.name);
+        log(
+          `{green-fg}Selected provider:{/green-fg} ${provider.name} (score ${selection.score.toFixed(2)})`,
+        );
+
+        const jobId = await createEscrowJob(provider, summary, cliArgs.budget);
+        if (!jobId) return null;
+        span.setAttribute("job.id", jobId);
+
+        const result = await pollJobCompletion(jobId);
+        if (!result) {
+          log("{yellow-fg}Provider timed out — retrying with next best provider{/yellow-fg}");
+          const fallback = selectProvider(
+            available.filter((a) => a.id !== provider.id),
+            capabilities,
+          );
+          if (!fallback) return null;
+          const retryJobId = await createEscrowJob(fallback.agent, summary, cliArgs.budget);
+          if (!retryJobId) return null;
+          const retryResult = await pollJobCompletion(retryJobId);
+          if (!retryResult) return null;
+          return {
+            jobId: retryJobId,
+            provider: fallback.agent.name,
+            cost: `${fallback.agent.price_usdc} USDC`,
+            result: retryResult,
+          };
+        }
+
+        return {
+          jobId,
+          provider: provider.name,
+          cost: `${provider.price_usdc} USDC`,
+          result,
+        };
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    },
   );
-
-  const jobId = await createEscrowJob(provider, summary, cliArgs.budget);
-  if (!jobId) return null;
-
-  const result = await pollJobCompletion(jobId);
-  if (!result) {
-    log("{yellow-fg}Provider timed out — retrying with next best provider{/yellow-fg}");
-    const fallback = selectProvider(
-      available.filter((a) => a.id !== provider.id),
-      capabilities,
-    );
-    if (!fallback) return null;
-    const retryJobId = await createEscrowJob(fallback.agent, summary, cliArgs.budget);
-    if (!retryJobId) return null;
-    const retryResult = await pollJobCompletion(retryJobId);
-    if (!retryResult) return null;
-    return {
-      jobId: retryJobId,
-      provider: fallback.agent.name,
-      cost: `${fallback.agent.price_usdc} USDC`,
-      result: retryResult,
-    };
-  }
-
-  return {
-    jobId,
-    provider: provider.name,
-    cost: `${provider.price_usdc} USDC`,
-    result,
-  };
 }
 
 async function createEscrowJob(
@@ -492,42 +593,65 @@ async function createEscrowJob(
   description: string,
   budget: bigint,
 ): Promise<string | null> {
-  try {
-    const commerce = new CommerceClient(cfg, buyer);
-    const job = await retryWithBackoff(() =>
-      commerce.createJob({
-        provider: provider.wallet,
-        description,
-        budget,
-      }),
-    );
-    log(`{green-fg}Escrow job created:{/green-fg} ${job.id}`);
-    return job.id;
-  } catch (err) {
-    log(`{red-fg}Failed to create job: ${(err as Error).message}{/red-fg}`);
-    return null;
-  }
+  return tracer.startActiveSpan(
+    "x402.escrow.create",
+    { kind: SpanKind.CLIENT, attributes: { "x402.provider": provider.wallet } },
+    async (span) => {
+      try {
+        const commerce = new CommerceClient(cfg, buyer);
+        const job = await retryWithBackoff(() =>
+          commerce.createJob({
+            provider: provider.wallet,
+            description,
+            budget,
+          }),
+        );
+        span.setAttribute("job.id", job.id);
+        log(`{green-fg}Escrow job created:{/green-fg} ${job.id}`);
+        return job.id;
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        log(`{red-fg}Failed to create job: ${(err as Error).message}{/red-fg}`);
+        return null;
+      } finally {
+        span.end();
+      }
+    },
+  );
 }
 
 async function pollJobCompletion(jobId: string): Promise<string | null> {
-  const commerce = new CommerceClient(cfg, buyer);
-  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
-    try {
-      const job: Job = await commerce.getJob(jobId);
-      if (job.status === "Completed") {
-        log(`{green-fg}Job ${jobId} completed{/green-fg}`);
-        return job.result ?? "";
-      }
-      if (job.status === "Failed" || job.status === "Cancelled") {
-        log(`{red-fg}Job ${jobId} ${job.status}{/red-fg}`);
+  return tracer.startActiveSpan(
+    "x402.escrow.poll",
+    { attributes: { "job.id": jobId } },
+    async (span) => {
+      try {
+        const commerce = new CommerceClient(cfg, buyer);
+        for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+          try {
+            const job: Job = await commerce.getJob(jobId);
+            if (job.status === "Completed") {
+              log(`{green-fg}Job ${jobId} completed{/green-fg}`);
+              return job.result ?? "";
+            }
+            if (job.status === "Failed" || job.status === "Cancelled") {
+              log(`{red-fg}Job ${jobId} ${job.status}{/red-fg}`);
+              span.setStatus({ code: SpanStatusCode.ERROR, message: job.status });
+              return null;
+            }
+          } catch {
+            // transient RPC error — keep polling
+          }
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        }
+        span.setStatus({ code: SpanStatusCode.ERROR, message: "timeout" });
         return null;
+      } finally {
+        span.end();
       }
-    } catch {
-      // transient RPC error — keep polling
-    }
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  }
-  return null;
+    },
+  );
 }
 
 // Submit handler: route the typed task through the LLM-powered pipeline.

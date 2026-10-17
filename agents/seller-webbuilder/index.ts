@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import rateLimit from "express-rate-limit";
 import Groq from "groq-sdk";
 import { CommerceClient } from "marc-stellar-sdk";
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import {
   createSellerAgent,
   makeSellerResponse,
@@ -17,6 +18,7 @@ import {
 } from "../shared.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
+=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4501);
@@ -29,6 +31,26 @@ const { app, seller, cfg } = await createSellerAgent({
   id: AGENT_ID,
   port: PORT,
   agentDir: AGENT_DIR,
+});
+
+const tracer = initTracing(AGENT_ID).getTracer(AGENT_ID);
+
+app.use((req, res, next) => {
+  const span = tracer.startSpan(`${req.method} ${req.path}`, {
+    attributes: {
+      "http.method": req.method,
+      "http.route": req.path,
+      "http.target": req.originalUrl,
+      "http.user_agent": req.headers["user-agent"] ?? "",
+      "agent.id": AGENT_ID,
+    },
+  });
+  res.on("finish", () => {
+    span.setAttribute("http.status_code", res.statusCode);
+    if (res.statusCode >= 500) span.setStatus({ code: SpanStatusCode.ERROR });
+    span.end();
+  });
+  next();
 });
 
 const startTime = Date.now();
@@ -103,17 +125,28 @@ async function generate(prompt: string): Promise<string> {
   if (isMockLlm()) {
     return MOCK_DELIVERABLES.webbuilder;
   }
-  const res = await callLlmWithRetry(
-    () =>
-      groq!.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.7,
-      }),
-    3,
-    AGENT_ID,
-  );
-  return res.choices[0].message.content ?? "";
+  return tracer.startActiveSpan("llm.generate", async (span: Span) => {
+    span.setAttribute("llm.model", GROQ_MODEL);
+    span.setAttribute("llm.provider", "groq");
+    try {
+      const res = await callLlmWithRetry(
+        () =>
+          groq!.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+          }),
+        3,
+        AGENT_ID,
+      );
+      return res.choices[0].message.content ?? "";
+    } catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
 interface BuildSpec {

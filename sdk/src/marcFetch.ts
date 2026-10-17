@@ -2,7 +2,22 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { ExactStellarScheme } from "@x402/stellar/exact/client";
 import { createEd25519Signer, STELLAR_TESTNET_CAIP2, STELLAR_PUBNET_CAIP2 } from "@x402/stellar";
+import { context, propagation, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import { decodeBase64 } from "./format.js";
+
+const tracer = trace.getTracer("marc-stellar-sdk", "0.0.0");
+
+/**
+ * Inject the active W3C `traceparent` (and `tracestate`) headers into a plain
+ * header record so downstream services can continue the distributed trace.
+ *
+ * @internal
+ */
+function injectTraceContext(headers: Record<string, string>): Record<string, string> {
+  const carrier: Record<string, string> = {};
+  propagation.inject(context.active(), carrier);
+  return { ...headers, ...carrier };
+}
 
 /**
  * Payment lifecycle status passed to the {@link MarcFetchOptions.onPayment} callback.
@@ -230,23 +245,63 @@ export function marcFetch(opts: MarcFetchOptions) {
   client.register(caip2, stellarScheme);
 
   const baseFetch: typeof fetch = (input, init) => {
-    const headers = customHeaders
-      ? { ...customHeaders, ...(init?.headers as Record<string, string> | undefined) }
-      : init?.headers;
+    const mergedHeaders: Record<string, string> = {
+      ...(customHeaders ?? {}),
+      ...((init?.headers as Record<string, string> | undefined) ?? {}),
+    };
+    const headers = injectTraceContext(mergedHeaders);
 
     const requestInit = {
       ...init,
       headers,
     } as RequestInit;
 
-    if (typeof timeoutMs === "number" && timeoutMs > 0) {
-      const controller = new AbortController();
-      const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
-      requestInit.signal = controller.signal;
-      return (fetchImpl ?? fetch)(input, requestInit).finally(() => clearTimeout(timeoutHandle));
-    }
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-    return (fetchImpl ?? fetch)(input, requestInit);
+    return tracer.startActiveSpan(
+      "x402.fetch",
+      {
+        kind: SpanKind.CLIENT,
+        attributes: {
+          "http.request.method": method,
+          "url.full": url,
+        },
+      },
+      async (span) => {
+        try {
+          let response: Response;
+          if (typeof timeoutMs === "number" && timeoutMs > 0) {
+            const controller = new AbortController();
+            const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+            requestInit.signal = controller.signal;
+            try {
+              response = await (fetchImpl ?? fetch)(input, requestInit);
+            } finally {
+              clearTimeout(timeoutHandle);
+            }
+          } else {
+            response = await (fetchImpl ?? fetch)(input, requestInit);
+          }
+          span.setAttribute("http.response.status_code", response.status);
+          if (response.status >= 400) {
+            span.setStatus({ code: SpanStatusCode.ERROR, message: `HTTP ${response.status}` });
+          }
+          return response;
+        } catch (err) {
+          span.recordException(err as Error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error)?.message });
+          throw err;
+        } finally {
+          span.end();
+        }
+      },
+    );
   };
 
   if (onPayment) {
@@ -257,15 +312,22 @@ export function marcFetch(opts: MarcFetchOptions) {
       (stellarScheme as unknown as { pay: typeof originalBuildAndPay }).pay = async (
         ...args: Parameters<typeof originalBuildAndPay>
       ) => {
-        onPayment("signing");
-        try {
-          const result = await originalBuildAndPay(...args);
-          onPayment("pending");
-          return result;
-        } catch (err) {
-          onPayment("failed");
-          throw err;
-        }
+        return tracer.startActiveSpan("x402.payment.sign", async (span) => {
+          onPayment("signing");
+          try {
+            const result = await originalBuildAndPay(...args);
+            onPayment("pending");
+            span.setStatus({ code: SpanStatusCode.OK });
+            return result;
+          } catch (err) {
+            onPayment("failed");
+            span.recordException(err as Error);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error)?.message });
+            throw err;
+          } finally {
+            span.end();
+          }
+        });
       };
     }
   }
@@ -300,10 +362,24 @@ export function marcFetch(opts: MarcFetchOptions) {
 
         let signedProof = "";
         try {
-          if (typeof (client as any).createPaymentPayload === "function") {
-            const payload = await (client as any).createPaymentPayload(reqHeader);
-            signedProof = typeof payload === "string" ? payload : JSON.stringify(payload);
-          }
+          signedProof = await tracer.startActiveSpan("x402.payment.createPayload", async (span) => {
+            try {
+              if (typeof (client as any).createPaymentPayload === "function") {
+                const payload = await (client as any).createPaymentPayload(reqHeader);
+                const proof = typeof payload === "string" ? payload : JSON.stringify(payload);
+                span.setStatus({ code: SpanStatusCode.OK });
+                return proof;
+              }
+              span.setStatus({ code: SpanStatusCode.OK });
+              return "";
+            } catch (err) {
+              span.recordException(err as Error);
+              span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error)?.message });
+              throw err;
+            } finally {
+              span.end();
+            }
+          });
         } catch (err) {
           if (onPayment) {
             onPayment("failed");
@@ -325,7 +401,28 @@ export function marcFetch(opts: MarcFetchOptions) {
 
         let lastResponse: Response | undefined;
         for (let retry = 0; retry <= retries; retry += 1) {
-          const retryResponse = await baseFetch(input, requestInit);
+          const retryResponse = await tracer.startActiveSpan(
+            "x402.payment.settle",
+            { attributes: { "x402.retry": retry } },
+            async (span) => {
+              try {
+                const res = await baseFetch(input, requestInit);
+                span.setAttribute("http.response.status_code", res.status);
+                if (res.status === 402) {
+                  span.setStatus({ code: SpanStatusCode.ERROR, message: "HTTP 402" });
+                } else {
+                  span.setStatus({ code: SpanStatusCode.OK });
+                }
+                return res;
+              } catch (err) {
+                span.recordException(err as Error);
+                span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error)?.message });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
+          );
           if (retryResponse.status !== 402) {
             if (onPayment && retryResponse.ok) {
               onPayment("settled");

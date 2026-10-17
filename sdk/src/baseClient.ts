@@ -10,6 +10,7 @@ import {
   extractContractErrorCode,
   resolveContractErrorExplanation,
 } from "./errors.js";
+import { withSpan } from "./tracing.js";
 
 // ---------------------------------------------------------------------------
 // #781 — RPC Failover Pool
@@ -366,17 +367,27 @@ export abstract class BaseClient {
     // #789 — sequence numbers are fetched through the failover pool so that a
     // degraded endpoint does not stall rapid successive submissions.
     this.sequenceManager = new AccountSequenceManager((publicKey) =>
-      this.rpcCall((s) => s.getAccount(publicKey)),
+      this.rpcCall((s) => s.getAccount(publicKey), "soroban.getAccount"),
     );
   }
 
   /**
    * Execute an RPC operation through the failover pool.
    * Falls back to `this.server` when the pool is not configured.
+   *
+   * The operation is wrapped in an OpenTelemetry span (issue #726) so that
+   * Soroban RPC latency is visible in distributed traces.
    */
-  protected async rpcCall<T>(fn: (server: rpc.Server) => Promise<T>): Promise<T> {
-    if (this.rpcPool) return this.rpcPool.call(fn);
-    return fn(this.server);
+  protected async rpcCall<T>(
+    fn: (server: rpc.Server) => Promise<T>,
+    spanName = "soroban.rpc",
+  ): Promise<T> {
+    return withSpan(spanName, async (span) => {
+      span.setAttribute("rpc.system", "soroban");
+      span.setAttribute("rpc.pool.enabled", Boolean(this.rpcPool));
+      if (this.rpcPool) return this.rpcPool.call(fn);
+      return fn(this.server);
+    });
   }
 
   /**
@@ -429,14 +440,14 @@ export abstract class BaseClient {
         builder = builder.addMemo(Memo.text(options.memo));
       }
       tx = builder.setTimeout(30).build();
-      const prepared = await this.rpcCall((s) => s.prepareTransaction(tx));
+      const prepared = await this.rpcCall((s) => s.prepareTransaction(tx), "soroban.simulate");
       const signedXdr = await walletSigner.signTransaction(prepared.toXDR(), {
         networkPassphrase: this.cfg.networkPassphrase,
       });
       const signedTx = TransactionBuilder.fromXDR(signedXdr, this.cfg.networkPassphrase);
 
       try {
-        sent = await this.rpcCall((s) => s.sendTransaction(signedTx));
+        sent = await this.rpcCall((s) => s.sendTransaction(signedTx), "soroban.submit");
       } catch (err) {
         // Network error: re-sync so the next attempt starts from a known-good
         // sequence number, then retry if attempts remain.
@@ -473,13 +484,13 @@ export abstract class BaseClient {
 
     const startTime = Date.now();
     const timeoutMs = this.cfg.pollTimeoutMs ?? 60000;
-    let getResp = await this.rpcCall((s) => s.getTransaction(sent.hash));
+    let getResp = await this.rpcCall((s) => s.getTransaction(sent.hash), "soroban.getTransaction");
     while (getResp.status === "NOT_FOUND") {
       if (Date.now() - startTime >= timeoutMs) {
         throw new TransactionTimeoutError(sent.hash, Date.now() - startTime);
       }
       await new Promise((r) => setTimeout(r, 1000));
-      getResp = await this.rpcCall((s) => s.getTransaction(sent.hash));
+      getResp = await this.rpcCall((s) => s.getTransaction(sent.hash), "soroban.getTransaction");
     }
     if (getResp.status !== "SUCCESS") {
       const failed = getResp as rpc.Api.GetFailedTransactionResponse;
@@ -518,7 +529,7 @@ export abstract class BaseClient {
       .addOperation(op)
       .setTimeout(30)
       .build();
-    const sim = await this.rpcCall((s) => s.simulateTransaction(tx));
+    const sim = await this.rpcCall((s) => s.simulateTransaction(tx), "soroban.simulate");
     if (rpc.Api.isSimulationError(sim)) throw new Error(maskSecret(sim.error));
     const fee = (sim as rpc.Api.SimulateTransactionSuccessResponse).minResourceFee ?? BASE_FEE;
     return BigInt(fee);
@@ -548,7 +559,7 @@ export abstract class BaseClient {
       .build();
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const sim = await this.rpcCall((s) => s.simulateTransaction(tx));
+        const sim = await this.rpcCall((s) => s.simulateTransaction(tx), "soroban.simulate");
         if (rpc.Api.isSimulationError(sim)) {
           const errMsg = maskSecret(sim.error);
           const code = extractContractErrorCode(errMsg);

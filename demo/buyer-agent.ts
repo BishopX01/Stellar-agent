@@ -6,8 +6,17 @@ import {
   marcFetch,
   TESTNET,
   type MarcConfig,
+  type Signer,
+  AwsKmsSigner,
+  VaultSigner,
+  initTracing,
+  withSpan,
   JobStatus,
 } from "marc-stellar-sdk";
+
+// Initialize OpenTelemetry distributed tracing before any instrumented client is
+// constructed. When OTEL_EXPORTER_OTLP_ENDPOINT is unset this is a no-op.
+const tracing = initTracing({ serviceName: process.env.OTEL_SERVICE_NAME ?? "marc-buyer-agent" });
 
 const cfg: MarcConfig = {
   rpcUrl: process.env.STELLAR_RPC_URL ?? TESTNET.rpcUrl,
@@ -31,7 +40,42 @@ function resolveTxTimeoutSecs(): number {
 
 const txTimeoutSecs = resolveTxTimeoutSecs();
 
-const buyer = Keypair.fromSecret(process.env.BUYER_SECRET!);
+/**
+ * Resolve the agent signer.
+ *
+ * Priority:
+ *   1. AWS KMS   — when AWS_KMS_KEY_ID is set (RemoteSigner, no plaintext key in memory).
+ *   2. Vault     — when VAULT_TRANSIT_KEY is set (RemoteSigner via Transit engine).
+ *   3. Local     — BUYER_SECRET via Keypair.fromSecret, for local/demo mode only.
+ */
+function resolveSigner(): Signer {
+  if (process.env.AWS_KMS_KEY_ID) {
+    console.log("[signer] Using AWS KMS remote signer");
+    return new AwsKmsSigner({
+      keyId: process.env.AWS_KMS_KEY_ID,
+      region: process.env.AWS_REGION,
+      publicKey: process.env.AWS_KMS_PUBLIC_KEY,
+    });
+  }
+  if (process.env.VAULT_TRANSIT_KEY) {
+    console.log("[signer] Using HashiCorp Vault remote signer");
+    return new VaultSigner({
+      keyName: process.env.VAULT_TRANSIT_KEY,
+      address: process.env.VAULT_ADDR,
+      token: process.env.VAULT_TOKEN,
+      publicKey: process.env.VAULT_TRANSIT_PUBLIC_KEY,
+    });
+  }
+  if (!process.env.BUYER_SECRET) {
+    throw new Error(
+      "No signer configured: set AWS_KMS_KEY_ID, VAULT_TRANSIT_KEY, or BUYER_SECRET (local demo only)",
+    );
+  }
+  console.log("[signer] Using local Keypair (demo mode — plaintext secret in memory)");
+  return Keypair.fromSecret(process.env.BUYER_SECRET);
+}
+
+const buyer = resolveSigner();
 const sellerPubkey = process.env.SELLER_PUBKEY!;
 const sellerPort = Number(process.env.SELLER_PORT ?? 4402);
 
@@ -44,7 +88,8 @@ const pollConfig = {
 
 console.log(`\n=== BUYER DEMO ===`);
 console.log(`Buyer: ${buyer.publicKey()}`);
-console.log(`Transaction timeout: ${txTimeoutSecs}s\n`);
+console.log(`Transaction timeout: ${txTimeoutSecs}s`);
+console.log(`Tracing: ${tracing.enabled ? "enabled" : "disabled"}\n`);
 
 /**
  * Poll a condition with exponential backoff.
@@ -71,14 +116,16 @@ async function pollWithBackoff(
 
 // Step 1: Register agent identity
 const identity = new IdentityClient(cfg);
-let agentId = await identity.agentOf(buyer.publicKey());
+let agentId = await withSpan("buyer.identity.agentOf", () => identity.agentOf(buyer.publicKey()));
 if (!agentId) {
   // Registration may take a few seconds to confirm on testnet — poll until visible
   await pollWithBackoff(
     async () => {
-      agentId = await identity.agentOf(buyer.publicKey());
+      agentId = await withSpan("buyer.identity.agentOf", () => identity.agentOf(buyer.publicKey()));
       if (agentId) return true;
-      await identity.register(buyer, "ipfs://buyer-metadata.json", { timeoutSecs: txTimeoutSecs });
+      await withSpan("buyer.identity.register", () =>
+        identity.register(buyer, "ipfs://buyer-metadata.json", { timeoutSecs: txTimeoutSecs }),
+      );
       return false;
     },
     "buyer agent registration",
@@ -92,21 +139,23 @@ if (!agentId) {
 // Step 2: Create escrow job
 const commerce = new CommerceClient(cfg);
 const budget = BigInt(10_000_000); // 1 USDC
-const jobId = await commerce.createJob(
-  buyer,
-  sellerPubkey,
-  buyer.publicKey(), // buyer acts as evaluator in demo
-  cfg.usdcToken,
-  budget,
-  "Generate report via x402-protected endpoint",
-  { timeoutSecs: txTimeoutSecs },
+const jobId = await withSpan("buyer.commerce.createJob", () =>
+  commerce.createJob(
+    buyer,
+    sellerPubkey,
+    buyer.publicKey(), // buyer acts as evaluator in demo
+    cfg.usdcToken,
+    budget,
+    "Generate report via x402-protected endpoint",
+    { timeoutSecs: txTimeoutSecs },
+  ),
 );
 console.log(`[2] Job created — id=${jobId}, budget=1 USDC locked in escrow`);
 
 // Poll until the job is visible on-chain before proceeding
 await pollWithBackoff(
   async () => {
-    const j = await commerce.getJob(jobId);
+    const j = await withSpan("buyer.commerce.getJob", () => commerce.getJob(jobId));
     return !!j;
   },
   `job #${jobId} on-chain confirmation`,
@@ -120,7 +169,9 @@ let res: Response | undefined;
 await pollWithBackoff(
   async () => {
     try {
-      res = await paidFetch(`http://localhost:${sellerPort}/api/work`);
+      res = await withSpan("buyer.x402.fetch", () =>
+        paidFetch(`http://localhost:${sellerPort}/api/work`),
+      );
       return res.ok;
     } catch (err) {
       console.log(`    [retry] API call pending or testnet congested (${(err as Error).message})`);
@@ -134,7 +185,9 @@ const data = await res!.json();
 console.log(`    Response: ${JSON.stringify(data)}`);
 
 // Step 4: Complete job (buyer=evaluator) → triggers 99/1 split
-await commerce.complete(buyer, jobId, { timeoutSecs: txTimeoutSecs });
+await withSpan("buyer.commerce.complete", () =>
+  commerce.complete(buyer, jobId, { timeoutSecs: txTimeoutSecs }),
+);
 
 // Step 4b: Sequence-manager stress test — fire 10 consecutive transactions in
 // rapid succession without awaiting ledger close between them. The SDK's
@@ -145,7 +198,10 @@ const BURST_COUNT = 10;
 console.log(`[4b] Firing ${BURST_COUNT} consecutive transactions to validate sequence tracking…`);
 const burstResults = await Promise.allSettled(
   Array.from({ length: BURST_COUNT }, (_, i) =>
-    commerce.getJob(jobId).then((j) => ({ i, status: j?.status })),
+    withSpan("buyer.commerce.getJob", () => commerce.getJob(jobId)).then((j) => ({
+      i,
+      status: j?.status,
+    })),
   ),
 );
 const badSeq = burstResults.filter(
@@ -170,14 +226,17 @@ console.log(`[4b] ${BURST_COUNT} consecutive transactions dispatched — no txBA
 // Poll until the job status flips to "completed"
 await pollWithBackoff(
   async () => {
-    const j = await commerce.getJob(jobId);
+    const j = await withSpan("buyer.commerce.getJob", () => commerce.getJob(jobId));
     return j?.status === JobStatus.Completed;
   },
   `job #${jobId} completion confirmation`,
   pollConfig,
 );
 
-const job = await commerce.getJob(jobId);
+const job = await withSpan("buyer.commerce.getJob", () => commerce.getJob(jobId));
 console.log(`[4] Job ${jobId} completed — status: ${job?.status}`);
 console.log(`    99% released to seller, 1% to treasury\n`);
 console.log(`=== BUYER DONE ===\n`);
+
+// Flush any buffered spans before the process exits.
+await tracing.shutdown();

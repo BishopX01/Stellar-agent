@@ -13,7 +13,7 @@ import { JobStatusFromNumber } from "./jobStatus.js";
 import type { JobStatus } from "./jobStatus.js";
 import { BaseClient } from "./baseClient.js";
 import type { Signer } from "./signer.js";
-import { signerPublicKey } from "./signer.js";
+import { signerPublicKey, toSigner } from "./signer.js";
 import { createChannelVoucher } from "./paymentChannels.js";
 import type { ChannelVoucher } from "./paymentChannels.js";
 
@@ -280,7 +280,7 @@ export class CommerceClient extends BaseClient {
    * ```
    */
   async createJob(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluator: string,
     token: string,
@@ -291,9 +291,10 @@ export class CommerceClient extends BaseClient {
     if (budget <= 0n) throw new Error("budget must be greater than 0");
     if (budget > MAX_I128) throw new Error("budget exceeds i128 max");
 
+    const signer = toSigner(client);
     const op = this.contract.call(
       "create_job",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       new Address(provider).toScVal(),
       new Address(evaluator).toScVal(),
       new Address(token).toScVal(),
@@ -301,7 +302,7 @@ export class CommerceClient extends BaseClient {
       nativeToScVal(description, { type: "string" }),
     );
     return await this.invoke(
-      client,
+      signer,
       op,
       (v) => BigInt(scValToNative(v) as string),
       "commerce",
@@ -332,7 +333,10 @@ export class CommerceClient extends BaseClient {
    * ]);
    * ```
    */
-  async batchCreateJobs(client: Signer, requests: JobRequest[]): Promise<bigint[]> {
+  async batchCreateJobs(
+    client: Signer | Keypair,
+    requests: JobRequest[],
+  ): Promise<bigint[]> {
     if (requests.length === 0) throw new Error("requests must contain at least one job");
     if (requests.length > MAX_BATCH_JOBS) {
       throw new Error(`requests must contain at most ${MAX_BATCH_JOBS} jobs`);
@@ -341,6 +345,8 @@ export class CommerceClient extends BaseClient {
       if (request.budget <= 0n) throw new Error("budget must be greater than 0");
       if (request.budget > MAX_I128) throw new Error("budget exceeds i128 max");
     }
+
+    const signer = toSigner(client);
 
     const requestsScVal = xdr.ScVal.scvVec(
       requests.map((request) =>
@@ -359,11 +365,11 @@ export class CommerceClient extends BaseClient {
 
     const op = this.contract.call(
       "batch_create_jobs",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       requestsScVal,
     );
     return await this.invoke(
-      client,
+      signer,
       op,
       (v) => {
         const native = scValToNative(v);
@@ -376,7 +382,7 @@ export class CommerceClient extends BaseClient {
 
   /** Create a high-value escrow job that requires an evaluator quorum. */
   async createJobMultiEval(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluators: string[],
     threshold: number,
@@ -395,12 +401,13 @@ export class CommerceClient extends BaseClient {
     if (new Set(evaluators).size !== evaluators.length) {
       throw new Error("evaluators must be unique");
     }
+    const signer = toSigner(client);
     const evaluatorScVal = xdr.ScVal.scvVec(
       evaluators.map((address) => new Address(address).toScVal()),
     );
     const op = this.contract.call(
       "create_job_multi_eval",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       new Address(provider).toScVal(),
       evaluatorScVal,
       nativeToScVal(threshold, { type: "u32" }),
@@ -408,17 +415,18 @@ export class CommerceClient extends BaseClient {
       nativeToScVal(budget, { type: "i128" }),
       nativeToScVal(description, { type: "string" }),
     );
-    return await this.invoke(client, op, (value) => BigInt(scValToNative(value) as string), "commerce");
+    return await this.invoke(signer, op, (value) => BigInt(scValToNative(value) as string), "commerce");
   }
 
   /** Submit this evaluator's approval; the contract pays out automatically at quorum. */
-  async approveJob(evaluator: Signer, jobId: bigint): Promise<number> {
+  async approveJob(evaluator: Signer | Keypair, jobId: bigint): Promise<number> {
+    const signer = toSigner(evaluator);
     const op = this.contract.call(
       "approve_job",
-      new Address(signerPublicKey(evaluator)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
     );
-    return await this.invoke(evaluator, op, (value) => Number(scValToNative(value)), "commerce");
+    return await this.invoke(signer, op, (value) => Number(scValToNative(value)), "commerce");
   }
 
   /** Read approval progress for a multi-evaluator job, or null for a regular job. */
@@ -435,21 +443,22 @@ export class CommerceClient extends BaseClient {
   }
 
   /** Admin: configure the budget threshold that requires evaluator quorum. */
-  async setMultiEvalThreshold(admin: Signer, threshold: bigint): Promise<void> {
+  async setMultiEvalThreshold(admin: Signer | Keypair, threshold: bigint): Promise<void> {
     if (threshold < 0n || threshold > MAX_I128) {
       throw new Error("threshold must fit in a non-negative i128");
     }
+    const signer = toSigner(admin);
     const op = this.contract.call(
       "set_multi_eval_threshold",
-      new Address(signerPublicKey(admin)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(threshold, { type: "i128" }),
     );
-    await this.invoke(admin, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /** Open an escrowed one-way channel; calls to createVoucher are entirely off-chain. */
   async openChannel(
-    payer: Signer,
+    payer: Signer | Keypair,
     provider: string,
     deposit: bigint,
     voucherKeypair: Keypair,
@@ -458,17 +467,18 @@ export class CommerceClient extends BaseClient {
     if (deposit <= 0n || deposit > MAX_I128) {
       throw new Error("deposit must be a positive i128 amount");
     }
+    const signer = toSigner(payer);
     const voucherKey = new Uint8Array(voucherKeypair.rawPublicKey());
     const op = this.contract.call(
       "open_channel",
-      new Address(signerPublicKey(payer)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       new Address(provider).toScVal(),
       new Address(token).toScVal(),
       nativeToScVal(deposit, { type: "i128" }),
       nativeToScVal(voucherKey, { type: "bytes" }),
     );
     const channelId = await this.invoke(
-      payer,
+      signer,
       op,
       (value) => BigInt(scValToNative(value) as string),
       "commerce",
@@ -493,9 +503,10 @@ export class CommerceClient extends BaseClient {
   async closeChannel(
     channelId: bigint,
     voucher: ChannelVoucher,
-    participant: Signer,
+    participant: Signer | Keypair,
   ): Promise<void> {
     if (voucher.channelId !== channelId) throw new Error("voucher channel ID does not match");
+    const signer = toSigner(participant);
     const voucherScVal = nativeToScVal(
       {
         channel_id: nativeToScVal(voucher.channelId, { type: "u64" }),
@@ -506,26 +517,27 @@ export class CommerceClient extends BaseClient {
     );
     const op = this.contract.call(
       "close_channel",
-      new Address(signerPublicKey(participant)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(channelId, { type: "u64" }),
       voucherScVal,
       nativeToScVal(voucher.signature, { type: "bytes" }),
     );
-    await this.invoke(participant, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /** Settle a channel after its 24-hour challenge window has elapsed. */
-  async forceClose(caller: Signer, channelId: bigint): Promise<void> {
+  async forceClose(caller: Signer | Keypair, channelId: bigint): Promise<void> {
+    const signer = toSigner(caller);
     const op = this.contract.call(
       "force_close",
-      new Address(signerPublicKey(caller)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(channelId, { type: "u64" }),
     );
-    await this.invoke(caller, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   async estimateCreateJobFee(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluator: string,
     token: string,
@@ -534,7 +546,7 @@ export class CommerceClient extends BaseClient {
   ): Promise<bigint> {
     const op = this.contract.call(
       "create_job",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(toSigner(client))).toScVal(),
       new Address(provider).toScVal(),
       new Address(evaluator).toScVal(),
       new Address(token).toScVal(),
@@ -560,7 +572,7 @@ export class CommerceClient extends BaseClient {
    * @throws {Error} If `budget <= 0`, `budget` exceeds `i128` max, or the transaction fails.
    */
   async createJobAndWait(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluator: string,
     token: string,
@@ -598,13 +610,14 @@ export class CommerceClient extends BaseClient {
    * @param expirationLedger - Optional expiration ledger sequence. Defaults to current + 1000.
    */
   async approve(
-    client: Signer,
+    client: Signer | Keypair,
     spender: string,
     token: string,
     amount: bigint,
     expirationLedger?: number,
   ): Promise<void> {
-    const clientAddr = signerPublicKey(client);
+    const signer = toSigner(client);
+    const clientAddr = signerPublicKey(signer);
     const tokenContract = new Contract(token);
     let liveUntil = expirationLedger;
     if (!liveUntil) {
@@ -622,7 +635,7 @@ export class CommerceClient extends BaseClient {
       nativeToScVal(amount, { type: "i128" }),
       nativeToScVal(liveUntil, { type: "u32" }),
     );
-    await this.invoke(client, op, () => undefined, "token:approve");
+    await this.invoke(signer, op, () => undefined, "token:approve");
   }
 
   /**
@@ -640,7 +653,7 @@ export class CommerceClient extends BaseClient {
    * @returns The newly created job ID as a `bigint`.
    */
   async approveAndCreateJob(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluator: string,
     token: string,
@@ -650,7 +663,8 @@ export class CommerceClient extends BaseClient {
     if (budget <= 0n) throw new Error("budget must be greater than 0");
     if (budget > MAX_I128) throw new Error("budget exceeds i128 max");
 
-    const clientAddress = signerPublicKey(client);
+    const signer = toSigner(client);
+    const clientAddress = signerPublicKey(signer);
     let currentAllowance = 0n;
     try {
       currentAllowance = await this.allowance(
@@ -663,17 +677,17 @@ export class CommerceClient extends BaseClient {
     }
 
     if (currentAllowance < budget) {
-      await this.approve(client, this.contract.address().toString(), token, budget);
+      await this.approve(signer, this.contract.address().toString(), token, budget);
     }
 
-    return await this.createJob(client, provider, evaluator, token, budget, description);
+    return await this.createJob(signer, provider, evaluator, token, budget, description);
   }
 
   /**
    * Helper alias for {@link approveAndCreateJob} (#546).
    */
   async createJobWithApproval(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluator: string,
     token: string,
@@ -709,20 +723,21 @@ export class CommerceClient extends BaseClient {
    * ```
    */
   async submit(
-    provider: Signer,
+    provider: Signer | Keypair,
     jobId: bigint,
     deliverable: string,
     deliverableHash?: Uint8Array,
   ): Promise<void> {
+    const signer = toSigner(provider);
     const hash = deliverableHash ?? (await computeDeliverableHash(deliverable));
     const op = this.contract.call(
       "submit",
-      new Address(signerPublicKey(provider)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
       nativeToScVal(deliverable, { type: "string" }),
       sha256ToScVal(hash),
     );
-    await this.invoke(provider, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /**
@@ -750,19 +765,20 @@ export class CommerceClient extends BaseClient {
    * ```
    */
   async complete(
-    evaluator: Signer,
+    evaluator: Signer | Keypair,
     jobId: bigint,
     expectedHash?: Uint8Array,
   ): Promise<void> {
+    const signer = toSigner(evaluator);
     const args: xdr.ScVal[] = [
-      new Address(signerPublicKey(evaluator)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
     ];
     if (expectedHash !== undefined) {
       args.push(sha256ToScVal(expectedHash));
     }
     const op = this.contract.call("complete", ...args);
-    await this.invoke(evaluator, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /**
@@ -783,40 +799,44 @@ export class CommerceClient extends BaseClient {
    * await commerce.cancel(clientKeypair, jobId);
    * ```
    */
-  async cancel(client: Signer, jobId: bigint): Promise<void> {
+  async cancel(client: Signer | Keypair, jobId: bigint): Promise<void> {
+    const signer = toSigner(client);
     const op = this.contract.call(
       "cancel",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
     );
-    await this.invoke(client, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
-  async dispute(client: Signer, jobId: bigint): Promise<void> {
+  async dispute(client: Signer | Keypair, jobId: bigint): Promise<void> {
+    const signer = toSigner(client);
     const op = this.contract.call(
       "dispute",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
     );
-    await this.invoke(client, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
-  async claimRefund(client: Signer, jobId: bigint): Promise<void> {
+  async claimRefund(client: Signer | Keypair, jobId: bigint): Promise<void> {
+    const signer = toSigner(client);
     const op = this.contract.call(
       "claim_refund",
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
     );
-    await this.invoke(client, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
-  async claimExpired(provider: Signer, jobId: bigint): Promise<void> {
+  async claimExpired(provider: Signer | Keypair, jobId: bigint): Promise<void> {
+    const signer = toSigner(provider);
     const op = this.contract.call(
       "claim_expired",
-      new Address(signerPublicKey(provider)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: "u64" }),
     );
-    await this.invoke(provider, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /**
@@ -1063,13 +1083,14 @@ export class CommerceClient extends BaseClient {
    * await commerce.setTreasury(adminKeypair, "GABC...");
    * ```
    */
-  async setTreasury(admin: Signer, newTreasury: string): Promise<void> {
+  async setTreasury(admin: Signer | Keypair, newTreasury: string): Promise<void> {
+    const signer = toSigner(admin);
     const op = this.contract.call(
       "set_treasury",
-      new Address(signerPublicKey(admin)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       new Address(newTreasury).toScVal(),
     );
-    await this.invoke(admin, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /**
@@ -1088,13 +1109,14 @@ export class CommerceClient extends BaseClient {
    * await commerce.setFeeBps(adminKeypair, 50); // 0.5%
    * ```
    */
-  async setFeeBps(admin: Signer, newBps: number): Promise<void> {
+  async setFeeBps(admin: Signer | Keypair, newBps: number): Promise<void> {
+    const signer = toSigner(admin);
     const op = this.contract.call(
       "set_fee_bps",
-      new Address(signerPublicKey(admin)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(newBps, { type: "u32" }),
     );
-    await this.invoke(admin, op, () => undefined, "commerce");
+    await this.invoke(signer, op, () => undefined, "commerce");
   }
 
   /**
@@ -1332,7 +1354,7 @@ export class CommerceClient extends BaseClient {
    * @returns The new job's on-chain ID as a `bigint`.
    */
   async createMilestoneJob(
-    client: Signer,
+    client: Signer | Keypair,
     provider: string,
     evaluator: string,
     token: string,
@@ -1347,6 +1369,8 @@ export class CommerceClient extends BaseClient {
     }
     const total = milestones.reduce((acc, m) => acc + m.amount, 0n);
     if (total !== budget) throw new Error('sum of milestone amounts must equal budget');
+
+    const signer = toSigner(client);
 
     // Encode milestones as a Soroban Vec<Milestone>
     const milestoneScVals = milestones.map((m, i) =>
@@ -1365,7 +1389,7 @@ export class CommerceClient extends BaseClient {
 
     const op = this.contract.call(
       'create_milestone_job',
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       new Address(provider).toScVal(),
       new Address(evaluator).toScVal(),
       new Address(token).toScVal(),
@@ -1373,7 +1397,7 @@ export class CommerceClient extends BaseClient {
       nativeToScVal(description, { type: 'string' }),
       milestonesScVal,
     );
-    return await this.invoke(client, op, (v) => BigInt(scValToNative(v) as string), 'commerce');
+    return await this.invoke(signer, op, (v) => BigInt(scValToNative(v) as string), 'commerce');
   }
 
   /**
@@ -1387,22 +1411,23 @@ export class CommerceClient extends BaseClient {
    *                          payload. Computed automatically from `deliverable` when omitted.
    */
   async submitMilestone(
-    provider: Signer,
+    provider: Signer | Keypair,
     jobId: bigint,
     milestoneIdx: number,
     deliverable: string,
     deliverableHash?: Uint8Array,
   ): Promise<void> {
+    const signer = toSigner(provider);
     const hash = deliverableHash ?? (await computeDeliverableHash(deliverable));
     const op = this.contract.call(
       'submit_milestone',
-      new Address(signerPublicKey(provider)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: 'u64' }),
       nativeToScVal(milestoneIdx, { type: 'u32' }),
       nativeToScVal(deliverable, { type: 'string' }),
       sha256ToScVal(hash),
     );
-    await this.invoke(provider, op, () => undefined, 'commerce');
+    await this.invoke(signer, op, () => undefined, 'commerce');
   }
 
   /**
@@ -1413,17 +1438,18 @@ export class CommerceClient extends BaseClient {
    * @param milestoneIdx - Zero-based index of the milestone to approve.
    */
   async approveMilestone(
-    evaluator: Signer,
+    evaluator: Signer | Keypair,
     jobId: bigint,
     milestoneIdx: number,
   ): Promise<void> {
+    const signer = toSigner(evaluator);
     const op = this.contract.call(
       'approve_milestone',
-      new Address(signerPublicKey(evaluator)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: 'u64' }),
       nativeToScVal(milestoneIdx, { type: 'u32' }),
     );
-    await this.invoke(evaluator, op, () => undefined, 'commerce');
+    await this.invoke(signer, op, () => undefined, 'commerce');
   }
 
   /**
@@ -1433,13 +1459,14 @@ export class CommerceClient extends BaseClient {
    * @param client - The client's Signer.
    * @param jobId - The milestone job's on-chain ID.
    */
-  async cancelUncompletedMilestones(client: Signer, jobId: bigint): Promise<void> {
+  async cancelUncompletedMilestones(client: Signer | Keypair, jobId: bigint): Promise<void> {
+    const signer = toSigner(client);
     const op = this.contract.call(
       'cancel_uncompleted_milestones',
-      new Address(signerPublicKey(client)).toScVal(),
+      new Address(signerPublicKey(signer)).toScVal(),
       nativeToScVal(jobId, { type: 'u64' }),
     );
-    await this.invoke(client, op, () => undefined, 'commerce');
+    await this.invoke(signer, op, () => undefined, 'commerce');
   }
 
   /**

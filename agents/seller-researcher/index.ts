@@ -15,6 +15,8 @@ import {
   registerGracefulShutdown,
   createActiveTaskTracker,
   MOCK_DELIVERABLES,
+  initTracing,
+  withSpan,
 } from "../shared.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
@@ -25,6 +27,8 @@ const PORT = Number(process.env.SELLER_PORT ?? 4504);
 const AGENT_ID = "seller-researcher";
 const OUTPUT_DIR = path.join(AGENT_DIR, "output");
 const OUTPUT_FILE = path.join(OUTPUT_DIR, "research.json");
+
+initTracing(AGENT_ID);
 
 const { app, seller, cfg } = await createSellerAgent({
   id: AGENT_ID,
@@ -98,14 +102,22 @@ async function generate(task: string, depth: ResearchDepth = "standard"): Promis
     return MOCK_DELIVERABLES.researcher;
   }
   const { sourceRange, detail } = DEPTH_CONFIG[depth];
-  const res = await callLlmWithRetry(
+  const res = await withSpan(
+    "llm.groq.chat.completions",
+    {
+      "llm.provider": "groq",
+      "llm.model": GROQ_MODEL,
+      "llm.research_depth": depth,
+    },
     () =>
-      groq!.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [
-          {
-            role: "user",
-            content: `You are a research analyst. Research the following topic and return ONLY valid JSON (no markdown, no code fences) with this exact schema:
+      callLlmWithRetry(
+        () =>
+          groq!.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [
+              {
+                role: "user",
+                content: `You are a research analyst. Research the following topic and return ONLY valid JSON (no markdown, no code fences) with this exact schema:
 {
   "summary": "research summary in markdown format",
   "sources": [
@@ -116,11 +128,12 @@ async function generate(task: string, depth: ResearchDepth = "standard"): Promis
 Research depth: ${depth}
 Include ${sourceRange} real, verifiable sources. Each source must have a real URL. The summary must cite sources by their index [1], [2], etc.
 ${detail}`,
-          },
-        ],
-      }),
-    3,
-    AGENT_ID,
+              },
+            ],
+          }),
+        3,
+        AGENT_ID,
+      ),
   );
   const text = res.choices[0].message.content ?? "";
   return JSON.parse(text.replace(/```(?:json)?\s*/gi, "").trim()) as ResearchOutput;
@@ -137,6 +150,26 @@ const limiter = rateLimit({
 app.post("/job", limiter, async (req, res) => {
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const startedAt = Date.now();
+  const { jobId, task, depth } = req.body;
+
+  await withSpan(
+    "http.server.job",
+    {
+      "http.method": "POST",
+      "http.route": "/job",
+      "agent.id": AGENT_ID,
+      "job.id": jobId != null ? String(jobId) : undefined,
+    },
+    () => handleJob(req, res, requestId, startedAt),
+  );
+});
+
+async function handleJob(
+  req: import("express").Request,
+  res: import("express").Response,
+  requestId: string,
+  startedAt: number,
+): Promise<void> {
   const { jobId, task, depth } = req.body;
 
   console.log(
@@ -194,9 +227,14 @@ app.post("/job", limiter, async (req, res) => {
     );
 
     const commerce = new CommerceClient(cfg);
-    await retryWithBackoff(
-      () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
-      { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+    await withSpan(
+      "stellar.commerce.submit",
+      { "job.id": String(jobId), "stellar.operation": "submit" },
+      () =>
+        retryWithBackoff(
+          () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
+          { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+        ),
     );
     console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted`);
     jobsCompleted++;
@@ -207,7 +245,7 @@ app.post("/job", limiter, async (req, res) => {
     jobsActive--;
     releaseTask();
   }
-});
+}
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
 registerGracefulShutdown(server, activeTaskTracker, null, AGENT_ID);
