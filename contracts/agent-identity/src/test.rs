@@ -767,3 +767,116 @@ fn upgrade_panics_when_not_initialized() {
     let fake_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
     client.upgrade(&admin, &fake_hash);
 }
+
+// ===========================================================================
+// #782 — boundary tests for register()/update_uri() metadata_uri length.
+//
+// These mirror the invariants the cargo-fuzz targets in contracts/fuzz/ rely
+// on: any input at or below MAX_METADATA_URI_LEN is accepted, anything above
+// is rejected with a clean contract error (never a panic/overflow), and the
+// empty string is rejected. They double as regression guards for the fuzz
+// harness so a change in bounds is caught by the unit suite as well.
+// ===========================================================================
+
+/// Builds a `String` of exactly `len` ASCII bytes ('a' repeated).
+fn uri_of_len(env: &Env, len: u32) -> String {
+    let mut buf = [b'a'; MAX_METADATA_URI_LEN as usize];
+    let slice = &mut buf[..len as usize];
+    String::from_bytes(env, slice)
+}
+
+/// register() accepts a URI of exactly MAX_METADATA_URI_LEN bytes.
+#[test]
+fn register_accepts_uri_at_max_length() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN);
+    let id = client.register(&alice, &uri);
+
+    let agent = client.get_agent(&id).unwrap();
+    assert_eq!(agent.uri.len(), MAX_METADATA_URI_LEN);
+}
+
+/// register() rejects a URI one byte over MAX_METADATA_URI_LEN with a clean
+/// contract error rather than a panic or overflow.
+#[test]
+#[should_panic(expected = "metadata_uri too long")]
+fn register_rejects_uri_one_over_max_length() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN + 1);
+    client.register(&alice, &uri);
+}
+
+/// update_uri() accepts a URI of exactly MAX_METADATA_URI_LEN bytes.
+#[test]
+fn update_uri_accepts_uri_at_max_length() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let id = client.register(&alice, &String::from_str(&env, "ipfs://a1.json"));
+
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN);
+    client.update_uri(&alice, &id, &uri);
+
+    let agent = client.get_agent(&id).unwrap();
+    assert_eq!(agent.uri.len(), MAX_METADATA_URI_LEN);
+}
+
+/// update_uri() rejects a URI one byte over MAX_METADATA_URI_LEN.
+#[test]
+#[should_panic(expected = "metadata_uri too long")]
+fn update_uri_rejects_uri_one_over_max_length() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let id = client.register(&alice, &String::from_str(&env, "ipfs://a1.json"));
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN + 1);
+    client.update_uri(&alice, &id, &uri);
+}
+
+/// update_uri() rejects the empty string with a clean contract error.
+#[test]
+#[should_panic(expected = "metadata_uri cannot be empty")]
+fn update_uri_rejects_empty_uri() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let id = client.register(&alice, &String::from_str(&env, "ipfs://a1.json"));
+    client.update_uri(&alice, &id, &String::from_str(&env, ""));
+}
+
+/// A single-byte URI is the smallest valid non-empty input and must be
+/// accepted by both register() and update_uri().
+#[test]
+fn register_and_update_uri_accept_single_byte_uri() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let one = String::from_str(&env, "a");
+    let id = client.register(&alice, &one);
+    assert_eq!(client.get_agent(&id).unwrap().uri, one);
+
+    client.update_uri(&alice, &id, &one);
+    assert_eq!(client.get_agent(&id).unwrap().uri, one);
+}

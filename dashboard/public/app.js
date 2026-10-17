@@ -952,6 +952,72 @@
       console.error(e);
     }
     state.loading.agents = false;
+    // Fetch capability badges for the loaded agents (#701)
+    await loadAgentBadges(state.agents);
+  }
+
+  // ── Capability Badges (#701) ──
+  // Badges are stored on-chain under DataKey::Badges(agent_id, tag) and exposed
+  // by the backend as { tag, score, issued_at, expires_at, issuer }.  We only
+  // render active, non-expired credentials and degrade gracefully when the
+  // endpoint is unavailable or returns nothing.
+  function isBadgeActive(badge, nowSeconds) {
+    if (!badge) return false;
+    var expiresAt = Number(badge.expires_at || badge.expiresAt || 0);
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return false;
+    return expiresAt > nowSeconds;
+  }
+
+  function normalizeBadges(raw) {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw;
+    if (Array.isArray(raw.badges)) return raw.badges;
+    if (Array.isArray(raw.items)) return raw.items;
+    return [];
+  }
+
+  async function loadAgentBadges(agents) {
+    var list = Array.isArray(agents) ? agents : [];
+    if (list.length === 0) return;
+    var nowSeconds = Math.floor(Date.now() / 1000);
+    await Promise.all(
+      list.map(function (a) {
+        if (a == null || a.id === undefined || a.id === null) return Promise.resolve();
+        return api("/agents/" + encodeURIComponent(String(a.id)) + "/badges", { _silent: true })
+          .then(function (data) {
+            a.badges = normalizeBadges(data).filter(function (b) {
+              return isBadgeActive(b, nowSeconds);
+            });
+          })
+          .catch(function () {
+            // Endpoint may not exist yet — degrade gracefully, no badges shown.
+            a.badges = [];
+          });
+      }),
+    );
+  }
+
+  // Renders active capability badges as escaped visual chips.
+  function renderBadgeChips(badges) {
+    if (!Array.isArray(badges) || badges.length === 0) return "";
+    var chips = "";
+    for (var i = 0; i < badges.length; i++) {
+      var b = badges[i] || {};
+      var tag = b.tag == null ? "" : String(b.tag);
+      if (!tag) continue;
+      var score = Number(b.score);
+      var scoreText = Number.isFinite(score) ? String(score) : "";
+      var title = "Verified capability: " + tag + (scoreText ? " (score " + scoreText + ")" : "");
+      chips +=
+        '<span class="badge-chip" title="' + escapeAttr(title) + '">' +
+        '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">' +
+        '<path d="M20 6 9 17l-5-5"/></svg>' +
+        '<span class="badge-chip-tag">' + escapeHtml(tag) + "</span>" +
+        (scoreText ? '<span class="badge-chip-score">' + escapeHtml(scoreText) + "</span>" : "") +
+        "</span>";
+    }
+    if (!chips) return "";
+    return '<div class="agent-badges" aria-label="Verified capability badges">' + chips + "</div>";
   }
   async function loadJobs(status) {
     state.loading.jobs = true;
@@ -1508,6 +1574,7 @@
           '<div class="agent-field-value">' +
           escapeHtml(a.uri) +
           "</div></div>" +
+          renderBadgeChips(a.badges) +
           "</div>";
       }
       cards += "</div>";

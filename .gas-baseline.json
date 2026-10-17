@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "generated_by": "scripts/profile-gas.sh",
+  "description": "Baseline Soroban CPU instruction and memory byte consumption per contract entry point. CI compares PR measurements against these values and fails on regressions greater than 10%.",
+  "threshold_percent": 10,
+  "contracts": {
+    "hello_world": {
+      "wasm": "target/wasm32-unknown-unknown/release/hello_world.wasm",
+      "entry_points": {
+        "hello": {
+          "cpu_instructions": 0,
+          "memory_bytes": 0
+        }
+      }
+    }
+  }
+}

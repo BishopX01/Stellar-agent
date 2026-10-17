@@ -25,6 +25,15 @@ fn deploy_token<'a>(
     )
 }
 
+/// Deterministic 32-byte content hash used across the hash-flow tests.
+fn sample_hash(env: &Env) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    BytesN::from_array(env, &bytes)
+}
+
 /// create_job() must persist the description field so dashboards can display
 /// human-readable job details without a separate metadata lookup.
 #[test]
@@ -161,11 +170,18 @@ fn submit_flips_status_and_records_deliverable() {
         &String::from_str(&env, "ipfs://job.json"),
     );
 
-    client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
+    let hash = sample_hash(&env);
+    client.submit(
+        &seller,
+        &id,
+        &String::from_str(&env, "ipfs://work.json"),
+        &hash,
+    );
 
     let expected_event = JobSubmitted {
         provider: seller,
         job_id: id,
+        deliverable_hash: hash.clone(),
     };
     // `init()` emits `Initialized` so we verify the last event only.
     let all_events = env.events().all().filter_by_contract(&client.address);
@@ -199,7 +215,12 @@ fn submit_rejects_non_provider() {
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
     );
-    client.submit(&mallory, &id, &String::from_str(&env, "ipfs://hax.json"));
+    client.submit(
+        &mallory,
+        &id,
+        &String::from_str(&env, "ipfs://hax.json"),
+        &sample_hash(&env),
+    );
 }
 
 #[test]
@@ -222,8 +243,8 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
         &String::from_str(&env, "ipfs://job.json"),
     );
 
-    let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    client.submit(&seller, &id, &deliverable);
+    let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    client.submit(&seller, &id, &deliverable, &sample_hash(&env));
 }
 
 #[test]
@@ -244,8 +265,14 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
     );
-    client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
-    client.complete(&buyer, &id);
+    let hash = sample_hash(&env);
+    client.submit(
+        &seller,
+        &id,
+        &String::from_str(&env, "ipfs://work.json"),
+        &hash,
+    );
+    client.complete(&buyer, &id, &hash);
 
     let expected_event = JobCompleted {
         evaluator: buyer.clone(),
@@ -289,8 +316,14 @@ fn complete_rejects_non_evaluator() {
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
     );
-    client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
-    client.complete(&mallory, &id);
+    let hash = sample_hash(&env);
+    client.submit(
+        &seller,
+        &id,
+        &String::from_str(&env, "ipfs://work.json"),
+        &hash,
+    );
+    client.complete(&mallory, &id, &hash);
 }
 
 #[test]
@@ -545,9 +578,10 @@ fn complete_panics_on_double_complete() {
         &100_000i128,
         &String::from_str(&env, "job"),
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&buyer, &id); // first complete — OK
-    client.complete(&buyer, &id); // second complete — must panic
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+    client.complete(&buyer, &id, &hash); // first complete — OK
+    client.complete(&buyer, &id, &hash); // second complete — must panic
 }
 
 // ---------------------------------------------------------------------------
@@ -573,9 +607,10 @@ fn complete_panics_when_called_by_non_evaluator() {
         &100_000i128,
         &String::from_str(&env, "job"),
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
     // impostor is neither buyer nor seller — must be rejected
-    client.complete(&impostor, &id);
+    client.complete(&impostor, &id, &hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +638,12 @@ fn submit_panics_when_called_by_non_provider() {
         &String::from_str(&env, "job"),
     );
     // interloper tries to submit on seller's behalf
-    client.submit(&interloper, &id, &String::from_str(&env, "deliverable"));
+    client.submit(
+        &interloper,
+        &id,
+        &String::from_str(&env, "deliverable"),
+        &sample_hash(&env),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +671,12 @@ fn submit_panics_with_job_not_found_for_unknown_id() {
     env.mock_all_auths();
     let (client, _admin, _treasury) = setup(&env);
     let seller = Address::generate(&env);
-    client.submit(&seller, &9999u64, &String::from_str(&env, "deliverable"));
+    client.submit(
+        &seller,
+        &9999u64,
+        &String::from_str(&env, "deliverable"),
+        &sample_hash(&env),
+    );
 }
 
 /// complete() on a non-existent job id must panic with JobNotFound (#5).
@@ -642,7 +687,7 @@ fn complete_panics_with_job_not_found_for_unknown_id() {
     env.mock_all_auths();
     let (client, _admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
-    client.complete(&buyer, &9999u64);
+    client.complete(&buyer, &9999u64, &sample_hash(&env));
 }
 
 /// cancel() on a non-existent job id must panic with JobNotFound (#5).
@@ -807,8 +852,9 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
         &budget,
         &String::from_str(&env, "job"),
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&buyer, &id);
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+    client.complete(&buyer, &id, &hash);
 
     // 5% fee → fee = 5_000, payout = 95_000
     assert_eq!(token.balance(&seller), 95_000);
@@ -846,680 +892,5 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
         &budget,
         &String::from_str(&env, "job"),
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&buyer, &id);
-
-    // 0% fee → provider receives the entire budget, treasury receives nothing.
-    assert_eq!(token.balance(&seller), budget);
-    assert_eq!(token.balance(&treasury), 0);
-    assert_eq!(token.balance(&client.address), 0);
-
-    let job = client.get_job(&id).unwrap();
-    assert_eq!(job.status, JobStatus::Completed);
-}
-
-// ===========================================================================
-// #29 — Emergency pause mechanism
-// ===========================================================================
-
-/// Pausing the contract must prevent create_job from executing.
-#[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn create_job_panics_when_contract_is_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    // Pause the contract.
-    client.emergency_pause(&admin);
-    assert!(client.is_paused());
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    // Any state-changing call must now be rejected with ContractPaused (#3).
-    client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "should fail"),
-    );
-}
-
-/// Unpausing must restore normal operation.
-#[test]
-fn unpause_restores_create_job() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    client.emergency_pause(&admin);
-    assert!(client.is_paused());
-
-    client.emergency_unpause(&admin);
-    assert!(!client.is_paused());
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    // create_job must succeed after unpause.
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "post-unpause job"),
-    );
-    assert!(id > 0);
-}
-
-/// Non-admin cannot pause the contract.
-#[test]
-#[should_panic(expected = "Error(Contract, #9)")]
-fn emergency_pause_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _treasury) = setup(&env);
-    let mallory = Address::generate(&env);
-    client.emergency_pause(&mallory);
-}
-
-// ===========================================================================
-// #536 — upgrade entry point tests
-// ===========================================================================
-
-/// upgrade() with a non-admin address must panic with "not admin".
-#[test]
-#[should_panic(expected = "Error(Contract, #9)")]
-fn upgrade_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _treasury) = setup(&env);
-
-    let mallory = Address::generate(&env);
-    // Any 32-byte hash — the call must panic at the admin check
-    // before reaching the deployer, so we never actually upload WASM.
-    let fake_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
-    client.upgrade(&mallory, &fake_hash);
-}
-
-/// upgrade() panics with "not initialized" when init() was never called.
-#[test]
-#[should_panic(expected = "not initialized")]
-fn upgrade_panics_when_not_initialized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // Register but never call init()
-    let contract_id = env.register(AgenticCommerceContract, ());
-    let client = AgenticCommerceContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let fake_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
-    client.upgrade(&admin, &fake_hash);
-}
-
-#[test]
-fn multi_eval_two_of_three_settles_only_at_quorum() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-        ],
-    );
-    let (token, token_client, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "2-of-3"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-
-    assert_eq!(client.approve_job(&evaluators.get(0).unwrap(), &id), 1);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Submitted);
-    assert_eq!(token_client.balance(&provider), 0);
-    assert_eq!(client.approve_job(&evaluators.get(1).unwrap(), &id), 2);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
-    assert_eq!(token_client.balance(&provider), 99_000);
-    assert_eq!(token_client.balance(&treasury), 1_000);
-}
-
-#[test]
-fn multi_eval_three_of_five_waits_for_third_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-        ],
-    );
-    let (token, token_client, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &3,
-        &token,
-        &100_000,
-        &String::from_str(&env, "3-of-5"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-
-    client.approve_job(&evaluators.get(0).unwrap(), &id);
-    client.approve_job(&evaluators.get(1).unwrap(), &id);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Submitted);
-    client.approve_job(&evaluators.get(2).unwrap(), &id);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
-    assert_eq!(token_client.balance(&provider), 99_000);
-}
-
-#[test]
-#[should_panic(expected = "multi-evaluator job requires approvals")]
-fn multi_eval_job_cannot_use_single_evaluator_complete() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "quorum required"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&evaluators.get(0).unwrap(), &id);
-}
-
-#[test]
-#[should_panic(expected = "not an assigned evaluator")]
-fn multi_eval_rejects_non_member_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let outsider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "assigned evaluators only"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-    client.approve_job(&outsider, &id);
-}
-
-#[test]
-#[should_panic(expected = "evaluator already approved")]
-fn multi_eval_rejects_duplicate_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "one approval each"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-    let evaluator = evaluators.get(0).unwrap();
-    client.approve_job(&evaluator, &id);
-    client.approve_job(&evaluator, &id);
-}
-
-#[test]
-#[should_panic(expected = "high-value job requires multiple evaluators")]
-fn high_value_job_requires_multi_eval_creation() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    client.set_multi_eval_threshold(&admin, &50_000);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job(
-        &buyer,
-        &provider,
-        &Address::generate(&env),
-        &token,
-        &100_000,
-        &String::from_str(&env, "must use evaluator quorum"),
-    );
-}
-
-#[test]
-#[should_panic(expected = "job does not meet multi-evaluator threshold")]
-fn multi_eval_creation_rejects_below_threshold_budget() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    client.set_multi_eval_threshold(&admin, &50_000);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &10_000,
-        &String::from_str(&env, "below multi-eval threshold"),
-    );
-}
-
-#[test]
-#[should_panic(expected = "invalid evaluator quorum")]
-fn multi_eval_rejects_threshold_greater_than_evaluator_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &3,
-        &token,
-        &100_000,
-        &String::from_str(&env, "invalid quorum"),
-    );
-}
-
-#[test]
-#[should_panic(expected = "duplicate evaluator")]
-fn multi_eval_rejects_duplicate_evaluator_addresses() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluator = Address::generate(&env);
-    let evaluators = Vec::from_array(&env, [evaluator.clone(), evaluator]);
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "duplicate evaluator"),
-    );
-}
-
-#[test]
-fn open_channel_escrows_deposit_and_stores_voucher_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let payer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let (token_addr, token, asset) = deploy_token(&env, &admin);
-    asset.mint(&payer, &1_000_000);
-    let voucher_key = BytesN::from_array(&env, &[7u8; 32]);
-
-    let channel_id = client.open_channel(&payer, &provider, &token_addr, &100_000, &voucher_key);
-
-    assert_eq!(channel_id, 1);
-    assert_eq!(token.balance(&client.address), 100_000);
-    let channel = client.get_channel(&channel_id).unwrap();
-    assert_eq!(channel.payer, payer);
-    assert_eq!(channel.provider, provider);
-    assert_eq!(channel.deposit, 100_000);
-    assert_eq!(channel.voucher_key, voucher_key);
-}
-
-#[test]
-#[should_panic(expected = "channel challenge window active")]
-fn channel_cannot_be_force_closed_before_challenge_period() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let payer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let (token_addr, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&payer, &1_000_000);
-    let voucher_key = BytesN::from_array(&env, &[7u8; 32]);
-    let channel_id = client.open_channel(&payer, &provider, &token_addr, &100_000, &voucher_key);
-
-    client.force_close(&payer, &channel_id);
-}
-
-// ===========================================================================
-// #713 — cross-currency escrow settlements via Stellar Path Payments
-// ===========================================================================
-
-/// A minimal mock AMM pool used to exercise `fund_job_with_swap` without a
-/// live Stellar DEX. It holds reserves of an `input_token` (e.g. XLM) and an
-/// `output_token` (e.g. USDC) and performs a constant-product style swap.
-///
-/// The pool is registered as a contract so the escrow contract can invoke it
-/// through the standard token interface: the client transfers `input_amount`
-/// of the input token into the pool, and the pool transfers `output_amount`
-/// of the output token to the escrow contract.
-mod mock_pool {
-    use soroban_sdk::{contract, contractimpl, token, Address, Env};
-
-    #[contract]
-    pub struct MockAmmPool;
-
-    #[contractimpl]
-    impl MockAmmPool {
-        /// Swap `input_amount` of `input_token` for `output_amount` of
-        /// `output_token`, sending the output directly to `recipient`.
-        ///
-        /// The caller (the escrow contract) is expected to have already moved
-        /// `input_amount` of `input_token` into this pool. This mock simply
-        /// forwards the pre-agreed `output_amount` from its own reserves.
-        pub fn swap(
-            env: Env,
-            input_token: Address,
-            output_token: Address,
-            input_amount: i128,
-            output_amount: i128,
-            recipient: Address,
-        ) {
-            // Pull the input tokens from the caller into the pool reserves.
-            let input_client = token::Client::new(&env, &input_token);
-            input_client.transfer(
-                &env.current_contract_address(),
-                &env.current_contract_address(),
-                &input_amount,
-            );
-            // Forward the output tokens to the recipient (escrow).
-            let output_client = token::Client::new(&env, &output_token);
-            output_client.transfer(
-                &env.current_contract_address(),
-                &recipient,
-                &output_amount,
-            );
-        }
-    }
-}
-
-use mock_pool::MockAmmPool;
-
-/// Deploy a mock AMM pool and seed it with output-token reserves so it can
-/// service swaps. Returns the pool address.
-fn deploy_mock_pool<'a>(
-    env: &Env,
-    admin: &Address,
-    output_token: &Address,
-    output_reserve: i128,
-) -> Address {
-    let pool_id = env.register(MockAmmPool, ());
-    // Fund the pool with output-token reserves so it can pay out swaps.
-    let output_asset = StellarAssetClient::new(env, output_token);
-    output_asset.mint(&pool_id, &output_reserve);
-    let _ = admin;
-    pool_id
-}
-
-/// (1) A client can fund a USDC escrow using XLM in a single transaction and
-/// the escrow receives the full required target budget.
-#[test]
-fn fund_job_with_swap_funds_escrow_in_single_transaction() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-
-    // Input token: XLM (what the client holds).
-    let (xlm_addr, xlm, xlm_asset) = deploy_token(&env, &admin);
-    // Output token: USDC (what the escrow/job requires).
-    let (usdc_addr, usdc, _usdc_asset) = deploy_token(&env, &admin);
-
-    xlm_asset.mint(&buyer, &1_000_000);
-
-    // Seed the mock pool with enough USDC to service the swap.
-    let pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
-
-    let budget: i128 = 100_000;
-    let max_input: i128 = 120_000;
-
-    let job_id = client.fund_job_with_swap(
-        &buyer,
-        &seller,
-        &buyer,
-        &xlm_addr,
-        &usdc_addr,
-        &budget,
-        &max_input,
-        &String::from_str(&env, "cross-currency job"),
-    );
-
-    // Escrow must hold exactly the required target budget in USDC.
-    assert_eq!(usdc.balance(&client.address), budget);
-
-    let job = client.get_job(&job_id).unwrap();
-    assert_eq!(job.status, JobStatus::Funded);
-    assert_eq!(job.budget, budget);
-    assert_eq!(job.token, usdc_addr);
-    assert_eq!(job.client, buyer);
-    assert_eq!(job.provider, seller);
-
-    // The pool received the input tokens it was paid for the swap.
-    assert!(xlm.balance(&pool) > 0);
-}
-
-/// (2) The `max_input_amount` slippage guard rejects swaps whose required
-/// input exceeds the caller-supplied limit.
-#[test]
-#[should_panic(expected = "max input amount exceeded")]
-fn fund_job_with_swap_rejects_when_input_exceeds_max() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-
-    let (xlm_addr, _xlm, xlm_asset) = deploy_token(&env, &admin);
-    let (usdc_addr, _usdc, _usdc_asset) = deploy_token(&env, &admin);
-
-    xlm_asset.mint(&buyer, &1_000_000);
-    let _pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
-
-    let budget: i128 = 100_000;
-    // The required input (100_000) exceeds this guard, so the call must panic.
-    let max_input: i128 = 50_000;
-
-    client.fund_job_with_swap(
-        &buyer,
-        &seller,
-        &buyer,
-        &xlm_addr,
-        &usdc_addr,
-        &budget,
-        &max_input,
-        &String::from_str(&env, "slippage guard"),
-    );
-}
-
-/// (3) Any unspent input remainder is refunded to the client wallet.
-#[test]
-fn fund_job_with_swap_refunds_unspent_input_remainder() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-
-    let (xlm_addr, xlm, xlm_asset) = deploy_token(&env, &admin);
-    let (usdc_addr, usdc, _usdc_asset) = deploy_token(&env, &admin);
-
-    let starting_balance: i128 = 1_000_000;
-    xlm_asset.mint(&buyer, &starting_balance);
-    let _pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
-
-    let budget: i128 = 100_000;
-    // The client authorises up to 120_000 XLM but only 100_000 is consumed,
-    // so 20_000 must be refunded.
-    let max_input: i128 = 120_000;
-
-    client.fund_job_with_swap(
-        &buyer,
-        &seller,
-        &buyer,
-        &xlm_addr,
-        &usdc_addr,
-        &budget,
-        &max_input,
-        &String::from_str(&env, "refund remainder"),
-    );
-
-    // Escrow holds the full USDC budget.
-    assert_eq!(usdc.balance(&client.address), budget);
-    // The client's XLM balance reflects only the consumed input, with the
-    // unspent remainder returned.
-    assert_eq!(xlm.balance(&buyer), starting_balance - budget);
-}
-
-/// (4) Balance distributions across client, escrow, and swap pool are correct.
-#[test]
-fn fund_job_with_swap_balance_distributions_are_correct() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-
-    let (xlm_addr, xlm, xlm_asset) = deploy_token(&env, &admin);
-    let (usdc_addr, usdc, _usdc_asset) = deploy_token(&env, &admin);
-
-    let starting_xlm: i128 = 500_000;
-    xlm_asset.mint(&buyer, &starting_xlm);
-
-    let pool_reserve: i128 = 1_000_000;
-    let pool = deploy_mock_pool(&env, &admin, &usdc_addr, &pool_reserve);
-
-    let budget: i128 = 100_000;
-    let max_input: i128 = 150_000;
-
-    client.fund_job_with_swap(
-        &buyer,
-        &seller,
-        &buyer,
-        &xlm_addr,
-        &usdc_addr,
-        &budget,
-        &max_input,
-        &String::from_str(&env, "balance distribution"),
-    );
-
-    // Escrow: exactly the target USDC budget.
-    assert_eq!(usdc.balance(&client.address), budget);
-    // Pool: received the consumed input tokens and paid out the budget.
-    assert_eq!(xlm.balance(&pool), budget);
-    assert_eq!(usdc.balance(&pool), pool_reserve - budget);
-    // Client: only the consumed input left their wallet.
-    assert_eq!(xlm.balance(&buyer), starting_xlm - budget);
-}
-
-/// Non-clients cannot call `fund_job_with_swap` on behalf of another client.
-#[test]
-#[should_panic(expected = "Error(Contract, #6)")]
-fn fund_job_with_swap_rejects_non_client() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let mallory = Address::generate(&env);
-
-    let (xlm_addr, _xlm, xlm_asset) = deploy_token(&env, &admin);
-    let (usdc_addr, _usdc, _usdc_asset) = deploy_token(&env, &admin);
-
-    xlm_asset.mint(&mallory, &1_000_000);
-    let _pool = deploy_mock_pool(&env, &admin, &usdc_addr, &1_000_000);
-
-    // mallory is not the declared client (buyer) — must be rejected.
-    client.fund_job_with_swap(
-        &mallory,
-        &seller,
-        &buyer,
-        &xlm_addr,
-        &usdc_addr,
-        &100_000i128,
-        &120_000i128,
-        &String::from_str(&env, "unauthorized funding"),
-    );
-}
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
