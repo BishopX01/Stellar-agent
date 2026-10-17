@@ -130,6 +130,9 @@ export class SorobanEventPoller {
         return;
       }
 
+      // Collect all events for this ledger across contracts before writing.
+      const allInserts: InsertEventParams[] = [];
+
       // Query each contract separately to stay within RPC limits
       for (const contractId of this.contracts) {
         try {
@@ -160,9 +163,11 @@ export class SorobanEventPoller {
             return toInsertParams(ev as StellarRpc.Api.EventResponse, closeTime);
           });
 
-          this.store.insertMany(inserts);
+          // Collect events across all contracts so the whole ledger batch is
+          // persisted atomically in a single IMMEDIATE transaction below.
+          allInserts.push(...inserts);
           this.log(
-            `Indexed ${inserts.length} events from contract ${contractId} (ledgers ${fromLedger}+)`,
+            `Fetched ${inserts.length} events from contract ${contractId} (ledgers ${fromLedger}+)`,
           );
         } catch (err) {
           console.error(
@@ -172,8 +177,12 @@ export class SorobanEventPoller {
         }
       }
 
-      // Advance the watermark to the latest ledger we queried up to
-      this.store.setLastIndexedLedger(latest.sequence);
+      // Persist the entire ledger batch (events + watermark) atomically.
+      // If anything fails, neither the events nor the watermark advance.
+      this.store.insertEventsBatch(allInserts, latest.sequence);
+      this.log(
+        `Indexed ${allInserts.length} events across ${this.contracts.length} contract(s) up to ledger ${latest.sequence}`,
+      );
     } catch (err) {
       console.error("[indexer] Poll error:", (err as Error).message);
     }

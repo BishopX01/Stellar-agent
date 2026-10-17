@@ -13,6 +13,7 @@ import {
   isMockLlm,
   MOCK_DELIVERABLES,
   callLlmWithRetry,
+  registerGracefulShutdown,
 } from "../shared.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
@@ -161,6 +162,8 @@ app.post("/job", limiter, async (req, res) => {
   );
   res.json(makeSellerResponse({ status: "accepted", jobId }, startedAt));
 
+  const taskKey = `job-${jobId}-${requestId}`;
+  activeTaskTracker.track(taskKey);
   jobsActive++;
   try {
     console.log(`[${AGENT_ID}] Calling Groq...`);
@@ -204,14 +207,10 @@ app.post("/job", limiter, async (req, res) => {
     console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
   } finally {
     jobsActive--;
+    activeTaskTracker.untrack(taskKey);
   }
 });
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+
+registerGracefulShutdown(server, activeTaskTracker, undefined);
