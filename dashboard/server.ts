@@ -42,9 +42,61 @@ import {
   requireAuth,
   requireMatchingWallet,
 } from "./lib/auth.js";
+import { DeliverableValidator } from "./lib/validator.js";
+import client from "prom-client";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// ── #732: Prometheus metrics registry ────────────────────────────────────────
+const metricsRegistry = new client.Registry();
+client.collectDefaultMetrics({ register: metricsRegistry });
+
+const httpRequestsTotal = new client.Counter({
+  name: "http_requests_total",
+  help: "Total number of HTTP requests handled by the dashboard API",
+  labelNames: ["method", "route", "status"] as const,
+  registers: [metricsRegistry],
+});
+
+const stellarEventsIngestedTotal = new client.Counter({
+  name: "stellar_events_ingested_total",
+  help: "Total number of Stellar contract events ingested by the indexer",
+  labelNames: ["contract", "type"] as const,
+  registers: [metricsRegistry],
+});
+
+const stellarRpcRequestDuration = new client.Histogram({
+  name: "stellar_rpc_request_duration_seconds",
+  help: "Duration of Soroban RPC calls in seconds",
+  labelNames: ["method", "status"] as const,
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [metricsRegistry],
+});
+
+const activeEscrowJobsGauge = new client.Gauge({
+  name: "active_escrow_jobs_gauge",
+  help: "Number of escrow jobs currently in Funded or Submitted state",
+  registers: [metricsRegistry],
+});
+
+// Count every HTTP request once the response has been sent.
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.on("finish", () => {
+    const route = req.route?.path
+      ? `${req.baseUrl ?? ""}${req.route.path}`
+      : req.path;
+    httpRequestsTotal.inc({ method: req.method, route, status: String(res.statusCode) });
+  });
+  next();
+});
+
+// ── #730: Deliverable content inspection ─────────────────────────────────────
+const deliverableValidator = new DeliverableValidator({
+  safeBrowsingApiKey: process.env.GOOGLE_SAFE_BROWSING_API_KEY,
+  virusTotalApiKey: process.env.VIRUSTOTAL_API_KEY,
+  maxFileSizeBytes: Number(process.env.DELIVERABLE_MAX_BYTES ?? 50 * 1024 * 1024),
+});
 
 // ── #778: Strict Content Security Policy with per-request nonces ─────────────
 // Generate a fresh cryptographic nonce for every request. The nonce is stored
@@ -171,6 +223,19 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
     }
   }
   throw lastError instanceof Error ? lastError : new Error("All Stellar RPC providers failed");
+}
+
+/** Wrap a Soroban RPC call with latency histogram instrumentation. */
+async function instrumentRpc<T>(method: string, fn: () => Promise<T>): Promise<T> {
+  const end = stellarRpcRequestDuration.startTimer({ method });
+  try {
+    const result = await fn();
+    end({ status: "ok" });
+    return result;
+  } catch (err) {
+    end({ status: "error" });
+    throw err;
+  }
 }
 
 const identityContract = new Contract(cfg.identityContract);
@@ -368,7 +433,7 @@ app.use(
 
 app.get("/health", async (_req, res) => {
   try {
-    await server.getLatestLedger();
+    await instrumentRpc("getLatestLedger", () => server.getLatestLedger());
     res.json({ status: "ok", rpc: "ok", timestamp: new Date().toISOString() });
   } catch (err: unknown) {
     res.status(503).json({
@@ -380,6 +445,24 @@ app.get("/health", async (_req, res) => {
   }
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
+
+// GET /metrics — Prometheus exposition format, optionally protected by bearer token.
+app.get("/metrics", async (req, res) => {
+  const expectedToken = process.env.METRICS_BEARER_TOKEN;
+  if (expectedToken) {
+    const provided = req.headers.authorization?.replace("Bearer ", "");
+    if (provided !== expectedToken) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+  }
+  try {
+    res.setHeader("Content-Type", metricsRegistry.contentType);
+    res.send(await metricsRegistry.metrics());
+  } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
 
 // --- Authentication Endpoints ---
 
@@ -653,6 +736,7 @@ app.get("/api/stats", async (req, res) => {
     }
     const [agents, jobs, feeBps] = await Promise.all([getAllAgents(), getAllJobs(), getFeeBps()]);
     const activeJobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted").length;
+    activeEscrowJobsGauge.set(activeJobs);
     const payload = {
       totalAgents: agents.length,
       totalJobs: jobs.length,
@@ -851,10 +935,19 @@ app.post(
     try {
       const params = numericIdParamSchema.parse(req.params);
       const parsed = submitJobSchema.parse(req.body);
+      const deliverable = parsed.deliverable || "ipfs://dashboard-delivery";
+      const inspection = await deliverableValidator.validate(deliverable);
+      if (!inspection.valid) {
+        res.status(400).json({
+          error: "Deliverable rejected by content inspection",
+          details: inspection.errors,
+        });
+        return;
+      }
       const kp = getKeypair(parsed.wallet);
-      await commerce.submit(kp, params.id, parsed.deliverable || "ipfs://dashboard-delivery");
+      await commerce.submit(kp, params.id, deliverable);
       invalidateJobs();
-      res.json({ success: true });
+      res.json({ success: true, warnings: inspection.warnings });
     } catch (err: unknown) {
       handleRouteError(err, res);
     }
@@ -1069,14 +1162,23 @@ app.post(
 app.post("/api/build/submit", rateLimitMutating, optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
   try {
     const parsed = buildUnsignedActionSchema.parse(req.body);
+    const deliverable = req.body.deliverable || "ipfs://dashboard-delivery";
+    const inspection = await deliverableValidator.validate(deliverable);
+    if (!inspection.valid) {
+      res.status(400).json({
+        error: "Deliverable rejected by content inspection",
+        details: inspection.errors,
+      });
+      return;
+    }
     const op = commerceContract.call(
       "submit",
       new Address(parsed.publicKey).toScVal(),
       nativeToScVal(BigInt(parsed.jobId), { type: "u64" }),
-      nativeToScVal(req.body.deliverable || "ipfs://dashboard-delivery", { type: "string" }),
+      nativeToScVal(deliverable, { type: "string" }),
     );
     const txXdr = await buildTxXdr(parsed.publicKey, op);
-    res.json({ xdr: txXdr });
+    res.json({ xdr: txXdr, warnings: inspection.warnings });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
@@ -1157,14 +1259,20 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
     }
     pendingTxHashes.delete(submitHash);
 
-    const sent = await withRpcFallback((rpcServer) => rpcServer.sendTransaction(tx));
+    const sent = await instrumentRpc("sendTransaction", () =>
+      withRpcFallback((rpcServer) => rpcServer.sendTransaction(tx)),
+    );
     if (sent.status === "ERROR") {
       throw new Error(`submit failed: ${sent.errorResult}`);
     }
-    let getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+    let getResp = await instrumentRpc("getTransaction", () =>
+      withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash)),
+    );
     while (getResp.status === "NOT_FOUND") {
       await new Promise((r) => setTimeout(r, 1000));
-      getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+      getResp = await instrumentRpc("getTransaction", () =>
+        withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash)),
+      );
     }
     if (getResp.status !== "SUCCESS") {
       throw new Error(`tx failed: ${getResp.status}`);
@@ -1180,6 +1288,7 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
     }
     invalidateAgents();
     invalidateJobs();
+    stellarEventsIngestedTotal.inc({ contract: cfg.commerceContract, type: "transaction" });
     res.json({ hash: sent.hash, returnValue: String(returnValue ?? "") });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;

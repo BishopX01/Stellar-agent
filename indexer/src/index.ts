@@ -1,8 +1,12 @@
 import { rpc as StellarRpc } from "@stellar/stellar-sdk";
 import { openDatabase, EventStore, type QueryOptions, type ParsedEventRow } from "./db.js";
+import { PostgresAdapter } from "./db-postgres.js";
+import type { DatabaseAdapter } from "./db-adapter.js";
 import { SorobanEventPoller, type PollerOptions } from "./poller.js";
 
 export type { QueryOptions, ParsedEventRow };
+export type { DatabaseAdapter } from "./db-adapter.js";
+export { PostgresAdapter } from "./db-postgres.js";
 
 export type BearEventIndexerConfig = {
   /** Soroban RPC URL */
@@ -13,6 +17,12 @@ export type BearEventIndexerConfig = {
   commerceContract: string;
   /** Path to the SQLite database file. Default: "./data/events.db" */
   dbPath?: string;
+  /**
+   * PostgreSQL connection string. When set (or when the DATABASE_URL
+   * environment variable is set), the indexer uses the PostgreSQL adapter
+   * instead of SQLite.
+   */
+  databaseUrl?: string;
   /** Ledger to start indexing from on first run. Default: 0 (chain origin) */
   startLedger?: number;
   /** Polling options */
@@ -39,15 +49,20 @@ export type BearEventIndexerConfig = {
  * ```
  */
 export class BearEventIndexer {
-  private readonly store: EventStore;
+  private readonly store: DatabaseAdapter;
   private readonly poller: SorobanEventPoller;
 
   constructor(config: BearEventIndexerConfig) {
-    const dbPath = config.dbPath ?? "./data/events.db";
     const startLedger = config.startLedger ?? 0;
 
-    const db = openDatabase(dbPath);
-    this.store = new EventStore(db);
+    const databaseUrl = config.databaseUrl ?? process.env.DATABASE_URL;
+    if (databaseUrl && databaseUrl.trim() !== "") {
+      this.store = new PostgresAdapter({ connectionString: databaseUrl });
+    } else {
+      const dbPath = config.dbPath ?? "./data/events.db";
+      const db = openDatabase(dbPath);
+      this.store = new EventStore(db);
+    }
 
     const rpcServer = new StellarRpc.Server(config.rpcUrl, {
       allowHttp: config.rpcUrl.startsWith("http://"),
@@ -70,6 +85,11 @@ export class BearEventIndexer {
   /** Stop the indexer gracefully. */
   stop(): void {
     this.poller.stop();
+  }
+
+  /** Release any resources held by the storage adapter (e.g. DB pool). */
+  async close(): Promise<void> {
+    await this.store.close?.();
   }
 
   // ── Query API ──────────────────────────────────────────────────────────────

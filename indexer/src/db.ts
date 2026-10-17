@@ -80,7 +80,29 @@ export type QueryOptions = {
   toTimestamp?: number;
 };
 
-export class EventStore {
+/**
+ * Backend-agnostic storage contract implemented by both the SQLite
+ * `EventStore` and the PostgreSQL adapter.  The indexer only depends on this
+ * interface so it can switch backing stores transparently.
+ */
+export interface DatabaseAdapter {
+  /** Insert a single event. */
+  insertEvent(event: InsertEventParams): void | Promise<void>;
+
+  /** Bulk-insert events (ideally inside a single transaction). */
+  insertMany(events: InsertEventParams[]): void | Promise<void>;
+
+  /** Fetch events matching the given options. */
+  getEvents(opts?: QueryOptions): ParsedEventRow[] | Promise<ParsedEventRow[]>;
+
+  /** Read the last successfully indexed ledger, or null if unknown. */
+  getIndexerState(): number | null | Promise<number | null>;
+
+  /** Persist the last successfully indexed ledger. */
+  setIndexerState(ledger: number): void | Promise<void>;
+}
+
+export class EventStore implements DatabaseAdapter {
   private db: Database.Database;
 
   private stmtInsert: Database.Statement;
@@ -103,6 +125,17 @@ export class EventStore {
       INSERT INTO indexer_state (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `);
+  }
+
+  /** Insert a single event. */
+  insertEvent(event: InsertEventParams): void {
+    this.stmtInsert.run({
+      ledger: event.ledger,
+      timestamp: event.timestamp,
+      contract: event.contract,
+      event_type: event.event_type,
+      payload: JSON.stringify(event.payload),
+    });
   }
 
   /** Bulk-insert events inside a single transaction. */
@@ -130,6 +163,39 @@ export class EventStore {
 
   setLastIndexedLedger(ledger: number): void {
     this.stmtSetState.run("last_ledger", String(ledger));
+  }
+
+  // ── DatabaseAdapter implementation ─────────────────────────────────────────
+
+  getIndexerState(): number | null {
+    return this.getLastIndexedLedger();
+  }
+
+  setIndexerState(ledger: number): void {
+    this.setLastIndexedLedger(ledger);
+  }
+
+  /**
+   * Generic event query.  Applies the optional timestamp range and
+   * pagination from `QueryOptions`, ordered by ledger descending.
+   */
+  getEvents(opts: QueryOptions = {}): ParsedEventRow[] {
+    const { limit = 20, offset = 0, fromTimestamp, toTimestamp } = opts;
+    let sql = `SELECT * FROM events WHERE 1 = 1`;
+    const params: (string | number)[] = [];
+    if (fromTimestamp !== undefined) {
+      sql += " AND timestamp >= ?";
+      params.push(fromTimestamp);
+    }
+    if (toTimestamp !== undefined) {
+      sql += " AND timestamp <= ?";
+      params.push(toTimestamp);
+    }
+    sql += " ORDER BY ledger DESC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+
+    const rows = this.db.prepare(sql).all(...params) as EventRow[];
+    return rows.map(parseRow);
   }
 
   // ── Query API ──────────────────────────────────────────────────────────────

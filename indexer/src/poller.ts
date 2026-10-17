@@ -1,5 +1,11 @@
 import { rpc as StellarRpc } from "@stellar/stellar-sdk";
-import { EventStore, type InsertEventParams } from "./db.js";
+import type { DatabaseAdapter, InsertEventParams } from "./db.js";
+import {
+  stellarEventsIngestedTotal,
+  stellarRpcRequestDurationSeconds,
+  activeEscrowJobsGauge,
+} from "./metrics.js";
+import type { WebhookDispatcher } from "./webhooks.js";
 
 export type SorobanRpcClient = {
   getEvents(
@@ -75,7 +81,22 @@ export type PollerOptions = {
   batchSize?: number;
   /** Emit debug logs. Default: false */
   debug?: boolean;
+  /** Optional webhook dispatcher invoked on JobCreated events. */
+  webhooks?: WebhookDispatcher;
 };
+
+/** Wraps an RPC call, observing its latency in the Prometheus histogram. */
+async function observeRpc<T>(
+  method: "getEvents" | "getLatestLedger",
+  fn: () => Promise<T>,
+): Promise<T> {
+  const end = stellarRpcRequestDurationSeconds.startTimer({ method });
+  try {
+    return await fn();
+  } finally {
+    end();
+  }
+}
 
 /**
  * Continuously polls Soroban RPC for new contract events and persists them
@@ -83,19 +104,20 @@ export type PollerOptions = {
  */
 export class SorobanEventPoller {
   private readonly rpc: SorobanRpcClient;
-  private readonly store: EventStore;
+  private readonly store: DatabaseAdapter;
   private readonly contracts: string[];
   private readonly startLedger: number;
   private readonly intervalMs: number;
   private readonly batchSize: number;
   private readonly debug: boolean;
+  private readonly webhooks?: WebhookDispatcher;
 
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
 
   constructor(
     rpc: SorobanRpcClient,
-    store: EventStore,
+    store: DatabaseAdapter,
     contracts: string[],
     startLedger: number,
     opts: PollerOptions = {},
@@ -107,6 +129,7 @@ export class SorobanEventPoller {
     this.intervalMs = opts.intervalMs ?? 5_000;
     this.batchSize = opts.batchSize ?? 100;
     this.debug = opts.debug ?? false;
+    this.webhooks = opts.webhooks;
   }
 
   private log(msg: string): void {
@@ -120,11 +143,56 @@ export class SorobanEventPoller {
     return last !== null ? last + 1 : this.startLedger;
   }
 
+  /**
+   * Fires webhook notifications for JobCreated events without blocking the
+   * poll loop.  Any failure is logged and swallowed so the poller keeps running.
+   */
+  private dispatchJobCreatedWebhooks(inserts: InsertEventParams[]): void {
+    if (!this.webhooks) return;
+
+    for (const insert of inserts) {
+      if (insert.event_type !== "JobCreated") continue;
+
+      const payload = insert.payload as Record<string, unknown>;
+      const value = payload?.value as Record<string, unknown> | undefined;
+      const provider =
+        (value?.provider as string | undefined) ??
+        (value?.seller as string | undefined);
+      if (!provider) continue;
+
+      const jobId =
+        (value?.job_id as string | undefined) ??
+        (value?.jobId as string | undefined) ??
+        insert.event_type;
+      const budget = value?.budget;
+      const client = value?.client;
+      const description = value?.description;
+
+      void Promise.resolve()
+        .then(() =>
+          this.webhooks!.dispatchJobCreated(provider, {
+            jobId: String(jobId),
+            budget,
+            client,
+            description,
+          }),
+        )
+        .catch((err) => {
+          console.error(
+            `[indexer] Webhook dispatch failed for provider ${provider}:`,
+            (err as Error).message,
+          );
+        });
+    }
+  }
+
   private async poll(): Promise<void> {
     const fromLedger = this.getFromLedger();
 
     try {
-      const latest = await this.rpc.getLatestLedger();
+      const latest = await observeRpc("getLatestLedger", () =>
+        this.rpc.getLatestLedger(),
+      );
       if (fromLedger > latest.sequence) {
         this.log(`Up to date at ledger ${latest.sequence}`);
         return;
@@ -133,16 +201,18 @@ export class SorobanEventPoller {
       // Query each contract separately to stay within RPC limits
       for (const contractId of this.contracts) {
         try {
-          const response = await this.rpc.getEvents({
-            startLedger: fromLedger,
-            filters: [
-              {
-                type: "contract",
-                contractIds: [contractId],
-              },
-            ],
-            limit: this.batchSize,
-          });
+          const response = await observeRpc("getEvents", () =>
+            this.rpc.getEvents({
+              startLedger: fromLedger,
+              filters: [
+                {
+                  type: "contract",
+                  contractIds: [contractId],
+                },
+              ],
+              limit: this.batchSize,
+            }),
+          );
 
           if (!response.events || response.events.length === 0) continue;
 
@@ -161,6 +231,10 @@ export class SorobanEventPoller {
           });
 
           this.store.insertMany(inserts);
+          for (const insert of inserts) {
+            stellarEventsIngestedTotal.inc({ event_type: insert.event_type });
+          }
+          this.dispatchJobCreatedWebhooks(inserts);
           this.log(
             `Indexed ${inserts.length} events from contract ${contractId} (ledgers ${fromLedger}+)`,
           );
@@ -174,6 +248,16 @@ export class SorobanEventPoller {
 
       // Advance the watermark to the latest ledger we queried up to
       this.store.setLastIndexedLedger(latest.sequence);
+
+      // Refresh the gauge of currently active escrow jobs.
+      try {
+        const active = this.store.countActiveJobs?.();
+        if (typeof active === "number") {
+          activeEscrowJobsGauge.set(active);
+        }
+      } catch (err) {
+        this.log(`Failed to update active jobs gauge: ${(err as Error).message}`);
+      }
     } catch (err) {
       console.error("[indexer] Poll error:", (err as Error).message);
     }

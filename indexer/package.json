@@ -1,25 +1,32 @@
 {
   "name": "bear-event-indexer",
   "version": "0.1.0",
-  "description": "Soroban event indexer with SQLite for fast historical Bear Protocol queries",
+  "description": "Soroban event indexer with SQLite/PostgreSQL backends for fast historical Bear Protocol queries",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:postgres": "vitest run --config vitest.postgres.config.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^12.0.0",
-    "better-sqlite3": "^9.4.3"
+    "better-sqlite3": "^9.4.3",
+    "pg": "^8.11.5",
+    "prom-client": "^15.1.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.10",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.6",
     "tsx": "^4.19.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
   },
-  "keywords": ["stellar", "soroban", "indexer", "sqlite", "bear-protocol"],
+  "keywords": ["stellar", "soroban", "indexer", "sqlite", "postgresql", "bear-protocol"],
   "license": "MIT"
 }
