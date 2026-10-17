@@ -87,3 +87,6 @@ export const TESTNET_ALLOWED_TOKENS = {
 } as const;
 
 export type { Milestone, MilestoneInput } from './types.js';
+
+// #698 — atomic batch job creation
+export type { JobRequest, BatchJobsCreatedEvent } from './commerce.js';

@@ -206,6 +206,77 @@ export class EventStore {
     return rows.map(parseRow);
   }
 
+  getByContract(
+    contract: string,
+    opts: QueryOptions = {},
+  ): ParsedEventRow[] {
+    const { limit = 20, offset = 0, fromTimestamp, toTimestamp } = opts;
+    let sql = `SELECT * FROM events WHERE contract = ?`;
+    const params: (string | number)[] = [contract];
+    if (fromTimestamp !== undefined) {
+      sql += " AND timestamp >= ?";
+      params.push(fromTimestamp);
+    }
+    if (toTimestamp !== undefined) {
+      sql += " AND timestamp <= ?";
+      params.push(toTimestamp);
+    }
+    sql += " ORDER BY ledger DESC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+
+    const rows = this.db.prepare(sql).all(...params) as EventRow[];
+    return rows.map(parseRow);
+  }
+
+  /**
+   * Fetch events whose JSON payload contains the given job id under any of the
+   * common key names used across the contracts (`job_id`, `jobId`, `job`).
+   * Used by the E2E lifecycle test to assert that every event emitted for a
+   * single job was persisted by the indexer.
+   */
+  getByJobId(
+    jobId: string | number,
+    opts: QueryOptions = {},
+  ): ParsedEventRow[] {
+    const { limit = 100, offset = 0, fromTimestamp, toTimestamp } = opts;
+    const id = String(jobId);
+    let sql = `
+      SELECT * FROM events
+      WHERE json_extract(payload, '$.job_id') = ?
+         OR json_extract(payload, '$.jobId')  = ?
+         OR json_extract(payload, '$.job')    = ?
+    `;
+    const params: (string | number)[] = [id, id, id];
+    if (fromTimestamp !== undefined) {
+      sql += " AND timestamp >= ?";
+      params.push(fromTimestamp);
+    }
+    if (toTimestamp !== undefined) {
+      sql += " AND timestamp <= ?";
+      params.push(toTimestamp);
+    }
+    sql += " ORDER BY ledger ASC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+
+    const rows = this.db.prepare(sql).all(...params) as EventRow[];
+    return rows.map(parseRow);
+  }
+
+  /**
+   * Fetch events matching a job id AND a specific event type.  Convenience
+   * wrapper used by the E2E test to assert individual lifecycle transitions
+   * (e.g. `job_funded`, `job_completed`) were indexed.
+   */
+  getByJobIdAndType(
+    jobId: string | number,
+    eventType: string,
+    opts: QueryOptions = {},
+  ): ParsedEventRow[] {
+    return this.getByJobId(jobId, opts).filter(
+      (row) => row.event_type === eventType,
+    );
+  }
+
   getByDateRange(
     from: number,
     to: number,

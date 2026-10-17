@@ -3,6 +3,9 @@ import {
   CommerceEvents,
   IdentityEvents,
   type AgentDeregisteredEvent,
+  type BadgeIssuedEvent,
+  type BadgeRevokedEvent,
+  type BatchJobsCreatedEvent,
   type IdentityEvent,
   type JobCancelledEvent,
   type JobCompletedEvent,
@@ -309,6 +312,84 @@ export function decodeOwnerTransferredEvent(
 }
 
 /**
+ * Decode a `BadgeIssued` contract event emitted by `agent_identity`.
+ *
+ * @param event - The raw event response from Soroban RPC or mock event payload.
+ * @returns Decoded `BadgeIssuedEvent` with typed `owner`, `agentId`, and `badgeId`.
+ */
+export function decodeBadgeIssuedEvent(event: EventPayload): BadgeIssuedEvent {
+  const topicName = getEventTopicName(event);
+  if (topicName !== IdentityEvents.BadgeIssued) {
+    throw new Error(
+      `Expected ${IdentityEvents.BadgeIssued} event, got ${topicName}`,
+    );
+  }
+
+  const owner = toAddress(event.topic[1]);
+  const body = toNative(event.value);
+
+  let agentId: bigint;
+  let badgeId: bigint;
+
+  if (Array.isArray(body)) {
+    agentId = toBigInt(body[0]);
+    badgeId = toBigInt(body[1]);
+  } else if (typeof body === "object" && body !== null) {
+    const obj = body as Record<string, unknown>;
+    agentId = toBigInt(obj.agent_id ?? obj.agentId ?? obj.id);
+    badgeId = toBigInt(obj.badge_id ?? obj.badgeId);
+  } else {
+    throw new Error("Unable to parse BadgeIssued data body");
+  }
+
+  return {
+    type: IdentityEvents.BadgeIssued,
+    owner,
+    agentId,
+    badgeId,
+  };
+}
+
+/**
+ * Decode a `BadgeRevoked` contract event emitted by `agent_identity`.
+ *
+ * @param event - The raw event response from Soroban RPC or mock event payload.
+ * @returns Decoded `BadgeRevokedEvent` with typed `owner`, `agentId`, and `badgeId`.
+ */
+export function decodeBadgeRevokedEvent(event: EventPayload): BadgeRevokedEvent {
+  const topicName = getEventTopicName(event);
+  if (topicName !== IdentityEvents.BadgeRevoked) {
+    throw new Error(
+      `Expected ${IdentityEvents.BadgeRevoked} event, got ${topicName}`,
+    );
+  }
+
+  const owner = toAddress(event.topic[1]);
+  const body = toNative(event.value);
+
+  let agentId: bigint;
+  let badgeId: bigint;
+
+  if (Array.isArray(body)) {
+    agentId = toBigInt(body[0]);
+    badgeId = toBigInt(body[1]);
+  } else if (typeof body === "object" && body !== null) {
+    const obj = body as Record<string, unknown>;
+    agentId = toBigInt(obj.agent_id ?? obj.agentId ?? obj.id);
+    badgeId = toBigInt(obj.badge_id ?? obj.badgeId);
+  } else {
+    throw new Error("Unable to parse BadgeRevoked data body");
+  }
+
+  return {
+    type: IdentityEvents.BadgeRevoked,
+    owner,
+    agentId,
+    badgeId,
+  };
+}
+
+/**
  * Decode any `agent_identity` contract event dynamically.
  */
 export function decodeIdentityEvent(event: EventPayload): IdentityEvent {
@@ -322,6 +403,10 @@ export function decodeIdentityEvent(event: EventPayload): IdentityEvent {
       return decodeAgentDeregisteredEvent(event);
     case IdentityEvents.OwnerTransferred:
       return decodeOwnerTransferredEvent(event);
+    case IdentityEvents.BadgeIssued:
+      return decodeBadgeIssuedEvent(event);
+    case IdentityEvents.BadgeRevoked:
+      return decodeBadgeRevokedEvent(event);
     default:
       throw new Error(`Unknown identity event type: ${topicName}`);
   }
@@ -614,6 +699,57 @@ export function decodeJobExpiredEvent(event: EventPayload): JobExpiredEvent {
 }
 
 /**
+ * Decode a `BatchJobsCreated` contract event emitted by `agentic_commerce`.
+ *
+ * @param event - The raw event response from Soroban RPC or mock event payload.
+ * @returns Decoded `BatchJobsCreatedEvent` with typed `client`, `batchId`, `jobIds`, and `budget`.
+ */
+export function decodeBatchJobsCreatedEvent(
+  event: EventPayload,
+): BatchJobsCreatedEvent {
+  const topicName = getEventTopicName(event);
+  if (topicName !== CommerceEvents.BatchJobsCreated) {
+    throw new Error(
+      `Expected ${CommerceEvents.BatchJobsCreated} event, got ${topicName}`,
+    );
+  }
+
+  const client = toAddress(event.topic[1]);
+  const body = toNative(event.value);
+
+  let batchId: bigint;
+  let jobIds: bigint[];
+  let budget: bigint;
+
+  if (Array.isArray(body)) {
+    batchId = toBigInt(body[0]);
+    const rawJobIds = body[1];
+    jobIds = Array.isArray(rawJobIds)
+      ? rawJobIds.map((id) => toBigInt(id))
+      : [];
+    budget = toBigInt(body[2]);
+  } else if (typeof body === "object" && body !== null) {
+    const obj = body as Record<string, unknown>;
+    batchId = toBigInt(obj.batch_id ?? obj.batchId ?? obj.id);
+    const rawJobIds = obj.job_ids ?? obj.jobIds;
+    jobIds = Array.isArray(rawJobIds)
+      ? rawJobIds.map((id) => toBigInt(id))
+      : [];
+    budget = toBigInt(obj.budget);
+  } else {
+    throw new Error("Unable to parse BatchJobsCreated data body");
+  }
+
+  return {
+    type: CommerceEvents.BatchJobsCreated,
+    client,
+    batchId,
+    jobIds,
+    budget,
+  };
+}
+
+/**
  * Decode any `agentic_commerce` contract event dynamically based on topic[0].
  */
 export function decodeCommerceEvent(event: EventPayload): JobEvent {
@@ -633,6 +769,8 @@ export function decodeCommerceEvent(event: EventPayload): JobEvent {
       return decodeJobRefundedEvent(event);
     case CommerceEvents.JobExpired:
       return decodeJobExpiredEvent(event);
+    case CommerceEvents.BatchJobsCreated:
+      return decodeBatchJobsCreatedEvent(event);
     default:
       throw new Error(`Unknown commerce event type: ${topicName}`);
   }

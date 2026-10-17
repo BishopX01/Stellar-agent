@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    Env, String,
+    Env, String, Symbol, Vec,
 };
 
 const MAX_METADATA_URI_LEN: u32 = 256; // prevents storage-griefing via oversized URI (#320)
@@ -78,6 +78,34 @@ pub struct Delegate {
     pub permissions: u32,
 }
 
+// ---------------------------------------------------------------------------
+// #701 — Capability badge / verifiable credential
+// ---------------------------------------------------------------------------
+
+/// An on-chain capability attestation issued by an authorised issuer.
+///
+/// Badges certify an agent's specialisations (e.g. Code Auditing, Translation,
+/// Market Making) with a benchmark `score` and an expiry. They are soulbound:
+/// they are bound to the agent id and cannot be transferred independently of
+/// the agent.
+///
+/// Fields:
+/// - `issuer`     — the address that minted the badge; the only address
+///                  allowed to revoke it.
+/// - `tag`        — the capability symbol (e.g. `code_audit`).
+/// - `score`      — issuer-attested benchmark score (0..=u32::MAX).
+/// - `issued_at`  — Unix timestamp (seconds) at issuance.
+/// - `expires_at` — Unix timestamp (seconds) after which the badge is inactive.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct Badge {
+    pub issuer: Address,
+    pub tag: Symbol,
+    pub score: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     NextId,
@@ -88,6 +116,10 @@ enum DataKey {
     Admin,
     /// Storage key for a delegate record: (agent_id, delegate_address). (#696)
     Delegate(u64, Address),
+    /// Storage key for a capability badge: (agent_id, tag). (#701)
+    Badges(u64, Symbol),
+    /// Admin-managed allowlist of addresses permitted to mint badges. (#701)
+    AuthorizedIssuer(Address),
 }
 
 // --- Events ---
@@ -147,6 +179,28 @@ pub struct DelegateRevoked {
     pub delegate: Address,
 }
 
+// --- #701 Badge events ---
+
+/// Emitted when a capability badge is minted for an agent.
+#[contractevent]
+pub struct BadgeIssued {
+    #[topic]
+    pub issuer: Address,
+    pub agent_id: u64,
+    pub tag: Symbol,
+    pub score: u32,
+    pub expires_at: u64,
+}
+
+/// Emitted when a capability badge is revoked by its issuer.
+#[contractevent]
+pub struct BadgeRevoked {
+    #[topic]
+    pub issuer: Address,
+    pub agent_id: u64,
+    pub tag: Symbol,
+}
+
 #[contract]
 pub struct AgentIdentityContract;
 
@@ -184,8 +238,9 @@ impl AgentIdentityContract {
     /// Initializer. Sets the contract admin address.
     /// Panics if the contract has already been initialized.
     ///
-    /// The admin is the only address authorised to call `upgrade()`. This must
-    /// be called once after deployment before any `upgrade` can be performed.
+    /// The admin is the only address authorised to call `upgrade()` and to
+    /// manage the badge issuer allowlist. This must be called once after
+    /// deployment before any `upgrade` can be performed.
     pub fn init(env: Env, admin: Address) {
         admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
@@ -321,6 +376,9 @@ impl AgentIdentityContract {
 
     /// Remove an agent from the registry. Caller must be the current owner.
     /// Frees the OwnerToId slot so the same address can re-register later.
+    ///
+    /// Any capability badges associated with the agent are archived (removed)
+    /// so that stale credentials cannot outlive the agent they attest to.
     pub fn deregister(env: Env, caller: Address, id: u64) {
         caller.require_auth();
         let agent: Agent = env
@@ -346,6 +404,18 @@ impl AgentIdentityContract {
                 .persistent()
                 .remove(&DataKey::OwnerToId(agent.owner.clone()));
         }
+
+        // #701 — archive/remove all badges bound to this agent so that
+        // credentials cannot be resolved for a deregistered agent.
+        let tags: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BadgeTags(id))
+            .unwrap_or_else(|| Vec::new(&env));
+        for tag in tags.iter() {
+            env.storage().persistent().remove(&DataKey::Badges(id, tag));
+        }
+        env.storage().persistent().remove(&DataKey::BadgeTags(id));
 
         let count: u32 = env
             .storage()
@@ -561,6 +631,8 @@ impl AgentIdentityContract {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #701 — Capability badges / verifiable credentials
     // -----------------------------------------------------------------------
 
     /// Fetch an agent by its id. Returns `None` if no such agent exists.
