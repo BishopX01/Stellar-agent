@@ -86,6 +86,21 @@ if ! stellar "${STELLAR_BUILD_ARGS[@]}"; then
   exit 1
 fi
 
+echo "==> Generating Python client from Soroban contract specs"
+if ! command -v python3 &> /dev/null; then
+  echo "WARNING: python3 not found; skipping Python client generation."
+  echo "         Install Python 3 to regenerate python/marc_stellar/ clients."
+elif [ ! -f scripts/generate-python-client.py ]; then
+  echo "WARNING: scripts/generate-python-client.py not found; skipping Python client generation."
+else
+  if python3 scripts/generate-python-client.py; then
+    echo "==> Python client generated successfully"
+  else
+    echo "WARNING: Python client generation failed; continuing build."
+    echo "         Ensure the generator's dependencies are installed (e.g. pip install -r python/requirements.txt)."
+  fi
+fi
+
 echo "==> Building SDK (TypeScript)"
 if ! ( cd sdk && npm run build ); then
   echo "ERROR: SDK build failed." >&2

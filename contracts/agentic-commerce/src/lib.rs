@@ -99,12 +99,25 @@ pub struct Job {
 }
 
 /// Evaluator quorum stored separately from `Job` to preserve existing job XDR.
+///
+/// #704 — Supports weighted voting: each evaluator may carry a distinct
+/// weight (`evaluator_weights`), and completion is triggered once the sum of
+/// the weights of approving evaluators (`accumulated_weight`) reaches
+/// `threshold`. For unweighted jobs created via `create_job_multi_eval`, every
+/// evaluator is assigned weight 1 and `total_weight == evaluators.len()`, so
+/// the weighted logic degenerates to the original 1-evaluator-1-vote quorum.
 #[contracttype]
 #[derive(Clone)]
 pub struct JobEvaluators {
     pub evaluators: Vec<Address>,
     pub threshold: u32,
     pub approvals: soroban_sdk::Map<Address, bool>,
+    /// #704 — per-evaluator voting weight. Absent entries are treated as 0.
+    pub evaluator_weights: soroban_sdk::Map<Address, u32>,
+    /// #704 — sum of all evaluator weights, validated at job creation.
+    pub total_weight: u32,
+    /// #704 — running sum of weights of evaluators that have approved.
+    pub accumulated_weight: u32,
 }
 
 /// Monotonic payment commitment signed by the payer's channel key.
@@ -921,6 +934,10 @@ impl AgenticCommerceContract {
     }
 
     /// Create and fund a high-value job with an explicit evaluator quorum.
+    ///
+    /// #704 — Backward-compatible unweighted path: every evaluator is assigned
+    /// weight 1, so `total_weight == evaluators.len()` and the weighted
+    /// threshold check degenerates to the original raw-count quorum.
     #[allow(clippy::too_many_arguments)]
     pub fn create_job_multi_eval(
         env: Env,
@@ -1024,12 +1041,169 @@ impl AgenticCommerceContract {
             fee_bps,
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
+        // #704 — assign weight 1 to every evaluator for the unweighted path.
+        let mut weights: soroban_sdk::Map<Address, u32> = soroban_sdk::Map::new(&env);
+        let mut widx = 0u32;
+        while widx < evaluators.len() {
+            weights.set(evaluators.get(widx).unwrap(), 1u32);
+            widx += 1;
+        }
+        let total_weight = evaluators.len();
         env.storage().persistent().set(
             &DataKey::Evaluators(next),
             &JobEvaluators {
                 evaluators,
                 threshold,
                 approvals: soroban_sdk::Map::new(&env),
+                evaluator_weights: weights,
+                total_weight,
+                accumulated_weight: 0,
+            },
+        );
+        env.storage().instance().set(&DataKey::NextId, &(next + 1));
+        JobCreated {
+            client: client_addr,
+            job_id: next,
+            budget,
+        }
+        .publish(&env);
+        next
+    }
+
+    /// #704 — Create and fund a job with a weighted evaluator quorum.
+    ///
+    /// `weights[i]` is the voting weight of `evaluators[i]`. Each weight must
+    /// be strictly positive, and the sum of all weights (`total_weight`) must
+    /// be at least `weight_threshold` so the quorum is actually reachable.
+    /// Completion is triggered once the accumulated weight of approving
+    /// evaluators reaches `weight_threshold`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_job_multi_eval_weighted(
+        env: Env,
+        client_addr: Address,
+        provider: Address,
+        evaluators: Vec<Address>,
+        weights: Vec<u32>,
+        weight_threshold: u32,
+        token: Address,
+        budget: i128,
+        description: String,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        client_addr.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+        if budget < MIN_BUDGET {
+            panic!("budget below minimum");
+        }
+        let multi_eval_threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiEvalThreshold)
+            .unwrap_or(DEFAULT_MULTI_EVAL_THRESHOLD);
+        if budget <= multi_eval_threshold {
+            panic!("job does not meet multi-evaluator threshold");
+        }
+        if evaluators.is_empty()
+            || evaluators.len() > MAX_EVALUATORS
+            || weights.len() != evaluators.len()
+            || weight_threshold == 0
+        {
+            panic!("invalid evaluator quorum");
+        }
+        if provider == client_addr {
+            panic_with_error!(&env, Error::SelfEscrow);
+        }
+        // Validate evaluators: no provider, no duplicates, and build the
+        // weight map while summing total weight.
+        let mut weight_map: soroban_sdk::Map<Address, u32> = soroban_sdk::Map::new(&env);
+        let mut total_weight: u32 = 0;
+        let mut index = 0u32;
+        while index < evaluators.len() {
+            let evaluator = evaluators.get(index).unwrap();
+            if evaluator == provider {
+                panic_with_error!(&env, Error::InvalidParties);
+            }
+            let weight = weights.get(index).unwrap();
+            if weight == 0 {
+                panic!("evaluator weight must be positive");
+            }
+            let mut previous = 0;
+            while previous < index {
+                if evaluators.get(previous).unwrap() == evaluator {
+                    panic!("duplicate evaluator");
+                }
+                previous += 1;
+            }
+            weight_map.set(evaluator, weight);
+            total_weight = total_weight
+                .checked_add(weight)
+                .expect("total weight overflow");
+            index += 1;
+        }
+        // Acceptance criteria: sum of weights must be >= weight_threshold.
+        if total_weight < weight_threshold {
+            panic!("total weight below threshold");
+        }
+
+        // #694 — reject tokens not on the approved whitelist.
+        // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
+        // is skipped so the contract can still be used before whitelist setup.
+        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+            let list: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AllowedTokenList)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !list.is_empty() {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+        }
+
+        let next: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+        let token_client = token::TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+        token_client.balance(&contract_addr);
+        token_client.transfer(&client_addr, &contract_addr, &budget);
+
+        let now = env.ledger().timestamp();
+        let primary_evaluator = evaluators.get(0).unwrap();
+        let job = Job {
+            id: next,
+            client: client_addr.clone(),
+            provider,
+            evaluator: primary_evaluator,
+            token,
+            budget,
+            released: 0,
+            status: JobStatus::Funded,
+            description,
+            deliverable: String::from_str(&env, ""),
+            funded_at: now,
+            created_at: now,
+            updated_at: now,
+            fee_bps,
+        };
+        env.storage().persistent().set(&DataKey::Job(next), &job);
+        env.storage().persistent().set(
+            &DataKey::Evaluators(next),
+            &JobEvaluators {
+                evaluators,
+                threshold: weight_threshold,
+                approvals: soroban_sdk::Map::new(&env),
+                evaluator_weights: weight_map,
+                total_weight,
+                accumulated_weight: 0,
             },
         );
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
@@ -1134,7 +1308,16 @@ impl AgenticCommerceContract {
             panic_with_error!(&env, Error::NotEvaluator);
         }
         if env.storage().persistent().has(&DataKey::Evaluators(id)) {
-            panic!("multi-evaluator job requires approvals");
+            // #704 — for weighted jobs, require the accumulated weight to meet
+            // the threshold rather than a raw evaluator count.
+            let quorum: JobEvaluators = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Evaluators(id))
+                .unwrap();
+            if quorum.accumulated_weight < quorum.threshold {
+                panic!("multi-evaluator job requires approvals");
+            }
         }
         // #22 — evaluator may resolve a job in either Submitted or Disputed state.
         if job.status != JobStatus::Submitted && job.status != JobStatus::Disputed {
@@ -1176,7 +1359,14 @@ impl AgenticCommerceContract {
         .publish(&env);
     }
 
-    /// Record an evaluator approval and release escrow when quorum is reached.
+    /// Record an evaluator approval and release escrow when the weighted
+    /// quorum is reached.
+    ///
+    /// #704 — The caller's weight is looked up from `evaluator_weights` and
+    /// added to `accumulated_weight`. Duplicate approvals are rejected via the
+    /// `approvals` map so the same evaluator can never double-count weight.
+    /// Completion/payout is triggered once `accumulated_weight >= threshold`.
+    /// Returns the accumulated weight so far.
     pub fn approve_job(env: Env, evaluator: Address, job_id: u64) -> u32 {
         Self::require_not_paused(&env);
         evaluator.require_auth();
@@ -1203,30 +1393,32 @@ impl AgenticCommerceContract {
         if !member {
             panic!("not an assigned evaluator");
         }
+        // Prevent double counting: an evaluator may only approve once.
         if quorum.approvals.get(evaluator.clone()).unwrap_or(false) {
             panic!("evaluator already approved");
         }
+        // #704 — look up this evaluator's weight and accumulate it.
+        let weight = quorum.evaluator_weights.get(evaluator.clone()).unwrap_or(0);
         quorum.approvals.set(evaluator.clone(), true);
-        let mut approval_count = 0u32;
-        for address in quorum.evaluators.iter() {
-            if quorum.approvals.get(address).unwrap_or(false) {
-                approval_count += 1;
-            }
-        }
+        quorum.accumulated_weight = quorum
+            .accumulated_weight
+            .checked_add(weight)
+            .expect("accumulated weight overflow");
+        let accumulated_weight = quorum.accumulated_weight;
         env.storage()
             .persistent()
             .set(&DataKey::Evaluators(job_id), &quorum);
         JobApproved {
             evaluator: evaluator.clone(),
             job_id,
-            approvals: approval_count,
+            approvals: accumulated_weight,
             threshold: quorum.threshold,
         }
         .publish(&env);
-        if approval_count >= quorum.threshold {
+        if accumulated_weight >= quorum.threshold {
             Self::settle_job(&env, &mut job, job_id, evaluator);
         }
-        approval_count
+        accumulated_weight
     }
 
     fn settle_job(env: &Env, job: &mut Job, id: u64, evaluator: Address) {
@@ -1526,21 +1718,26 @@ impl AgenticCommerceContract {
         env.storage().persistent().get(&DataKey::Job(id))
     }
 
-    /// Read the evaluator list, quorum, and approval count for a multi-eval job.
+    /// Read the evaluator list, quorum, and accumulated approval weight for a
+    /// multi-eval job.
+    ///
+    /// #704 — The third tuple element is now the accumulated weight of
+    /// approving evaluators (which equals the raw approval count for
+    /// unweighted jobs where every evaluator has weight 1).
     pub fn get_evaluator_progress(env: Env, id: u64) -> Option<(Vec<Address>, u32, u32)> {
         let quorum: Option<JobEvaluators> = env
             .storage()
             .persistent()
             .get(&DataKey::Evaluators(id));
         quorum.map(|quorum| {
-            let mut approvals = 0u32;
-            for evaluator in quorum.evaluators.iter() {
-                if quorum.approvals.get(evaluator).unwrap_or(false) {
-                    approvals += 1;
-                }
-            }
-            (quorum.evaluators, quorum.threshold, approvals)
+            (quorum.evaluators, quorum.threshold, quorum.accumulated_weight)
         })
+    }
+
+    /// #704 — Read the full weighted quorum state for a job, including the
+    /// per-evaluator weights, total weight, and accumulated approval weight.
+    pub fn get_evaluator_weights(env: Env, id: u64) -> Option<JobEvaluators> {
+        env.storage().persistent().get(&DataKey::Evaluators(id))
     }
 
     /// Open a one-way channel by escrowing a fixed token deposit.
