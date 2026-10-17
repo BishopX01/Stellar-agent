@@ -1,5 +1,9 @@
 import { rpc as StellarRpc } from "@stellar/stellar-sdk";
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { EventStore, type InsertEventParams } from "./db.js";
+import { ReputationEngine } from "./reputation.js";
+
+const tracer = trace.getTracer("bear-indexer-poller");
 
 export type SorobanRpcClient = {
   getEvents(
@@ -75,7 +79,33 @@ export type PollerOptions = {
   batchSize?: number;
   /** Emit debug logs. Default: false */
   debug?: boolean;
+  /** Optional reputation engine used to recalculate scores on settlement. */
+  reputation?: ReputationEngine;
 };
+
+/** Event types that affect an agent's reputation score. */
+const REPUTATION_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "JobCompleted",
+  "JobDisputed",
+]);
+
+/**
+ * Best-effort extraction of the agent address from a raw Soroban event.
+ * Job events carry the provider agent as one of their topics; we scan the
+ * topics for the first string-like value that is not the event name.
+ */
+function extractAgentId(event: StellarRpc.Api.EventResponse): string | null {
+  const topics = event.topic ?? [];
+  for (let i = 1; i < topics.length; i++) {
+    const topic = topics[i] as unknown;
+    if (typeof topic === "string") return topic;
+    if (topic && typeof topic === "object") {
+      const value = (topic as Record<string, unknown>).value;
+      if (typeof value === "string") return value;
+    }
+  }
+  return null;
+}
 
 /**
  * Continuously polls Soroban RPC for new contract events and persists them
@@ -89,6 +119,7 @@ export class SorobanEventPoller {
   private readonly intervalMs: number;
   private readonly batchSize: number;
   private readonly debug: boolean;
+  private readonly reputation: ReputationEngine | null;
 
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
@@ -107,6 +138,7 @@ export class SorobanEventPoller {
     this.intervalMs = opts.intervalMs ?? 5_000;
     this.batchSize = opts.batchSize ?? 100;
     this.debug = opts.debug ?? false;
+    this.reputation = opts.reputation ?? null;
   }
 
   private log(msg: string): void {
@@ -120,11 +152,51 @@ export class SorobanEventPoller {
     return last !== null ? last + 1 : this.startLedger;
   }
 
+  /** Recalculate reputation for agents affected by settlement events. */
+  private updateReputation(events: StellarRpc.Api.EventResponse[]): void {
+    if (!this.reputation) return;
+
+    const agents = new Set<string>();
+    for (const ev of events) {
+      const params = toInsertParams(ev, 0);
+      if (!REPUTATION_EVENT_TYPES.has(params.event_type)) continue;
+      const agentId = extractAgentId(ev);
+      if (agentId) agents.add(agentId);
+    }
+
+    for (const agentId of agents) {
+      try {
+        this.reputation.recalculate(agentId);
+        this.log(`Recalculated reputation for agent ${agentId}`);
+      } catch (err) {
+        console.error(
+          `[indexer] Failed to recalculate reputation for ${agentId}:`,
+          (err as Error).message,
+        );
+      }
+    }
+  }
+
   private async poll(): Promise<void> {
     const fromLedger = this.getFromLedger();
 
     try {
-      const latest = await this.rpc.getLatestLedger();
+      const latest = await tracer.startActiveSpan(
+        "soroban.getLatestLedger",
+        async (span: Span) => {
+          try {
+            const res = await this.rpc.getLatestLedger();
+            span.setAttribute("stellar.ledger.sequence", res.sequence);
+            return res;
+          } catch (err) {
+            span.recordException(err as Error);
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw err;
+          } finally {
+            span.end();
+          }
+        },
+      );
       if (fromLedger > latest.sequence) {
         this.log(`Up to date at ledger ${latest.sequence}`);
         return;
@@ -133,16 +205,33 @@ export class SorobanEventPoller {
       // Query each contract separately to stay within RPC limits
       for (const contractId of this.contracts) {
         try {
-          const response = await this.rpc.getEvents({
-            startLedger: fromLedger,
-            filters: [
-              {
-                type: "contract",
-                contractIds: [contractId],
-              },
-            ],
-            limit: this.batchSize,
-          });
+          const response = await tracer.startActiveSpan(
+            "soroban.getEvents",
+            async (span: Span) => {
+              span.setAttribute("stellar.contract.id", contractId);
+              span.setAttribute("stellar.ledger.start", fromLedger);
+              try {
+                const res = await this.rpc.getEvents({
+                  startLedger: fromLedger,
+                  filters: [
+                    {
+                      type: "contract",
+                      contractIds: [contractId],
+                    },
+                  ],
+                  limit: this.batchSize,
+                });
+                span.setAttribute("stellar.events.count", res.events?.length ?? 0);
+                return res;
+              } catch (err) {
+                span.recordException(err as Error);
+                span.setStatus({ code: SpanStatusCode.ERROR });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
+          );
 
           if (!response.events || response.events.length === 0) continue;
 
@@ -160,7 +249,21 @@ export class SorobanEventPoller {
             return toInsertParams(ev as StellarRpc.Api.EventResponse, closeTime);
           });
 
-          this.store.insertMany(inserts);
+          tracer.startActiveSpan("indexer.persistEvents", (span: Span) => {
+            try {
+              span.setAttribute("stellar.events.count", inserts.length);
+              this.store.insertMany(inserts);
+            } catch (err) {
+              span.recordException(err as Error);
+              span.setStatus({ code: SpanStatusCode.ERROR });
+              throw err;
+            } finally {
+              span.end();
+            }
+          });
+
+          this.updateReputation(response.events as StellarRpc.Api.EventResponse[]);
+
           this.log(
             `Indexed ${inserts.length} events from contract ${contractId} (ledgers ${fromLedger}+)`,
           );

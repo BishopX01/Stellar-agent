@@ -28,6 +28,11 @@
     "docs": "typedoc --options typedoc.json"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.52.0",
+    "@opentelemetry/resources": "^1.25.0",
+    "@opentelemetry/sdk-trace-node": "^1.25.0",
+    "@opentelemetry/semantic-conventions": "^1.25.0",
     "@stellar/freighter-api": "^2.0.0",
     "@stellar/stellar-sdk": "^12.0.0",
     "@x402/core": "^2.27.0",
@@ -36,8 +41,22 @@
     "@x402/stellar": "^2.27.0",
     "express": "^5.2.1"
   },
+  "peerDependencies": {
+    "@aws-sdk/client-kms": "^3.600.0",
+    "node-vault": "^0.10.2"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-kms": {
+      "optional": true
+    },
+    "node-vault": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@aws-sdk/client-kms": "^3.600.0",
     "jsdom": "^24.0.0",
+    "node-vault": "^0.10.2",
     "typedoc": "^0.25.0",
     "typescript": "^5.4.0",
     "vitest": "^1.6.0"
@@ -47,7 +66,11 @@
     "soroban",
     "identity",
     "commerce",
-    "freighter"
+    "freighter",
+    "opentelemetry",
+    "tracing",
+    "kms",
+    "vault"
   ],
   "license": "MIT"
 }

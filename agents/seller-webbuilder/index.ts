@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import rateLimit from "express-rate-limit";
 import Groq from "groq-sdk";
 import { CommerceClient } from "marc-stellar-sdk";
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import {
   createSellerAgent,
   makeSellerResponse,
@@ -13,9 +14,11 @@ import {
   isMockLlm,
   MOCK_DELIVERABLES,
   callLlmWithRetry,
+  initTracing,
 } from "../shared.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
+=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4501);
@@ -28,6 +31,26 @@ const { app, seller, cfg } = await createSellerAgent({
   id: AGENT_ID,
   port: PORT,
   agentDir: AGENT_DIR,
+});
+
+const tracer = initTracing(AGENT_ID).getTracer(AGENT_ID);
+
+app.use((req, res, next) => {
+  const span = tracer.startSpan(`${req.method} ${req.path}`, {
+    attributes: {
+      "http.method": req.method,
+      "http.route": req.path,
+      "http.target": req.originalUrl,
+      "http.user_agent": req.headers["user-agent"] ?? "",
+      "agent.id": AGENT_ID,
+    },
+  });
+  res.on("finish", () => {
+    span.setAttribute("http.status_code", res.statusCode);
+    if (res.statusCode >= 500) span.setStatus({ code: SpanStatusCode.ERROR });
+    span.end();
+  });
+  next();
 });
 
 const startTime = Date.now();
@@ -74,17 +97,28 @@ async function generate(prompt: string): Promise<string> {
   if (isMockLlm()) {
     return MOCK_DELIVERABLES.webbuilder;
   }
-  const res = await callLlmWithRetry(
-    () =>
-      groq!.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.7,
-      }),
-    3,
-    AGENT_ID,
-  );
-  return res.choices[0].message.content ?? "";
+  return tracer.startActiveSpan("llm.generate", async (span: Span) => {
+    span.setAttribute("llm.model", GROQ_MODEL);
+    span.setAttribute("llm.provider", "groq");
+    try {
+      const res = await callLlmWithRetry(
+        () =>
+          groq!.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+          }),
+        3,
+        AGENT_ID,
+      );
+      return res.choices[0].message.content ?? "";
+    } catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
 interface BuildSpec {
@@ -182,17 +216,28 @@ app.post("/job", limiter, async (req, res) => {
     console.log(`[${AGENT_ID}] Website built (${stripped.length} chars) → ${deliverable}`);
 
     const commerce = new CommerceClient(cfg);
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    await tracer.startActiveSpan("commerce.submit", async (span: Span) => {
+      span.setAttribute("job.id", jobId);
+      span.setAttribute("deliverable.url", deliverable);
       try {
-        await commerce.submit(seller, BigInt(jobId), deliverable);
-        console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
-        break;
-      } catch (e) {
-        if (attempt === 5) throw e;
-        console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
-        await new Promise((r) => setTimeout(r, 4000));
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          try {
+            await commerce.submit(seller, BigInt(jobId), deliverable);
+            console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
+            break;
+          } catch (e) {
+            if (attempt === 5) throw e;
+            console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
+            await new Promise((r) => setTimeout(r, 4000));
+          }
+        }
+      } catch (err) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        throw err;
+      } finally {
+        span.end();
       }
-    }
+    });
     jobsCompleted++;
   } catch (err) {
     jobsFailed++;
@@ -205,7 +250,10 @@ app.post("/job", limiter, async (req, res) => {
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
 const shutdown = () => {
   console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
+  server.close(() => {
+    void trace.getTracer(AGENT_ID).startActiveSpan("shutdown", (span) => span.end());
+    process.exit(0);
+  });
   setTimeout(() => process.exit(1), 5000);
 };
 process.on("SIGINT", shutdown);

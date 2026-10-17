@@ -19,7 +19,9 @@ import {
   scValToNative,
   StrKey,
   Networks,
+  Utils,
 } from "@stellar/stellar-sdk";
+import { trace, context, propagation, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { cfg, rpcUrls, buyerKeypair, sellerKeypair, getKeypair, DEMO_MODE } from "./lib/config.js";
 import {
   getAllAgents,
@@ -33,8 +35,6 @@ import {
   getFeeBps,
 } from "./lib/discovery.js";
 import {
-  generateNonce,
-  verifyNonceSignature,
   createSession,
   refreshSession,
   verifySession,
@@ -45,6 +45,51 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// ── #726: OpenTelemetry distributed tracing ─────────────────────────────────
+// The SDK is initialized in ./lib/tracing.js (imported for its side effects at
+// process startup). Here we obtain a tracer and install HTTP middleware that
+// extracts W3C traceparent headers and starts a server span per request.
+const tracer = trace.getTracer("marc-dashboard", "1.0.0");
+
+function tracingMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Extract incoming W3C trace context (traceparent/tracestate) from headers.
+  const parentContext = propagation.extract(context.active(), req.headers);
+  const span = tracer.startSpan(
+    `${req.method} ${req.path}`,
+    {
+      kind: 1, // SpanKind.SERVER
+      attributes: {
+        "http.method": req.method,
+        "http.target": req.originalUrl || req.url,
+        "http.route": req.path,
+        "http.scheme": req.protocol,
+        "http.host": req.headers.host ?? "",
+        "http.user_agent": req.headers["user-agent"] ?? "",
+      },
+    },
+    parentContext,
+  );
+
+  // Make the span active for the remainder of the request lifecycle.
+  context.with(trace.setSpan(parentContext, span), () => {
+    (req as any).span = span;
+    res.on("finish", () => {
+      span.setAttribute("http.status_code", res.statusCode);
+      if (res.statusCode >= 500) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+      }
+      span.end();
+    });
+    res.on("close", () => {
+      if (!span.isRecording()) return;
+      span.end();
+    });
+    next();
+  });
+}
+
+app.use(tracingMiddleware);
 
 // ── #778: Strict Content Security Policy with per-request nonces ─────────────
 // Generate a fresh cryptographic nonce for every request. The nonce is stored
@@ -171,6 +216,51 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
     }
   }
   throw lastError instanceof Error ? lastError : new Error("All Stellar RPC providers failed");
+}
+
+/**
+ * #726: Wrap a Stellar RPC call in a custom span so the trace waterfall shows
+ * the exact latency of simulation / submission / account lookups.
+ */
+async function tracedRpc<T>(
+  name: string,
+  attributes: Record<string, string | number>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return tracer.startActiveSpan(`stellar.rpc ${name}`, async (span: Span) => {
+    span.setAttribute("rpc.system", "stellar");
+    for (const [k, v] of Object.entries(attributes)) span.setAttribute(k, v);
+    try {
+      const result = await fn();
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/** #726: Wrap a discovery/database query in a custom span. */
+async function tracedDb<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  return tracer.startActiveSpan(`db ${name}`, async (span: Span) => {
+    span.setAttribute("db.system", "marc-discovery");
+    span.setAttribute("db.operation", name);
+    try {
+      const result = await fn();
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
 const identityContract = new Contract(cfg.identityContract);
@@ -381,28 +471,49 @@ app.get("/health", async (_req, res) => {
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
-// --- Authentication Endpoints ---
+// --- Authentication Endpoints (SEP-0010) ---
 
-/** GET /api/auth/challenge — Request a nonce to sign for wallet verification */
+// #728: SEP-0010 server signing key. Used to sign the challenge transaction so
+// wallets can verify the home domain. Falls back to the seller keypair in demo
+// mode when no dedicated SEP-0010 key is configured.
+const SEP10_SERVER_KEYPAIR = process.env.SEP10_SERVER_SECRET
+  ? Keypair.fromSecret(process.env.SEP10_SERVER_SECRET)
+  : sellerKeypair;
+const SEP10_HOME_DOMAIN = process.env.SEP10_HOME_DOMAIN ?? "localhost";
+const SEP10_WEB_AUTH_DOMAIN = process.env.SEP10_WEB_AUTH_DOMAIN ?? SEP10_HOME_DOMAIN;
+const SEP10_CHALLENGE_TIMEOUT_SECONDS = 300;
+
+/**
+ * GET /api/auth/challenge — Issue a SEP-0010 challenge transaction.
+ * Query: { publicKey }
+ * Returns the base64 challenge XDR for the wallet to sign.
+ */
 app.get("/api/auth/challenge", async (req, res) => {
   try {
     const publicKeySchema = z.object({
       publicKey: stellarAddressSchema,
     });
     const parsed = publicKeySchema.parse(req.query);
-    const nonce = generateNonce(parsed.publicKey);
-    const account = await withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey));
-    const challengeTx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: cfg.networkPassphrase,
-    })
-      .addOperation(Operation.manageData({ name: "marc-auth", value: nonce }))
-      .setTimeout(300)
-      .build();
+    const account = await tracedRpc(
+      "getAccount",
+      { "rpc.method": "getAccount", "stellar.account": parsed.publicKey },
+      () => withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey)),
+    );
+    const challengeTx = Utils.buildChallengeTx(
+      SEP10_SERVER_KEYPAIR,
+      parsed.publicKey,
+      SEP10_HOME_DOMAIN,
+      SEP10_CHALLENGE_TIMEOUT_SECONDS,
+      cfg.networkPassphrase,
+      SEP10_WEB_AUTH_DOMAIN,
+      cfg.networkPassphrase === Networks.PUBLIC ? undefined : cfg.networkPassphrase,
+    );
+    // buildChallengeTx builds its own sequence number; the account lookup above
+    // validates the account exists on-chain before issuing a challenge.
+    void account;
     res.json({
-      nonce,
-      message: `Sign this nonce to authenticate: ${nonce}`,
-      xdr: challengeTx.toXDR(),
+      transaction: challengeTx.toXDR(),
+      network_passphrase: cfg.networkPassphrase,
     });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
@@ -411,27 +522,33 @@ app.get("/api/auth/challenge", async (req, res) => {
 });
 
 /**
- * POST /api/auth/verify — Verify signed nonce and receive session token.
- * Body: { publicKey, nonce, signedXdr }
+ * POST /api/auth/token — Verify a signed SEP-0010 challenge and issue a JWT.
+ * Body: { transaction }
  */
-app.post("/api/auth/verify", (req, res) => {
+app.post("/api/auth/token", (req, res) => {
   try {
     const authSchema = z.object({
-      publicKey: stellarAddressSchema,
-      nonce: z.string().min(1),
-      signedXdr: z.string().min(1),
+      transaction: z.string().min(1),
     });
     const parsed = authSchema.parse(req.body);
 
-    // Verify the signature proves wallet ownership
-    if (!verifyNonceSignature(parsed.publicKey, parsed.nonce, parsed.signedXdr)) {
-      res.status(401).json({ error: "Invalid signature or expired nonce" });
+    let clientPublicKey: string;
+    try {
+      clientPublicKey = Utils.verifyChallengeTx(
+        parsed.transaction,
+        SEP10_SERVER_KEYPAIR.publicKey(),
+        cfg.networkPassphrase,
+        SEP10_HOME_DOMAIN,
+        SEP10_WEB_AUTH_DOMAIN,
+      );
+    } catch (err: unknown) {
+      res.status(401).json({ error: `Invalid challenge transaction: ${(err as Error).message}` });
       return;
     }
 
-    // Create authenticated session
-    const token = createSession(parsed.publicKey);
-    res.json({ token, publicKey: parsed.publicKey });
+    // Issue a 24-hour JWT session token bound to the verified client key.
+    const token = createSession(clientPublicKey);
+    res.json({ token, publicKey: clientPublicKey });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(400).json({ error: (err as Error).message });
@@ -490,7 +607,7 @@ function optionalAuthMiddleware(req: Request, res: Response, next: NextFunction)
   if (!token) {
     res.status(401).json({
       error:
-        "Authentication required. Use /api/auth/challenge and /api/auth/verify to authenticate.",
+        "Authentication required. Use /api/auth/challenge and /api/auth/token to authenticate.",
     });
     return;
   }
@@ -573,7 +690,11 @@ async function simulateReadCall(contract: Contract, method: string): Promise<unk
     .addOperation(op)
     .setTimeout(30)
     .build();
-  const sim = await withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx));
+  const sim = await tracedRpc(
+    "simulateTransaction",
+    { "rpc.method": "simulateTransaction", "stellar.contract": contract.contractId(), "stellar.method": method },
+    () => withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx)),
+  );
   if (rpc.Api.isSimulationError(sim)) return null;
   const result = (sim as rpc.Api.SimulateTransactionSuccessResponse).result;
   if (!result) return null;
@@ -610,7 +731,11 @@ async function getTokenBalance(pubkey: string): Promise<string> {
       .addOperation(op)
       .setTimeout(30)
       .build();
-    const sim = await withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx));
+    const sim = await tracedRpc(
+      "simulateTransaction",
+      { "rpc.method": "simulateTransaction", "stellar.contract": cfg.usdcToken, "stellar.method": "balance" },
+      () => withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx)),
+    );
     if (rpc.Api.isSimulationError(sim)) return "0";
     const result = (sim as rpc.Api.SimulateTransactionSuccessResponse).result;
     if (!result) return "0";
@@ -651,7 +776,11 @@ app.get("/api/stats", async (req, res) => {
       res.json(statsCache.payload);
       return;
     }
-    const [agents, jobs, feeBps] = await Promise.all([getAllAgents(), getAllJobs(), getFeeBps()]);
+    const [agents, jobs, feeBps] = await Promise.all([
+      tracedDb("getAllAgents", () => getAllAgents()),
+      tracedDb("getAllJobs", () => getAllJobs()),
+      tracedDb("getFeeBps", () => getFeeBps()),
+    ]);
     const activeJobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted").length;
     const payload = {
       totalAgents: agents.length,
@@ -732,12 +861,12 @@ app.get("/api/wallets", async (_req, res) => {
 app.get("/api/agents", async (req, res) => {
   try {
     if (!("page" in req.query) && !("pageSize" in req.query)) {
-      const agents = await getAllAgents();
+      const agents = await tracedDb("getAllAgents", () => getAllAgents());
       res.json(serialize(agents));
       return;
     }
     const parsed = agentsQuerySchema.parse(req.query);
-    const agents = await getAgentsPage(parsed.page, parsed.pageSize);
+    const agents = await tracedDb("getAgentsPage", () => getAgentsPage(parsed.page, parsed.pageSize));
     res.json({ ...agents, items: serialize(agents.items) });
   } catch (err: unknown) {
     res.status(500).json({ error: (err as Error).message });
@@ -777,7 +906,7 @@ app.post(
 app.get("/api/jobs", async (req, res) => {
   try {
     const parsed = jobsQuerySchema.parse(req.query);
-    let jobs = await getAllJobs();
+    let jobs = await tracedDb("getAllJobs", () => getAllJobs());
     if (parsed.status === "Active") {
       jobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted");
     } else if (parsed.status) {
@@ -991,7 +1120,11 @@ const pendingTxHashes = new Set<string>();
 
 /** Build an unsigned, simulated transaction and return its XDR */
 async function buildTxXdr(publicKey: string, op: xdr.Operation): Promise<string> {
-  const account = await withRpcFallback((rpcServer) => rpcServer.getAccount(publicKey));
+  const account = await tracedRpc(
+    "getAccount",
+    { "rpc.method": "getAccount", "stellar.account": publicKey },
+    () => withRpcFallback((rpcServer) => rpcServer.getAccount(publicKey)),
+  );
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: cfg.networkPassphrase,
@@ -999,7 +1132,11 @@ async function buildTxXdr(publicKey: string, op: xdr.Operation): Promise<string>
     .addOperation(op)
     .setTimeout(30)
     .build();
-  const prepared = await withRpcFallback((rpcServer) => rpcServer.prepareTransaction(tx));
+  const prepared = await tracedRpc(
+    "prepareTransaction",
+    { "rpc.method": "prepareTransaction" },
+    () => withRpcFallback((rpcServer) => rpcServer.prepareTransaction(tx)),
+  );
   const hash = prepared.hash().toString("hex");
   pendingTxHashes.add(hash);
   return prepared.toXDR();
@@ -1157,14 +1294,26 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
     }
     pendingTxHashes.delete(submitHash);
 
-    const sent = await withRpcFallback((rpcServer) => rpcServer.sendTransaction(tx));
+    const sent = await tracedRpc(
+      "sendTransaction",
+      { "rpc.method": "sendTransaction", "stellar.tx.hash": submitHash },
+      () => withRpcFallback((rpcServer) => rpcServer.sendTransaction(tx)),
+    );
     if (sent.status === "ERROR") {
       throw new Error(`submit failed: ${sent.errorResult}`);
     }
-    let getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+    let getResp = await tracedRpc(
+      "getTransaction",
+      { "rpc.method": "getTransaction", "stellar.tx.hash": sent.hash },
+      () => withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash)),
+    );
     while (getResp.status === "NOT_FOUND") {
       await new Promise((r) => setTimeout(r, 1000));
-      getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+      getResp = await tracedRpc(
+        "getTransaction",
+        { "rpc.method": "getTransaction", "stellar.tx.hash": sent.hash },
+        () => withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash)),
+      );
     }
     if (getResp.status !== "SUCCESS") {
       throw new Error(`tx failed: ${getResp.status}`);

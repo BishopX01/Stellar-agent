@@ -67,6 +67,16 @@ export {
 // #781 — RPC failover pool (exported for advanced usage / observability)
 export { RpcFailoverPool, type RpcEndpointHealth } from "./baseClient.js";
 
+// #726 — OpenTelemetry distributed tracing bootstrap
+export {
+  initTracing,
+  getTracer,
+  injectTraceparent,
+  withSpan,
+  type InitTracingOptions,
+  type SpanAttributes,
+} from "./tracing.js";
+
 /**
  * The current semantic version of the `marc-stellar-sdk` package.
  *
