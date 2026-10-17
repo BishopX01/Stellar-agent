@@ -55,6 +55,8 @@ fn create_job_stores_and_returns_description() {
         &token_addr,
         &100_000i128,
         &description,
+        &0u64,
+        &0u32,
     );
 
     let job = client.get_job(&job_id).unwrap();
@@ -124,6 +126,8 @@ fn create_job_transfers_budget_into_escrow() {
         &token_addr,
         &budget,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
 
     assert_eq!(job_id, 1);
@@ -168,6 +172,8 @@ fn submit_flips_status_and_records_deliverable() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
 
     let hash = sample_hash(&env);
@@ -214,6 +220,8 @@ fn submit_rejects_non_provider() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     client.submit(
         &mallory,
@@ -241,6 +249,8 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
 
     let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -264,6 +274,8 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     let hash = sample_hash(&env);
     client.submit(
@@ -315,6 +327,8 @@ fn complete_rejects_non_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     let hash = sample_hash(&env);
     client.submit(
@@ -343,6 +357,8 @@ fn cancel_refunds_buyer_when_not_yet_submitted() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     assert_eq!(token.balance(&buyer), 900_000);
 
@@ -384,6 +400,8 @@ fn cancel_rejects_non_client() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "ipfs://job.json"),
+        &0u64,
+        &0u32,
     );
     client.cancel(&mallory, &id);
 }
@@ -441,6 +459,8 @@ fn create_job_rejects_call_before_init() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job before init"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -469,6 +489,8 @@ fn create_job_rejects_client_as_provider() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "self-escrow attempt"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -493,6 +515,8 @@ fn create_job_rejects_provider_as_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "provider-as-evaluator attempt"),
+        &0u64,
+        &0u32,
     );
 }
 
@@ -516,6 +540,8 @@ fn create_job_allows_client_as_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "buyer self-evaluates"),
+        &0u64,
+        &0u32,
     );
 
     let job = client.get_job(&job_id).unwrap();
@@ -577,6 +603,8 @@ fn complete_panics_on_double_complete() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
@@ -606,6 +634,8 @@ fn complete_panics_when_called_by_non_evaluator() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
@@ -636,6 +666,8 @@ fn submit_panics_when_called_by_non_provider() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     // interloper tries to submit on seller's behalf
     client.submit(
@@ -717,9 +749,36 @@ fn jobs_by_provider_returns_only_that_providers_jobs() {
     stellar_token.mint(&buyer, &1_000_000);
 
     let desc = String::from_str(&env, "job");
-    let id_a1 = client.create_job(&buyer, &seller_a, &buyer, &token_addr, &1_000i128, &desc);
-    client.create_job(&buyer, &seller_b, &buyer, &token_addr, &1_000i128, &desc);
-    let id_a2 = client.create_job(&buyer, &seller_a, &buyer, &token_addr, &1_000i128, &desc);
+    let id_a1 = client.create_job(
+        &buyer,
+        &seller_a,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    client.create_job(
+        &buyer,
+        &seller_b,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    let id_a2 = client.create_job(
+        &buyer,
+        &seller_a,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
 
     let seller_a_jobs = client.jobs_by_provider(&seller_a, &1u64, &10u32);
     assert_eq!(seller_a_jobs.len(), 2);
@@ -741,8 +800,26 @@ fn jobs_by_client_returns_only_that_clients_jobs() {
     stellar_token.mint(&buyer_b, &1_000_000);
 
     let desc = String::from_str(&env, "job");
-    client.create_job(&buyer_a, &seller, &buyer_a, &token_addr, &1_000i128, &desc);
-    let id_b = client.create_job(&buyer_b, &seller, &buyer_b, &token_addr, &1_000i128, &desc);
+    client.create_job(
+        &buyer_a,
+        &seller,
+        &buyer_a,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    let id_b = client.create_job(
+        &buyer_b,
+        &seller,
+        &buyer_b,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
 
     let buyer_b_jobs = client.jobs_by_client(&buyer_b, &1u64, &10u32);
     assert_eq!(buyer_b_jobs.len(), 1);
@@ -761,9 +838,36 @@ fn jobs_by_provider_respects_limit_and_start_id() {
     stellar_token.mint(&buyer, &1_000_000);
 
     let desc = String::from_str(&env, "job");
-    client.create_job(&buyer, &seller, &buyer, &token_addr, &1_000i128, &desc);
-    let id2 = client.create_job(&buyer, &seller, &buyer, &token_addr, &1_000i128, &desc);
-    client.create_job(&buyer, &seller, &buyer, &token_addr, &1_000i128, &desc);
+    client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    let id2 = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
+    client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000i128,
+        &desc,
+        &0u64,
+        &0u32,
+    );
 
     // limit=1 from the start returns only the first match.
     let first_page = client.jobs_by_provider(&seller, &1u64, &1u32);
@@ -807,6 +911,8 @@ fn cancel_panics_on_already_cancelled_job() {
         &token_addr,
         &100_000i128,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     client.cancel(&buyer, &id); // first cancel — OK
     client.cancel(&buyer, &id); // second cancel — must panic
@@ -851,6 +957,8 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
         &token_addr,
         &budget,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
@@ -891,6 +999,8 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
         &token_addr,
         &budget,
         &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
