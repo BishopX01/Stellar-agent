@@ -728,6 +728,196 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
+// GET /api/stats/historical — 30-day protocol analytics for the dashboard charts.
+// Aggregates daily volume, job counts, active jobs and settlement times from the
+// cached discovery helpers, plus top-earning agents and month-over-month deltas.
+const HISTORICAL_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+type HistoricalJob = {
+  id?: unknown;
+  status?: unknown;
+  budget?: unknown;
+  createdAt?: unknown;
+  completedAt?: unknown;
+  provider?: unknown;
+  seller?: unknown;
+};
+
+function toMs(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string") {
+    const asNum = Number(value);
+    if (Number.isFinite(asNum) && /^[0-9]+$/.test(value)) {
+      // Heuristic: treat large integers as unix seconds/ms, otherwise parse as date.
+      if (asNum > 1e12) return asNum;
+      if (asNum > 1e9) return asNum * 1000;
+    }
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function toBigIntSafe(value: unknown): bigint {
+  if (value === null || value === undefined) return 0n;
+  try {
+    return BigInt(value as string | number | bigint);
+  } catch {
+    return 0n;
+  }
+}
+
+function dayKey(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+app.get("/api/stats/historical", async (_req, res) => {
+  try {
+    const [agents, jobs] = await Promise.all([getAllAgents(), getAllJobs()]);
+    const now = Date.now();
+    const windowStart = now - HISTORICAL_DAYS * DAY_MS;
+    const prevWindowStart = windowStart - HISTORICAL_DAYS * DAY_MS;
+
+    // Pre-build the ordered list of day buckets (oldest → newest).
+    const buckets = new Map<
+      string,
+      { date: string; volume: bigint; jobCount: number; activeJobs: number; settlementSum: number; settlementCount: number }
+    >();
+    for (let i = HISTORICAL_DAYS - 1; i >= 0; i--) {
+      const key = dayKey(now - i * DAY_MS);
+      buckets.set(key, {
+        date: key,
+        volume: 0n,
+        jobCount: 0,
+        activeJobs: 0,
+        settlementSum: 0,
+        settlementCount: 0,
+      });
+    }
+
+    const earningsByProvider = new Map<string, bigint>();
+    let currentVolume = 0n;
+    let currentJobs = 0;
+    let currentSettlementSum = 0;
+    let currentSettlementCount = 0;
+    let prevVolume = 0n;
+    let prevJobs = 0;
+    let prevSettlementSum = 0;
+    let prevSettlementCount = 0;
+
+    for (const raw of jobs as HistoricalJob[]) {
+      const createdMs = toMs(raw.createdAt);
+      const completedMs = toMs(raw.completedAt);
+      const status = typeof raw.status === "string" ? raw.status : "";
+      const budget = toBigIntSafe(raw.budget);
+      const isActive = status === "Funded" || status === "Submitted" || status === "Active";
+
+      // Daily buckets only cover the current 30-day window.
+      if (createdMs !== null && createdMs >= windowStart && createdMs <= now) {
+        const bucket = buckets.get(dayKey(createdMs));
+        if (bucket) {
+          bucket.jobCount += 1;
+          bucket.volume += budget;
+          if (isActive) bucket.activeJobs += 1;
+        }
+      }
+
+      // Settlement time measured from creation to completion.
+      const settlementMs =
+        createdMs !== null && completedMs !== null && completedMs >= createdMs
+          ? completedMs - createdMs
+          : null;
+      if (settlementMs !== null && completedMs !== null) {
+        if (completedMs >= windowStart && completedMs <= now) {
+          const bucket = buckets.get(dayKey(completedMs));
+          if (bucket) {
+            bucket.settlementSum += settlementMs;
+            bucket.settlementCount += 1;
+          }
+          currentSettlementSum += settlementMs;
+          currentSettlementCount += 1;
+        } else if (completedMs >= prevWindowStart && completedMs < windowStart) {
+          prevSettlementSum += settlementMs;
+          prevSettlementCount += 1;
+        }
+      }
+
+      // Aggregate volume/jobs for current vs previous window (by creation date).
+      if (createdMs !== null) {
+        if (createdMs >= windowStart && createdMs <= now) {
+          currentVolume += budget;
+          currentJobs += 1;
+        } else if (createdMs >= prevWindowStart && createdMs < windowStart) {
+          prevVolume += budget;
+          prevJobs += 1;
+        }
+      }
+
+      // Top-earning agents: completed jobs credited to the provider.
+      if (status === "Completed" && completedMs !== null && completedMs >= windowStart) {
+        const provider = String(raw.provider ?? raw.seller ?? "");
+        if (provider) {
+          earningsByProvider.set(provider, (earningsByProvider.get(provider) ?? 0n) + budget);
+        }
+      }
+    }
+
+    const days = Array.from(buckets.values()).map((b) => ({
+      date: b.date,
+      volume: b.volume.toString(),
+      jobCount: b.jobCount,
+      activeJobs: b.activeJobs,
+      avgSettlementMs: b.settlementCount > 0 ? Math.round(b.settlementSum / b.settlementCount) : 0,
+    }));
+
+    const agentById = new Map<string, unknown>();
+    for (const agent of agents as Array<Record<string, unknown>>) {
+      const owner = String(agent.owner ?? agent.address ?? agent.publicKey ?? "");
+      if (owner) agentById.set(owner, agent.id ?? null);
+    }
+
+    const topAgents = Array.from(earningsByProvider.entries())
+      .map(([owner, earnings]) => ({
+        id: agentById.get(owner) ?? null,
+        owner,
+        earnings: earnings.toString(),
+      }))
+      .sort((a, b) => (BigInt(b.earnings) > BigInt(a.earnings) ? 1 : -1))
+      .slice(0, 10);
+
+    const currentAvgSettlementMs =
+      currentSettlementCount > 0 ? Math.round(currentSettlementSum / currentSettlementCount) : 0;
+    const prevAvgSettlementMs =
+      prevSettlementCount > 0 ? Math.round(prevSettlementSum / prevSettlementCount) : 0;
+
+    const pctDelta = (current: number, previous: number): number | null => {
+      if (previous === 0) return current === 0 ? 0 : null;
+      return Math.round(((current - previous) / previous) * 1000) / 10;
+    };
+
+    res.json({
+      days,
+      topAgents,
+      totals: {
+        volume: currentVolume.toString(),
+        jobs: currentJobs,
+        avgSettlementMs: currentAvgSettlementMs,
+      },
+      deltas: {
+        volumePct: pctDelta(Number(currentVolume), Number(prevVolume)),
+        jobsPct: pctDelta(currentJobs, prevJobs),
+        avgSettlementPct: pctDelta(currentAvgSettlementMs, prevAvgSettlementMs),
+      },
+    });
+  } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 app.get("/api/audit-trail", requireAuth, (_req, res) => {
   res.json(auditTrail.slice().reverse());
 });
