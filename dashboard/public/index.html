@@ -235,8 +235,128 @@
       </span>
     </template>
 
-    <!-- Toast container -->
-    <div class="toast-container" id="toasts"></div>
+    <!-- Wallet selector modal (#743) -->
+    <div
+      class="wallet-modal-overlay"
+      id="wallet-modal-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="wallet-modal-title"
+      aria-hidden="true"
+      hidden
+    >
+      <div class="wallet-modal" id="wallet-modal">
+        <div class="wallet-modal-header">
+          <h2 class="wallet-modal-title" id="wallet-modal-title">Connect a Stellar Wallet</h2>
+          <button
+            class="wallet-modal-close"
+            id="wallet-modal-close"
+            type="button"
+            aria-label="Close wallet selector"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <p class="wallet-modal-subtitle">
+          Choose a wallet provider. Installed browser extensions are detected automatically.
+        </p>
+        <ul class="wallet-provider-list" id="wallet-provider-list" role="list">
+          <li class="wallet-provider" data-wallet-id="freighter" role="listitem">
+            <button class="wallet-provider-btn" type="button" data-wallet-id="freighter">
+              <span class="wallet-provider-icon wallet-icon-freighter" aria-hidden="true">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 20V6a2 2 0 0 1 2-2h9l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" />
+                  <path d="M14 4v6h6" />
+                  <path d="M8 14h8M8 17h5" />
+                </svg>
+              </span>
+              <span class="wallet-provider-meta">
+                <span class="wallet-provider-name">Freighter</span>
+                <span class="wallet-provider-desc">Browser extension by Stellar Development Foundation</span>
+              </span>
+              <span class="wallet-installed-badge" data-installed-badge="freighter" hidden>Installed</span>
+            </button>
+          </li>
+          <li class="wallet-provider" data-wallet-id="xbull" role="listitem">
+            <button class="wallet-provider-btn" type="button" data-wallet-id="xbull">
+              <span class="wallet-provider-icon wallet-icon-xbull" aria-hidden="true">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="m8 8 8 8M16 8l-8 8" />
+                </svg>
+              </span>
+              <span class="wallet-provider-meta">
+                <span class="wallet-provider-name">xBull</span>
+                <span class="wallet-provider-desc">Multi-account wallet with hardware support</span>
+              </span>
+              <span class="wallet-installed-badge" data-installed-badge="xbull" hidden>Installed</span>
+            </button>
+          </li>
+          <li class="wallet-provider" data-wallet-id="albedo" role="listitem">
+            <button class="wallet-provider-btn" type="button" data-wallet-id="albedo">
+              <span class="wallet-provider-icon wallet-icon-albedo" aria-hidden="true">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 3a9 9 0 0 1 0 18" />
+                  <circle cx="12" cy="12" r="3" />
+                </svg>
+              </span>
+              <span class="wallet-provider-meta">
+                <span class="wallet-provider-name">Albedo</span>
+                <span class="wallet-provider-desc">Web-based signer, no extension required</span>
+              </span>
+              <span class="wallet-installed-badge" data-installed-badge="albedo" hidden>Installed</span>
+            </button>
+          </li>
+          <li class="wallet-provider" data-wallet-id="lobstr" role="listitem">
+            <button class="wallet-provider-btn" type="button" data-wallet-id="lobstr">
+              <span class="wallet-provider-icon wallet-icon-lobstr" aria-hidden="true">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3c3 3 5 6 5 9a5 5 0 0 1-10 0c0-3 2-6 5-9Z" />
+                  <path d="M12 21v-4" />
+                </svg>
+              </span>
+              <span class="wallet-provider-meta">
+                <span class="wallet-provider-name">Lobstr</span>
+                <span class="wallet-provider-desc">Popular Stellar wallet extension</span>
+              </span>
+              <span class="wallet-installed-badge" data-installed-badge="lobstr" hidden>Installed</span>
+            </button>
+          </li>
+        </ul>
+        <div class="wallet-modal-status" id="wallet-modal-status" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <!-- Network mismatch prompt (#743) -->
+    <div
+      class="wallet-network-overlay"
+      id="wallet-network-overlay"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="wallet-network-title"
+      aria-hidden="true"
+      hidden
+    >
+      <div class="wallet-network-modal">
+        <h2 class="wallet-network-title" id="wallet-network-title">Network Mismatch</h2>
+        <p class="wallet-network-text" id="wallet-network-text">
+          Your wallet is connected to a different network than this dashboard. Please switch networks in your wallet.
+        </p>
+        <div class="wallet-network-actions">
+          <button class="btn btn-secondary" id="wallet-network-dismiss" type="button">Dismiss</button>
+          <button class="btn btn-primary" id="wallet-network-retry" type="button">Re-check</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast container (also hosts optimistic progress/error toasts, #744) -->
+    <div class="toast-container" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+    <!-- Job lifecycle stepper mount point (#745) -->
+    <div id="job-stepper-root" class="job-stepper-root" aria-live="polite"></div>
 
     <!-- Transaction overlay -->
     <div class="tx-overlay" id="tx-overlay">

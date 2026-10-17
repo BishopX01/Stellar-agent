@@ -1,10 +1,60 @@
 import "dotenv/config";
 import express from "express";
 import { marcPaywall } from "marc-stellar-sdk";
+import { z } from "zod";
+
+const StrKeyEd25519PublicKeySchema = z
+  .string()
+  .regex(/^G[A-Z2-7]{55}$/, "must be a valid Stellar StrKey Ed25519 public key (G...)");
+
+const SellerMockEnvSchema = z.object({
+  PORT: z.coerce.number().int().min(1).max(65535).default(4510),
+  PAY_TO: StrKeyEd25519PublicKeySchema.default(
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  ),
+  X402_FACILITATOR_URL: z
+    .string()
+    .url("must be a valid URL")
+    .default("https://channels.openzeppelin.com/x402/testnet"),
+  X402_API_KEY: z.string().min(1, "must not be empty").optional(),
+});
+
+type SellerMockEnv = z.infer<typeof SellerMockEnvSchema>;
+
+function formatZodErrorTable(error: z.ZodError): string {
+  const rows = error.issues.map((issue) => ({
+    variable: issue.path.join(".") || "(root)",
+    problem: issue.message,
+  }));
+  const varWidth = Math.max("VARIABLE".length, ...rows.map((r) => r.variable.length));
+  const probWidth = Math.max("PROBLEM".length, ...rows.map((r) => r.problem.length));
+  const line = `+-${"-".repeat(varWidth)}-+-${"-".repeat(probWidth)}-+`;
+  const formatRow = (v: string, p: string) =>
+    `| ${v.padEnd(varWidth)} | ${p.padEnd(probWidth)} |`;
+  return [
+    line,
+    formatRow("VARIABLE", "PROBLEM"),
+    line,
+    ...rows.map((r) => formatRow(r.variable, r.problem)),
+    line,
+  ].join("\n");
+}
+
+function loadEnv(): SellerMockEnv {
+  const result = SellerMockEnvSchema.safeParse(process.env);
+  if (!result.success) {
+    console.error("[seller-mock] Invalid environment configuration:");
+    console.error(formatZodErrorTable(result.error));
+    process.exit(1);
+  }
+  return result.data;
+}
+
+const env = loadEnv();
+const port: number = env.PORT;
+const payTo: string = env.PAY_TO;
 
 const app = express();
-const port = Number(process.env.PORT ?? 4510);
-const payTo = process.env.PAY_TO ?? "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 app.use(express.json());
 
@@ -14,9 +64,8 @@ const mockPaywall = marcPaywall({
   network: "stellar:testnet",
   description: "Access the local mock seller agent",
   mimeType: "application/json",
-  facilitatorUrl:
-    process.env.X402_FACILITATOR_URL ?? "https://channels.openzeppelin.com/x402/testnet",
-  facilitatorApiKey: process.env.X402_API_KEY,
+  facilitatorUrl: env.X402_FACILITATOR_URL,
+  facilitatorApiKey: env.X402_API_KEY,
 });
 
 app.get("/health", (_req, res) => {

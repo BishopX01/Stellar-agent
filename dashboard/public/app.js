@@ -54,25 +54,95 @@
     };
   }
 
-  // ── Stellar Wallets Kit integration ──
+  // ── Stellar Wallets Kit integration (#743) ──
   const wallet = {
     connected: false,
     publicKey: null,
     network: null, // 'testnet' | 'mainnet' | null
+    provider: null, // 'freighter' | 'xbull' | 'albedo' | 'lobstr' | null
   };
   window.__walletState = wallet;
+
+  // Target network for the dashboard (Testnet). Used for mismatch prompts.
+  var TARGET_NETWORK = "testnet";
+  var TARGET_PASSPHRASE = "Test SDF Network ; September 2015";
+  var WALLET_STORAGE_KEY = "bear-wallet-provider";
+
+  // Provider metadata: brand icons + extension detection (#743)
+  var WALLET_PROVIDERS = [
+    {
+      id: "freighter",
+      name: "Freighter",
+      detect: function () {
+        return Boolean(window.freighterApi || window.freighter);
+      },
+      icon:
+        '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">' +
+        '<path d="M3 12h18M12 3v18"/><circle cx="12" cy="12" r="9"/></svg>',
+    },
+    {
+      id: "xbull",
+      name: "xBull",
+      detect: function () {
+        return Boolean(window.xBullSDK || (window.xBull && window.xBull.sign));
+      },
+      icon:
+        '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">' +
+        '<path d="M4 4l16 16M20 4L4 20"/></svg>',
+    },
+    {
+      id: "albedo",
+      name: "Albedo",
+      detect: function () {
+        return Boolean(window.albedo);
+      },
+      icon:
+        '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">' +
+        '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18"/></svg>',
+    },
+    {
+      id: "lobstr",
+      name: "Lobstr",
+      detect: function () {
+        return Boolean(window.lobstr || window.lobstrApi);
+      },
+      icon:
+        '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">' +
+        '<path d="M4 14c0-4 3-8 8-8s8 4 8 8-3 6-8 6-8-2-8-6z"/><circle cx="9" cy="12" r="1.2"/><circle cx="15" cy="12" r="1.2"/></svg>',
+    },
+  ];
+
+  function providerById(id) {
+    for (var i = 0; i < WALLET_PROVIDERS.length; i++) {
+      if (WALLET_PROVIDERS[i].id === id) return WALLET_PROVIDERS[i];
+    }
+    return null;
+  }
 
   // Initialize Stellar Wallets Kit (loaded via UMD script tag)
   var swkReady = false;
   var StellarWalletsKit, KitEventType, SwkAppDarkTheme, defaultModules;
+  var swkModules = null;
   if (window.MyWalletKit) {
     StellarWalletsKit = window.MyWalletKit.StellarWalletsKit;
     KitEventType = window.MyWalletKit.KitEventType;
     SwkAppDarkTheme = window.MyWalletKit.SwkAppDarkTheme;
     defaultModules = window.MyWalletKit.defaultModules;
+    // Configure explicit modules for Freighter, xBull, Albedo, Lobstr (#743)
+    try {
+      var mk = window.MyWalletKit;
+      var modules = [];
+      if (mk.FreighterModule) modules.push(new mk.FreighterModule());
+      if (mk.XbullModule) modules.push(new mk.XbullModule());
+      if (mk.AlbedoModule) modules.push(new mk.AlbedoModule());
+      if (mk.LobstrModule) modules.push(new mk.LobstrModule());
+      swkModules = modules.length ? modules : defaultModules();
+    } catch (e) {
+      swkModules = defaultModules();
+    }
     StellarWalletsKit.init({
       theme: SwkAppDarkTheme,
-      modules: defaultModules(),
+      modules: swkModules,
     });
     // Mount the connect button in sidebar
     var btnWrapper = document.getElementById("swk-button-wrapper");
@@ -100,90 +170,222 @@
       wallet.publicKey = addr;
       updateWalletUI();
     });
+    // Account switching / network mismatch events (#743)
+    try {
+      if (KitEventType.ACCOUNT_CHANGED) {
+        StellarWalletsKit.on(KitEventType.ACCOUNT_CHANGED, function (event) {
+          var addr =
+            event.payload &&
+            (event.payload.address ||
+              (event.payload.accounts &&
+                event.payload.accounts[0] &&
+                event.payload.accounts[0].address));
+          if (addr && addr.length > 10) handleAccountChanged(addr);
+        });
+      }
+      if (KitEventType.NETWORK_CHANGED) {
+        StellarWalletsKit.on(KitEventType.NETWORK_CHANGED, function (event) {
+          var net = event.payload && (event.payload.network || event.payload.networkPassphrase);
+          handleNetworkChanged(net);
+        });
+      }
+    } catch (e) {}
     swkReady = true;
   }
 
-  // Freighter detection: prefer Freighter if present
-  async function detectFreighter() {
-    try {
-      const api = window.freighterApi || window.freighter;
-      if (!api || typeof api.getPublicKey !== "function") return;
-      const pk = await api.getPublicKey();
-      if (!pk || pk.length <= 10) return;
-      let net = null;
-      if (typeof api.getNetwork === "function") {
-        try {
-          const n = await api.getNetwork();
-          if (String(n).toLowerCase().includes("test")) net = "testnet";
-          else if (
-            String(n).toLowerCase().includes("pub") ||
-            String(n).toLowerCase().includes("main")
-          )
-            net = "mainnet";
-        } catch (e) {}
-      }
-      wallet.connected = true;
-      wallet.publicKey = pk;
-      wallet.network = net;
-      previousPublicKey = pk; // Track for change detection (#575)
-      updateWalletUI();
-      if (typeof api.onNetworkChanged === "function") {
-        api.onNetworkChanged(function (n) {
-          let updatedNet = null;
-          if (String(n).toLowerCase().includes("test")) updatedNet = "testnet";
-          else if (
-            String(n).toLowerCase().includes("pub") ||
-            String(n).toLowerCase().includes("main")
-          )
-            updatedNet = "mainnet";
-          wallet.network = updatedNet;
-          updateWalletUI();
-        });
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  // Retry Freighter detection a few times on load
-  async function retryDetectFreighter(attempts) {
-    if (attempts <= 0) return;
-    await detectFreighter();
-    if (!wallet.connected) {
-      setTimeout(function () {
-        retryDetectFreighter(attempts - 1);
-      }, 1000);
-    }
-  }
-  retryDetectFreighter(3);
-
   // Track previous public key for account change detection (#575)
   var previousPublicKey = null;
+
+  function normalizeNetwork(n) {
+    var s = String(n || "").toLowerCase();
+    if (s.includes("test")) return "testnet";
+    if (s.includes("pub") || s.includes("main")) return "mainnet";
+    return null;
+  }
+
+  // Handle account switching: clear session, update state (#743)
+  function handleAccountChanged(newPk) {
+    if (previousPublicKey && previousPublicKey !== newPk) {
+      toast("Account changed to " + truncAddr(newPk), "info");
+      var token = window.__sessionToken;
+      if (token) {
+        fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + token },
+        }).catch(function () {});
+        window.__sessionToken = null;
+      }
+    }
+    wallet.publicKey = newPk;
+    previousPublicKey = newPk;
+    updateWalletUI();
+  }
+
+  // Handle network changes: prompt on mismatch (#743)
+  function handleNetworkChanged(n) {
+    var net = normalizeNetwork(n);
+    wallet.network = net;
+    updateWalletUI();
+    if (net && net !== TARGET_NETWORK) {
+      showNetworkMismatchPrompt(net);
+    }
+  }
+
+  function showNetworkMismatchPrompt(net) {
+    var overlay = showModal(
+      '<h2 class="modal-title">Network Mismatch</h2>' +
+        '<p style="color:var(--text-muted);margin-bottom:16px">Your wallet is connected to <strong>' +
+        escapeHtml(net === "mainnet" ? "Mainnet" : net) +
+        "</strong> but this dashboard targets <strong>Testnet</strong>. " +
+        "Signing is blocked on Mainnet to avoid real transactions.</p>" +
+        '<div class="modal-actions">' +
+        '<button class="btn btn-secondary" onclick="this.closest(\'.modal-overlay\').remove()">Dismiss</button>' +
+        '<button class="btn btn-primary" onclick="this.closest(\'.modal-overlay\').remove();window.__openWalletModal()">Switch Wallet</button>' +
+        "</div>",
+    );
+    return overlay;
+  }
+
+  // Persist selected provider for auto-reconnection (#743)
+  function persistProvider(id) {
+    try {
+      if (id) localStorage.setItem(WALLET_STORAGE_KEY, id);
+      else localStorage.removeItem(WALLET_STORAGE_KEY);
+    } catch (e) {}
+  }
+  function getPersistedProvider() {
+    try {
+      return localStorage.getItem(WALLET_STORAGE_KEY);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Responsive wallet selector modal with brand icons + installed detection (#743)
+  window.__openWalletModal = function () {
+    var cards = "";
+    for (var i = 0; i < WALLET_PROVIDERS.length; i++) {
+      var p = WALLET_PROVIDERS[i];
+      var installed = false;
+      try {
+        installed = p.detect();
+      } catch (e) {}
+      cards +=
+        '<button type="button" class="wallet-provider-card" data-provider="' +
+        escapeAttr(p.id) +
+        '" onclick="window.__selectWalletProvider(\'' +
+        p.id +
+        "')\" aria-label=\"Connect with " +
+        escapeAttr(p.name) +
+        '">' +
+        '<span class="wallet-provider-icon">' +
+        p.icon +
+        "</span>" +
+        '<span class="wallet-provider-name">' +
+        escapeHtml(p.name) +
+        "</span>" +
+        '<span class="wallet-provider-status ' +
+        (installed ? "installed" : "not-installed") +
+        '">' +
+        (installed ? "Detected" : "Not installed") +
+        "</span>" +
+        "</button>";
+    }
+    showModal(
+      '<h2 class="modal-title">Connect a Wallet</h2>' +
+        '<p style="color:var(--text-muted);margin-bottom:16px">Choose a Stellar wallet provider to connect.</p>' +
+        '<div class="wallet-provider-grid">' +
+        cards +
+        "</div>" +
+        '<div class="modal-actions">' +
+        '<button class="btn btn-secondary" onclick="this.closest(\'.modal-overlay\').remove()">Cancel</button>' +
+        "</div>",
+    );
+  };
+
+  // Connect using the selected provider via Stellar Wallets Kit (#743)
+  window.__selectWalletProvider = async function (id) {
+    var overlay = document.querySelector(".modal-overlay");
+    if (overlay) overlay.remove();
+    if (!swkReady) {
+      toast("Stellar Wallets Kit not loaded", "error");
+      return;
+    }
+    try {
+      if (typeof StellarWalletsKit.setWallet === "function") {
+        StellarWalletsKit.setWallet(id);
+      }
+      var res = await StellarWalletsKit.getAddress();
+      var addr = res && res.address;
+      if (!addr || addr.length <= 10) throw new Error("No address returned by wallet");
+      wallet.connected = true;
+      wallet.publicKey = addr;
+      wallet.provider = id;
+      previousPublicKey = addr;
+      persistProvider(id);
+      updateWalletUI();
+      toast("Connected with " + (providerById(id) ? providerById(id).name : id));
+      // Check network after connect
+      try {
+        if (typeof StellarWalletsKit.getNetwork === "function") {
+          var netRes = await StellarWalletsKit.getNetwork();
+          handleNetworkChanged(netRes && (netRes.network || netRes.networkPassphrase));
+        }
+      } catch (e) {}
+    } catch (e) {
+      notifyError(e);
+    }
+  };
+
+  // Auto-reconnect to the persisted provider on load (#743)
+  async function autoReconnect() {
+    var saved = getPersistedProvider();
+    if (!saved || !swkReady) return;
+    var p = providerById(saved);
+    if (!p) return;
+    var installed = false;
+    try {
+      installed = p.detect();
+    } catch (e) {}
+    if (!installed) return;
+    try {
+      if (typeof StellarWalletsKit.setWallet === "function") {
+        StellarWalletsKit.setWallet(saved);
+      }
+      var res = await StellarWalletsKit.getAddress();
+      var addr = res && res.address;
+      if (!addr || addr.length <= 10) return;
+      wallet.connected = true;
+      wallet.publicKey = addr;
+      wallet.provider = saved;
+      previousPublicKey = addr;
+      updateWalletUI();
+    } catch (e) {
+      // Silent — user can connect manually
+    }
+  }
+  autoReconnect();
 
   // Periodic poll for account changes (#575)
   async function checkAccountChange() {
     if (!wallet.connected) return;
     try {
-      const api = window.freighterApi || window.freighter;
-      if (!api || typeof api.getPublicKey !== "function") return;
-      const currentPk = await api.getPublicKey();
-      if (!currentPk || currentPk.length <= 10) return;
-
-      // Account changed detected
-      if (previousPublicKey && previousPublicKey !== currentPk) {
-        toast("Account changed to " + truncAddr(currentPk), "info");
-        // Clear session token
-        var token = window.__sessionToken;
-        if (token) {
-          fetch("/api/auth/logout", {
-            method: "POST",
-            headers: { Authorization: "Bearer " + token },
-          }).catch(function () {});
-          window.__sessionToken = null;
+      var currentPk = null;
+      if (swkReady && StellarWalletsKit && typeof StellarWalletsKit.getAddress === "function") {
+        try {
+          var res = await StellarWalletsKit.getAddress();
+          currentPk = res && res.address;
+        } catch (e) {}
+      }
+      if (!currentPk || currentPk.length <= 10) {
+        const api = window.freighterApi || window.freighter;
+        if (api && typeof api.getPublicKey === "function") {
+          currentPk = await api.getPublicKey();
         }
-        // Update wallet state
-        wallet.publicKey = currentPk;
-        updateWalletUI();
+      }
+      if (!currentPk || currentPk.length <= 10) return;
+      if (previousPublicKey && previousPublicKey !== currentPk) {
+        handleAccountChanged(currentPk);
       }
       previousPublicKey = currentPk;
     } catch (e) {
@@ -198,7 +400,9 @@
     wallet.connected = false;
     wallet.publicKey = null;
     wallet.network = null;
+    wallet.provider = null;
     previousPublicKey = null; // Clear account change tracking (#575)
+    persistProvider(null);
     // Clear all cached state so the next session starts fresh
     state.stats = null;
     state.wallets = null;
@@ -278,42 +482,30 @@
   /** Build unsigned tx on server, sign with Stellar Wallets Kit, submit via server */
   async function signAndSubmit(buildEndpoint, params) {
     await ensureSession();
+    if (wallet.network === "mainnet") {
+      throw new Error(
+        "Wallet is on Mainnet — dashboard blocks mainnet signing to avoid real transactions",
+      );
+    }
     // 1. Build unsigned tx on server
     var buildRes = await api(buildEndpoint, {
       method: "POST",
       body: { publicKey: wallet.publicKey, ...params },
     });
-    // 2. Sign with Stellar Wallets Kit
-    // Prefer Freighter if available
-    try {
-      const api = window.freighterApi || window.freighter;
-      if (api && typeof api.signTransaction === "function") {
-        if (wallet.network === "mainnet")
-          throw new Error(
-            "Freighter is on Mainnet — dashboard blocks mainnet signing to avoid real transactions",
-          );
-        const sigRes = await api.signTransaction(buildRes.xdr);
-        // Accept multiple possible response shapes
-        const signedXdr =
-          sigRes.signedTransaction ||
-          sigRes.signedTx ||
-          sigRes.signedTxXdr ||
-          sigRes.signedXdr ||
-          sigRes;
-        return await apiClientSubmit(signedXdr);
-      }
-    } catch (e) {
-      // Fall through to SWK path if Freighter signing fails
-      console.warn("Freighter signing failed, falling back to SWK:", e);
-    }
-
+    // 2. Sign with Stellar Wallets Kit (multi-wallet, #743)
     if (!swkReady) throw new Error("Stellar Wallets Kit not loaded");
-    var { address } = await StellarWalletsKit.getAddress();
-    var { signedTxXdr } = await StellarWalletsKit.signTransaction(buildRes.xdr, {
-      networkPassphrase: "Test SDF Network ; September 2015",
-      address: address,
+    var addressResult = await StellarWalletsKit.getAddress();
+    var signResult = await StellarWalletsKit.signTransaction(buildRes.xdr, {
+      networkPassphrase: TARGET_PASSPHRASE,
+      address: addressResult.address,
     });
-    return await apiClientSubmit(signedTxXdr);
+    var signedXdr =
+      signResult.signedTxXdr ||
+      signResult.signedTransaction ||
+      signResult.signedTx ||
+      signResult.signedXdr ||
+      signResult;
+    return await apiClientSubmit(signedXdr);
   }
 
   async function apiClientSubmit(signedXdr) {
@@ -339,8 +531,10 @@
         if (name && name.length > 0) return name;
       } catch (e) {}
     }
-    var freighter = window.freighterApi || window.freighter;
-    if (freighter && typeof freighter.getPublicKey === "function") return "Freighter";
+    if (wallet.provider) {
+      var p = providerById(wallet.provider);
+      if (p) return p.name;
+    }
     return "Wallet";
   }
 
@@ -419,24 +613,19 @@
   }
 
   async function signWalletTransaction(txXdr) {
-    const freighter = window.freighterApi || window.freighter;
-    if (freighter && typeof freighter.signTransaction === "function") {
-      const result = await freighter.signTransaction(txXdr);
-      return (
-        result.signedTransaction ||
-        result.signedTx ||
-        result.signedTxXdr ||
-        result.signedXdr ||
-        result
-      );
-    }
     if (!swkReady) throw new Error("Stellar Wallet Kit not loaded");
     const addressResult = await StellarWalletsKit.getAddress();
     const result = await StellarWalletsKit.signTransaction(txXdr, {
-      networkPassphrase: "Test SDF Network ; September 2015",
+      networkPassphrase: TARGET_PASSPHRASE,
       address: addressResult.address,
     });
-    return result.signedTxXdr;
+    return (
+      result.signedTxXdr ||
+      result.signedTransaction ||
+      result.signedTx ||
+      result.signedXdr ||
+      result
+    );
   }
 
   // ── Helpers ──
@@ -482,6 +671,198 @@
     const tip = escapeHtml(STATUS_TOOLTIPS[status] || status);
     return (
       '<span class="status-badge status-' + safe + '" title="' + tip + '"><span class="dot"></span>' + safe + "</span>"
+    );
+  }
+
+  // ── Optimistic UI helpers (#744) ──
+  // Tracks in-flight escrow actions to guard against double submission.
+  var inFlightActions = Object.create(null);
+
+  function isActionInFlight(key) {
+    return Boolean(inFlightActions[key]);
+  }
+
+  function beginOptimisticAction(key, opts) {
+    if (inFlightActions[key]) return false;
+    inFlightActions[key] = true;
+    opts = opts || {};
+    // Immediately disable buttons and show pending badge within 50ms
+    var row = opts.jobId != null ? document.getElementById("job-" + opts.jobId) : null;
+    if (row) {
+      row.classList.add("job-pending");
+      var buttons = row.querySelectorAll(".job-actions button");
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].disabled = true;
+        buttons[i].classList.add("btn-pending");
+      }
+      var summary = row.querySelector(".job-summary");
+      if (summary && !summary.querySelector(".pending-badge")) {
+        var badge = document.createElement("span");
+        badge.className = "pending-badge";
+        badge.setAttribute("role", "status");
+        badge.textContent = "In-Flight / Pending";
+        summary.appendChild(badge);
+      }
+    }
+    // Non-intrusive progress toast
+    showProgressToast(opts.label || "Submitting to Stellar…", opts.expertUrl);
+    return true;
+  }
+
+  function endOptimisticAction(key, success, opts) {
+    delete inFlightActions[key];
+    opts = opts || {};
+    var row = opts.jobId != null ? document.getElementById("job-" + opts.jobId) : null;
+    if (row) {
+      row.classList.remove("job-pending");
+      var buttons = row.querySelectorAll(".job-actions button");
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].disabled = false;
+        buttons[i].classList.remove("btn-pending");
+      }
+      var badge = row.querySelector(".pending-badge");
+      if (badge) badge.remove();
+    }
+    dismissProgressToast();
+  }
+
+  var progressToastEl = null;
+  function showProgressToast(text, expertUrl) {
+    dismissProgressToast();
+    if (!container) container = document.getElementById("toasts");
+    if (!container) return;
+    var el = document.createElement("div");
+    el.className = "toast progress";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    var spinner = document.createElement("span");
+    spinner.className = "toast-spinner";
+    el.appendChild(spinner);
+    var msg = document.createElement("span");
+    msg.textContent = text;
+    el.appendChild(msg);
+    if (expertUrl) {
+      var link = document.createElement("a");
+      link.href = expertUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.className = "toast-link";
+      link.textContent = "View on Stellar Expert ↗";
+      el.appendChild(link);
+    }
+    container.appendChild(el);
+    progressToastEl = el;
+  }
+  function dismissProgressToast() {
+    if (progressToastEl && progressToastEl.parentNode) {
+      progressToastEl.parentNode.removeChild(progressToastEl);
+    }
+    progressToastEl = null;
+  }
+
+  function stellarExpertUrl(hash) {
+    if (!hash) return null;
+    return "https://stellar.expert/explorer/testnet/tx/" + encodeURIComponent(hash);
+  }
+
+  // ── Job lifecycle stepper (#745) ──
+  // Visualizes Created -> Funded -> Submitted -> Evaluated -> Settled with
+  // branched Disputed / Cancelled paths. Accessible via ARIA attributes.
+  var LIFECYCLE_STEPS = ["Created", "Funded", "Submitted", "Evaluated", "Settled"];
+
+  function lifecycleIndexForStatus(status) {
+    switch (status) {
+      case "Open":
+        return 0;
+      case "Funded":
+        return 1;
+      case "Submitted":
+        return 2;
+      case "Completed":
+        return 4;
+      case "Disputed":
+        return 2;
+      case "Cancelled":
+      case "Rejected":
+        return -1;
+      default:
+        return 0;
+    }
+  }
+
+  function lifecycleRoleHint(status) {
+    switch (status) {
+      case "Open":
+        return "Waiting on Client to fund escrow";
+      case "Funded":
+        return "Waiting on Provider to submit work";
+      case "Submitted":
+        return "Waiting on Evaluator Approval";
+      case "Completed":
+        return "Settled — funds released to Provider";
+      case "Disputed":
+        return "Disputed — awaiting Evaluator resolution";
+      case "Cancelled":
+        return "Cancelled — funds refunded to Client";
+      case "Rejected":
+        return "Rejected — deliverable not accepted";
+      default:
+        return "";
+    }
+  }
+
+  function renderLifecycleStepper(job) {
+    if (!job) return "";
+    var status = job.status || "Open";
+    var activeIdx = lifecycleIndexForStatus(status);
+    var branched = status === "Disputed" || status === "Cancelled" || status === "Rejected";
+
+    var stepsHtml = "";
+    for (var i = 0; i < LIFECYCLE_STEPS.length; i++) {
+      var stepName = LIFECYCLE_STEPS[i];
+      var isComplete = !branched && i < activeIdx;
+      var isActive = !branched && i === activeIdx;
+      var cls = "lifecycle-step" + (isComplete ? " complete" : "") + (isActive ? " active" : "");
+      var tip = stepName;
+      if (isComplete) {
+        tip = stepName + " — completed";
+        if (job.created_at && i === 0) {
+          tip += " · " + new Date(Number(job.created_at) * 1000).toLocaleString();
+        }
+      }
+      stepsHtml +=
+        '<li class="' + cls + '" aria-current="' + (isActive ? "step" : "false") + '">' +
+        '<span class="lifecycle-dot" aria-hidden="true"></span>' +
+        '<span class="lifecycle-label" title="' + escapeAttr(tip) + '">' + escapeHtml(stepName) + "</span>" +
+        "</li>";
+      if (i < LIFECYCLE_STEPS.length - 1) {
+        var connCls = "lifecycle-connector" + (isComplete ? " complete" : "");
+        stepsHtml += '<li class="' + connCls + '" aria-hidden="true"></li>';
+      }
+    }
+
+    var branchHtml = "";
+    if (branched) {
+      branchHtml =
+        '<div class="lifecycle-branch" role="note">' +
+        '<span class="lifecycle-branch-badge status-' + escapeHtml(status) + '">' +
+        escapeHtml(status) +
+        "</span>" +
+        '<span class="lifecycle-branch-hint">' + escapeHtml(lifecycleRoleHint(status)) + "</span>" +
+        "</div>";
+    }
+
+    var roleHint = lifecycleRoleHint(status);
+    return (
+      '<div class="lifecycle-stepper" role="group" aria-label="Job lifecycle: ' +
+      escapeAttr(roleHint) +
+      '">' +
+      '<ol class="lifecycle-track">' + stepsHtml + "</ol>" +
+      (roleHint && !branched
+        ? '<div class="lifecycle-role" role="status">' + escapeHtml(roleHint) + "</div>"
+        : "") +
+      branchHtml +
+      "</div>"
     );
   }
 
@@ -1455,6 +1836,7 @@
           evaluatorProgressHtml +
           deliverableHtml +
           "</div>" +
+          renderLifecycleStepper(j) +
           '<div class="job-actions">' +
           actions +
           "</div>" +

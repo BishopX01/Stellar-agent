@@ -17,20 +17,24 @@ import {
   type MarcConfig,
   type Job,
 } from "marc-stellar-sdk";
-import { retryWithBackoff } from "../shared.js";
+import { retryWithBackoff, loadAgentConfig } from "../shared.js";
 import { watchFile, unwatchFile, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 
 const DEFAULT_JOB_BUDGET = 10_000_000n;
 
+// ── Validated configuration ───────────────────────────────────────────────────
+// All Stellar and LLM settings are validated at boot via the shared Zod schema
+// (issue #742). Invalid or missing values fail fast with a readable error table
+// instead of crashing deep inside execution.
+const agentConfig = loadAgentConfig({ requireSecretKey: true });
+
 // ── LLM configuration ─────────────────────────────────────────────────────────
 // Provider/model are env-configurable per issue #650. Supported providers:
 //   AGENT_LLM_PROVIDER=openai    (default model: gpt-4o)
 //   AGENT_LLM_PROVIDER=anthropic (default model: claude-3-5-sonnet-latest)
-const LLM_PROVIDER = (process.env.AGENT_LLM_PROVIDER ?? "openai").toLowerCase();
-const LLM_MODEL =
-  process.env.AGENT_LLM_MODEL ??
-  (LLM_PROVIDER === "anthropic" ? "claude-3-5-sonnet-latest" : "gpt-4o");
+const LLM_PROVIDER = agentConfig.llm.provider;
+const LLM_MODEL = agentConfig.llm.model;
 
 interface TaskClassification {
   capabilities: string[];
@@ -95,7 +99,7 @@ function extractJson(text: string): string {
 
 async function callLlm(prompt: string): Promise<string> {
   if (LLM_PROVIDER === "anthropic") {
-    const key = process.env.ANTHROPIC_API_KEY;
+    const key = agentConfig.llm.anthropicApiKey;
     if (!key) throw new Error("ANTHROPIC_API_KEY not set");
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -115,7 +119,7 @@ async function callLlm(prompt: string): Promise<string> {
     return data.content.map((c) => c.text).join("");
   }
 
-  const key = process.env.OPENAI_API_KEY;
+  const key = agentConfig.llm.openaiApiKey;
   if (!key) throw new Error("OPENAI_API_KEY not set");
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -187,11 +191,11 @@ function parseCliArgs(args: string[]) {
 const cliArgs = parseCliArgs(process.argv.slice(2));
 
 const cfg: MarcConfig = {
-  rpcUrl: process.env.STELLAR_RPC_URL ?? TESTNET.rpcUrl,
-  networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? TESTNET.networkPassphrase,
-  identityContract: process.env.AGENT_IDENTITY_CONTRACT || TESTNET.identityContract,
-  commerceContract: process.env.AGENTIC_COMMERCE_CONTRACT || TESTNET.commerceContract,
-  usdcToken: process.env.USDC_TOKEN_CONTRACT || TESTNET.usdcToken,
+  rpcUrl: agentConfig.stellar.rpcUrl,
+  networkPassphrase: agentConfig.stellar.networkPassphrase,
+  identityContract: agentConfig.stellar.identityContract,
+  commerceContract: agentConfig.stellar.commerceContract,
+  usdcToken: agentConfig.stellar.usdcToken,
   onTx: (hash) =>
     log(
       `{gray-fg}tx: ${hash.slice(0, 16)}... → https://stellar.expert/explorer/testnet/tx/${hash}{/gray-fg}`,
@@ -223,8 +227,8 @@ async function getUsdc(pubkey: string): Promise<string> {
 
 // ── TUI ───────────────────────────────────────────────────────────────────────
 
-const buyer = Keypair.fromSecret(process.env.BUYER_SECRET!);
-const REGISTRY = "http://localhost:4500/agents";
+const buyer = Keypair.fromSecret(agentConfig.stellar.secretKey);
+const REGISTRY = agentConfig.registryUrl;
 const POLL_INTERVAL_MS = 5000;
 const MAX_POLL_ATTEMPTS = 120; // 10 minutes
 

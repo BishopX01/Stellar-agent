@@ -1,4 +1,112 @@
 import { z } from "zod";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
+
+/**
+ * Validate a Stellar StrKey Ed25519 secret key (starts with "S").
+ */
+export const StellarSecretKeySchema = z.string().refine(
+  (value) => {
+    try {
+      Keypair.fromSecret(value);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { message: "Invalid Stellar secret key (expected StrKey Ed25519 secret starting with 'S')" },
+);
+
+/**
+ * Validate a Stellar StrKey Ed25519 public key (starts with "G").
+ */
+export const StellarPublicKeySchema = z.string().refine(
+  (value) => {
+    try {
+      return StrKey.isValidEd25519PublicKey(value);
+    } catch {
+      return false;
+    }
+  },
+  { message: "Invalid Stellar public key (expected StrKey Ed25519 public key starting with 'G')" },
+);
+
+export const ContractAddressesSchema = z.object({
+  AGENT_IDENTITY_CONTRACT: StellarPublicKeySchema,
+  AGENTIC_COMMERCE_CONTRACT: StellarPublicKeySchema,
+  USDC_TOKEN_CONTRACT: StellarPublicKeySchema,
+});
+
+export type ContractAddresses = z.infer<typeof ContractAddressesSchema>;
+
+export const AgentConfigSchema = z.object({
+  STELLAR_RPC_URL: z.string().url({ message: "STELLAR_RPC_URL must be a valid URL" }),
+  STELLAR_NETWORK_PASSPHRASE: z
+    .string()
+    .min(1, { message: "STELLAR_NETWORK_PASSPHRASE must not be empty" }),
+  SECRET_KEY: StellarSecretKeySchema,
+  CONTRACT_ADDRESSES: ContractAddressesSchema,
+  PORT: z.coerce
+    .number({ invalid_type_error: "PORT must be a number" })
+    .int({ message: "PORT must be an integer" })
+    .positive({ message: "PORT must be a positive integer" })
+    .max(65535, { message: "PORT must be <= 65535" }),
+});
+
+export type AgentConfig = z.infer<typeof AgentConfigSchema>;
+
+/**
+ * Format Zod issues into a readable terminal table.
+ */
+export function formatConfigIssues(issues: z.ZodIssue[]): string {
+  const rows = issues.map((issue) => ({
+    path: issue.path.length > 0 ? issue.path.join(".") : "(root)",
+    message: issue.message,
+  }));
+  const pathWidth = Math.max(4, ...rows.map((r) => r.path.length));
+  const msgWidth = Math.max(7, ...rows.map((r) => r.message.length));
+  const line = `+-${"-".repeat(pathWidth)}-+-${"-".repeat(msgWidth)}-+`;
+  const formatRow = (path: string, message: string) =>
+    `| ${path.padEnd(pathWidth)} | ${message.padEnd(msgWidth)} |`;
+  const out = [
+    line,
+    formatRow("Path", "Message"),
+    line,
+    ...rows.map((r) => formatRow(r.path, r.message)),
+    line,
+  ];
+  return out.join("\n");
+}
+
+/**
+ * Validate a raw environment object against AgentConfigSchema.
+ * Throws a readable error (with a terminal table) on failure.
+ */
+export function validateAgentConfig(
+  env: Record<string, string | undefined> = process.env,
+): AgentConfig {
+  const result = AgentConfigSchema.safeParse({
+    STELLAR_RPC_URL: env.STELLAR_RPC_URL,
+    STELLAR_NETWORK_PASSPHRASE: env.STELLAR_NETWORK_PASSPHRASE,
+    SECRET_KEY: env.SECRET_KEY,
+    CONTRACT_ADDRESSES: {
+      AGENT_IDENTITY_CONTRACT: env.AGENT_IDENTITY_CONTRACT,
+      AGENTIC_COMMERCE_CONTRACT: env.AGENTIC_COMMERCE_CONTRACT,
+      USDC_TOKEN_CONTRACT: env.USDC_TOKEN_CONTRACT,
+    },
+    PORT: env.PORT,
+  });
+  if (!result.success) {
+    throw new Error(
+      `Invalid agent configuration:\n${formatConfigIssues(result.error.issues)}`,
+    );
+  }
+  return result.data;
+}
+
+/**
+ * Strictly typed agent configuration, validated at boot.
+ */
+export const agentConfig: AgentConfig = validateAgentConfig(process.env);
 
 export const AGENT_LLM_PROVIDER = process.env.AGENT_LLM_PROVIDER ?? "openai";
 export const AGENT_LLM_MODEL =

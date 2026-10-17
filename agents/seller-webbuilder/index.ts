@@ -8,17 +8,22 @@ import { CommerceClient } from "marc-stellar-sdk";
 import {
   createSellerAgent,
   makeSellerResponse,
-  validateEnv,
   validatePrompt,
   isMockLlm,
   MOCK_DELIVERABLES,
   callLlmWithRetry,
+  loadAgentConfig,
 } from "../shared.js";
 
-validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
+const config = loadAgentConfig({
+  agentId: "seller-webbuilder",
+  required: ["SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"],
+  portEnvVar: "SELLER_PORT",
+  defaultPort: 4501,
+});
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.SELLER_PORT ?? 4501);
+const PORT = config.PORT;
 const AGENT_ID = "seller-webbuilder";
 const OUTPUT_DIR = path.join(AGENT_DIR, "output");
 const OUTPUT_URL = "output";
@@ -42,7 +47,7 @@ app.get("/health", (_req, res) => {
     version: "1.0.0",
     uptime: Math.floor((Date.now() - startTime) / 1000),
     jobs: { active: jobsActive, completed: jobsCompleted, failed: jobsFailed },
-    wallet: { address: process.env.SECRET_KEY ? "configured" : "not-configured" },
+    wallet: { address: config.SECRET_KEY ? "configured" : "not-configured" },
   });
 });
 
@@ -67,8 +72,8 @@ app.get("/metrics", (_req, res) => {
   );
 });
 
-const groq = isMockLlm() ? null : new Groq({ apiKey: process.env.GROQ_API_KEY });
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const groq = isMockLlm() ? null : new Groq({ apiKey: config.GROQ_API_KEY });
+const GROQ_MODEL = config.GROQ_MODEL;
 
 async function generate(prompt: string): Promise<string> {
   if (isMockLlm()) {

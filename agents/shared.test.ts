@@ -386,3 +386,112 @@ test("autoRegister - throws on invalid config", async () => {
     /Invalid agent config/,
   );
 });
+
+// A syntactically valid Stellar Ed25519 secret key (StrKey "S..." format).
+const VALID_SECRET_KEY =
+  "SDAURK7QJYQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2";
+// A syntactically valid Stellar Ed25519 public key (StrKey "G..." format).
+const VALID_PUBLIC_KEY =
+  "GDAURK7QJYQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2";
+
+const VALID_ENV = {
+  STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+  NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+  SECRET_KEY: VALID_SECRET_KEY,
+  CONTRACT_ADDRESSES: JSON.stringify({
+    identity: VALID_PUBLIC_KEY,
+    marketplace: VALID_PUBLIC_KEY,
+  }),
+  PORT: "4501",
+};
+
+test("AgentConfigSchema - accepts a valid runtime environment configuration", () => {
+  const parsed = AgentConfigSchema.parse(VALID_ENV);
+  assert.equal(parsed.STELLAR_RPC_URL, VALID_ENV.STELLAR_RPC_URL);
+  assert.equal(parsed.NETWORK_PASSPHRASE, VALID_ENV.NETWORK_PASSPHRASE);
+  assert.equal(parsed.SECRET_KEY, VALID_SECRET_KEY);
+  assert.equal(parsed.PORT, 4501);
+  assert.deepEqual(parsed.CONTRACT_ADDRESSES, {
+    identity: VALID_PUBLIC_KEY,
+    marketplace: VALID_PUBLIC_KEY,
+  });
+});
+
+test("AgentConfigSchema - rejects missing required environment variables", () => {
+  for (const key of [
+    "STELLAR_RPC_URL",
+    "NETWORK_PASSPHRASE",
+    "SECRET_KEY",
+    "CONTRACT_ADDRESSES",
+    "PORT",
+  ] as const) {
+    const { [key]: _omitted, ...rest } = VALID_ENV;
+    assert.equal(
+      AgentConfigSchema.safeParse(rest).success,
+      false,
+      `expected missing ${key} to fail validation`,
+    );
+  }
+});
+
+test("AgentConfigSchema - rejects malformed STELLAR_RPC_URL", () => {
+  for (const badUrl of ["not-a-url", "ftp://example.com", "http://", ""]) {
+    const result = AgentConfigSchema.safeParse({
+      ...VALID_ENV,
+      STELLAR_RPC_URL: badUrl,
+    });
+    assert.equal(result.success, false, `expected ${badUrl} to be rejected`);
+  }
+});
+
+test("AgentConfigSchema - rejects invalid SECRET_KEY StrKey format", () => {
+  for (const badSecret of [
+    "not-a-secret",
+    "GDAURK7QJYQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2YQ2",
+    "S123",
+    "",
+  ]) {
+    const result = AgentConfigSchema.safeParse({
+      ...VALID_ENV,
+      SECRET_KEY: badSecret,
+    });
+    assert.equal(result.success, false, `expected ${badSecret} to be rejected`);
+  }
+});
+
+test("AgentConfigSchema - rejects invalid contract addresses", () => {
+  const invalidJson = AgentConfigSchema.safeParse({
+    ...VALID_ENV,
+    CONTRACT_ADDRESSES: "{not-json",
+  });
+  assert.equal(invalidJson.success, false);
+
+  const invalidAddress = AgentConfigSchema.safeParse({
+    ...VALID_ENV,
+    CONTRACT_ADDRESSES: JSON.stringify({ identity: "not-a-public-key" }),
+  });
+  assert.equal(invalidAddress.success, false);
+});
+
+test("AgentConfigSchema - rejects non-numeric PORT", () => {
+  for (const badPort of ["abc", "-1", "0", "70000", "45.5", ""]) {
+    const result = AgentConfigSchema.safeParse({ ...VALID_ENV, PORT: badPort });
+    assert.equal(result.success, false, `expected PORT=${badPort} to be rejected`);
+  }
+});
+
+test("validateAgentConfig - returns parsed config for valid environment", () => {
+  const result = validateAgentConfig(VALID_ENV);
+  assert.equal(result.valid, true);
+  assert.equal(result.error, undefined);
+  assert.equal(result.config?.PORT, 4501);
+  assert.equal(result.config?.SECRET_KEY, VALID_SECRET_KEY);
+});
+
+test("validateAgentConfig - returns readable error for invalid environment", () => {
+  const result = validateAgentConfig({ ...VALID_ENV, PORT: "not-a-port" });
+  assert.equal(result.valid, false);
+  assert.equal(typeof result.error, "string");
+  assert.ok((result.error ?? "").length > 0);
+  assert.equal(result.config, undefined);
+});

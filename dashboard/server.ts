@@ -20,7 +20,17 @@ import {
   StrKey,
   Networks,
 } from "@stellar/stellar-sdk";
-import { cfg, rpcUrls, buyerKeypair, sellerKeypair, getKeypair, DEMO_MODE } from "./lib/config.js";
+import {
+  cfg,
+  rpcUrls,
+  buyerKeypair,
+  sellerKeypair,
+  getKeypair,
+  DEMO_MODE,
+  env,
+  formatEnvValidationError,
+  EnvValidationError,
+} from "./lib/config.js";
 import {
   getAllAgents,
   getAgentsPage,
@@ -176,16 +186,16 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
 const identityContract = new Contract(cfg.identityContract);
 const commerceContract = new Contract(cfg.commerceContract);
 
-const allowedOrigins = [
+const allowedOrigins: string[] = [
   "http://localhost:3000",
   "http://localhost:5173",
-  process.env.ALLOWED_ORIGIN,
-  ...(process.env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()),
-].filter(Boolean) as string[];
+  ...(env.ALLOWED_ORIGIN ? [env.ALLOWED_ORIGIN] : []),
+  ...(env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean),
+];
 
 const mutatingBuckets = new Map<string, { count: number; resetAt: number }>();
-const MUTATING_RATE_LIMIT = Number(process.env.MUTATING_RATE_LIMIT ?? 30);
-const MUTATING_RATE_WINDOW_MS = Number(process.env.MUTATING_RATE_WINDOW_MS ?? 60_000);
+const MUTATING_RATE_LIMIT = env.MUTATING_RATE_LIMIT;
+const MUTATING_RATE_WINDOW_MS = env.MUTATING_RATE_WINDOW_MS;
 
 function rateLimitMutating(req: Request, res: Response, next: NextFunction) {
   const key = req.ip || "unknown";
@@ -541,7 +551,7 @@ function serialize(obj: unknown): unknown {
 }
 
 const HORIZON_URL =
-  process.env.HORIZON_URL ??
+  env.HORIZON_URL ??
   (cfg.networkPassphrase === Networks.PUBLIC
     ? "https://horizon.stellar.org"
     : "https://horizon-testnet.stellar.org");
@@ -641,7 +651,7 @@ app.get("/api/demo-mode", (_req, res) => {
 });
 
 let statsCache: { ts: number; payload: unknown } | null = null;
-const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS ?? 5_000);
+const STATS_CACHE_TTL_MS = env.STATS_CACHE_TTL_MS;
 
 // GET /api/stats
 app.get("/api/stats", async (req, res) => {
@@ -1220,7 +1230,22 @@ function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFun
 
 app.use(errorHandler);
 
-const PORT = Number(process.env.PORT ?? process.env.DASHBOARD_PORT ?? 3000);
+// ── #742: Fail fast at boot if the runtime environment is misconfigured ──────
+// `env` is produced by the Zod-validated schema in lib/config.ts. If validation
+// failed, the import above would have thrown an EnvValidationError; we still
+// guard here so that any deferred validation surfaces as a readable table.
+let bootEnv: typeof env;
+try {
+  bootEnv = env;
+} catch (err: unknown) {
+  if (err instanceof EnvValidationError) {
+    console.error(formatEnvValidationError(err));
+    process.exit(1);
+  }
+  throw err;
+}
+
+const PORT = bootEnv.PORT;
 app.listen(PORT, () => {
   console.log(`Bear Dashboard → http://localhost:${PORT}`);
   console.log(`  Buyer:  ${buyerKeypair.publicKey()}`);
