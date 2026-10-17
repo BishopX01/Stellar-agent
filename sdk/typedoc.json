@@ -1,0 +1,68 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "entryPointStrategy": "resolve",
+  "out": "docs/api",
+  "name": "marc-stellar-sdk",
+  "readme": "README.md",
+  "includeVersion": true,
+  "excludePrivate": true,
+  "excludeProtected": false,
+  "excludeInternal": true,
+  "excludeExternals": true,
+  "excludeNotDocumented": false,
+  "categorizeByGroup": true,
+  "defaultCategory": "API",
+  "categoryOrder": ["Core", "Contracts", "Utilities", "*"],
+  "groupOrder": ["Classes", "Interfaces", "Type Aliases", "Enumerations", "Functions", "Variables", "*"],
+  "sort": ["source-order"],
+  "kindSortOrder": [
+    "Class",
+    "Interface",
+    "TypeAlias",
+    "Enumeration",
+    "Function",
+    "Variable"
+  ],
+  "searchInComments": true,
+  "searchInDocuments": true,
+  "cleanOutputDir": true,
+  "githubPages": true,
+  "hideGenerator": false,
+  "navigationLinks": {
+    "GitHub": "https://github.com/marc-stellar/marc-stellar-sdk",
+    "Rust API (rustdoc)": "../rust/index.html"
+  },
+  "sidebarLinks": {
+    "Repository": "https://github.com/marc-stellar/marc-stellar-sdk",
+    "Issues": "https://github.com/marc-stellar/marc-stellar-sdk/issues"
+  },
+  "navigation": {
+    "includeCategories": true,
+    "includeGroups": true,
+    "includeFolders": true
+  },
+  "visibilityFilters": {
+    "protected": false,
+    "private": false,
+    "inherited": true,
+    "external": false
+  },
+  "theme": "default",
+  "lightHighlightTheme": "github-light",
+  "darkHighlightTheme": "github-dark",
+  "customCss": "./typedoc.css",
+  "customJs": "./typedoc.js",
+  "plugin": [],
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "notDocumented": false
+  },
+  "treatWarningsAsErrors": false,
+  "logLevel": "Info",
+  "skipErrorChecking": false,
+  "emit": "docs",
+  "pretty": true,
+  "sourceLinkTemplate": "https://github.com/marc-stellar/marc-stellar-sdk/blob/{gitRevision}/{path}#L{line}"
+}
