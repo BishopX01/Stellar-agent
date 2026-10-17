@@ -10,7 +10,9 @@
     "landing",
     "agents",
     "agents/*",
-    "indexer"
+    "indexer",
+    "packages/react",
+    "examples/nextjs-starter"
   ],
   "scripts": {
     "format": "prettier --write .",
@@ -19,6 +21,7 @@
     "test": "cargo test --workspace && npm run test --workspaces --if-present",
     "test:rust": "cargo test --workspace",
     "test:ts": "npm run test --workspaces --if-present",
+    "test:react": "npm run test --workspace packages/react",
     "prepare": "husky"
   },
   "lint-staged": {

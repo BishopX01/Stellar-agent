@@ -1,3 +1,5 @@
+'use client';
+
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { IdentityClient } from 'marc-stellar-sdk';
 import type { Agent } from 'marc-stellar-sdk';
@@ -62,13 +64,11 @@ export function useAgent(
       : ((options as UseAgentOptions | undefined) ?? {});
   const { client, ttlMs = DEFAULT_TTL_MS } = opts;
 
-  const [agent, setAgent] = useState<Agent | null>(() =>
-    agentId ? agentCache.get(agentId)?.data ?? null : null,
-  );
-  const [loading, setLoading] = useState<boolean>(() => {
-    if (!agentId) return false;
-    return !agentCache.has(agentId);
-  });
+  // Initial state must be identical on the server and during the first client
+  // render to avoid hydration mismatches. The shared cache is only consulted
+  // after mount (see the effect below), never during render.
+  const [agent, setAgent] = useState<Agent | null>(null);
+  const [loading, setLoading] = useState<boolean>(() => Boolean(agentId));
   const [error, setError] = useState<Error | null>(null);
   const [isStale, setIsStale] = useState<boolean>(false);
 
@@ -155,6 +155,9 @@ export function useAgent(
   );
 
   useEffect(() => {
+    // Only touch the shared cache / network in the browser. On the server the
+    // effect never runs, so the SSR output stays deterministic.
+    if (typeof window === 'undefined') return;
     void fetchAgent(false);
     // Invalidate any in-flight request when deps change or on unmount.
     return () => {

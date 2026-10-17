@@ -20,6 +20,43 @@ jobs:
       - run: npm run build
       - run: npm test
 
+  react-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Build React package
+        run: npm run build --workspace @marc-stellar/react
+      - name: Run React hook tests with coverage
+        run: npm test --workspace @marc-stellar/react -- --coverage
+      - name: Check bundle size (<15 KB gzipped)
+        run: npm run size --workspace @marc-stellar/react
+
+  nextjs-ssr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Build React package
+        run: npm run build --workspace @marc-stellar/react
+      - name: Build Next.js starter (SSR verification)
+        working-directory: examples/nextjs-starter
+        run: |
+          npm ci
+          npm run build 2>&1 | tee next-build.log
+          if grep -q "window is not defined" next-build.log; then
+            echo "SSR error: 'window is not defined' detected during Next.js build" >&2
+            exit 1
+          fi
+
   openapi-lint:
     runs-on: ubuntu-latest
     steps:
