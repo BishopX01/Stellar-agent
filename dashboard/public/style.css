@@ -2376,6 +2376,575 @@ textarea:focus-visible,
 }
 
 /* ────────────────────────────────────────────
+   #761 — Network Switcher
+   ──────────────────────────────────────────── */
+.network-switcher {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.network-switcher-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: all 0.2s var(--ease);
+  white-space: nowrap;
+}
+.network-switcher-btn:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.network-switcher-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.network-switcher-btn .network-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+.network-switcher-btn .network-chevron {
+  color: var(--text-dim);
+  transition: transform 0.2s var(--ease);
+}
+.network-switcher.open .network-switcher-btn .network-chevron {
+  transform: rotate(180deg);
+}
+/* Network-specific accents */
+.network-switcher[data-network="testnet"] .network-dot {
+  background: var(--status-funded);
+  box-shadow: 0 0 6px rgba(96, 165, 250, 0.5);
+}
+.network-switcher[data-network="futurenet"] .network-dot {
+  background: var(--status-submitted);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.5);
+}
+.network-switcher[data-network="mainnet"] .network-dot {
+  background: var(--status-completed);
+  box-shadow: 0 0 6px rgba(52, 211, 153, 0.5);
+}
+.network-switcher[data-network="mainnet"] .network-switcher-btn {
+  border-color: rgba(52, 211, 153, 0.3);
+  color: var(--status-completed);
+}
+/* Dropdown menu */
+.network-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 240px;
+  padding: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  z-index: 120;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  animation: page-fade 0.15s ease-out;
+}
+.network-switcher.open .network-menu {
+  display: flex;
+}
+.network-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  transition: background 0.15s;
+}
+.network-option:hover {
+  background: var(--bg-hover);
+}
+.network-option:focus-visible {
+  outline: none;
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.network-option .network-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+  background: var(--text-dim);
+}
+.network-option[data-network="testnet"] .network-dot {
+  background: var(--status-funded);
+}
+.network-option[data-network="futurenet"] .network-dot {
+  background: var(--status-submitted);
+}
+.network-option[data-network="mainnet"] .network-dot {
+  background: var(--status-completed);
+}
+.network-option-body {
+  flex: 1;
+  min-width: 0;
+}
+.network-option-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.network-option-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 1px;
+}
+.network-option-check {
+  color: var(--accent);
+  flex-shrink: 0;
+  margin-top: 2px;
+  opacity: 0;
+}
+.network-option.active .network-option-check {
+  opacity: 1;
+}
+.network-option.active .network-option-name {
+  color: var(--accent);
+}
+
+/* Mainnet warning banner */
+.network-warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  margin-bottom: 20px;
+  border-radius: var(--radius-sm);
+  background: rgba(248, 113, 113, 0.08);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  color: var(--status-cancelled);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.network-warning-banner svg {
+  flex-shrink: 0;
+}
+.network-warning-banner .network-warning-text {
+  flex: 1;
+  min-width: 0;
+}
+.network-warning-banner .network-warning-dismiss {
+  flex-shrink: 0;
+  color: var(--status-cancelled);
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.network-warning-banner .network-warning-dismiss:hover {
+  opacity: 1;
+}
+/* Wallet/network mismatch warning */
+.network-mismatch-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  margin-bottom: 20px;
+  border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.08);
+  border: 1px solid rgba(251, 191, 36, 0.25);
+  color: var(--status-submitted);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+/* ────────────────────────────────────────────
+   #759 — Keyboard Shortcuts
+   ──────────────────────────────────────────── */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-hover);
+  border-bottom-width: 2px;
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+.shortcut-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.shortcut-row:last-child {
+  border-bottom: none;
+}
+.shortcut-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.shortcut-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.shortcut-keys .kbd-sep {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.shortcut-section-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  margin: 16px 0 4px;
+}
+.shortcut-section-title:first-child {
+  margin-top: 0;
+}
+.shortcut-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 16px;
+  text-align: center;
+}
+.modal.modal-wide {
+  max-width: 560px;
+}
+
+/* ────────────────────────────────────────────
+   #760 — Agent Public Profile Page
+   ──────────────────────────────────────────── */
+.agent-profile {
+  max-width: 960px;
+  margin: 0 auto;
+}
+.agent-profile-banner {
+  position: relative;
+  height: 160px;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background:
+    radial-gradient(ellipse 70% 120% at 20% 0%, var(--accent-glow) 0%, transparent 70%),
+    linear-gradient(135deg, var(--bg-surface), var(--bg-elevated));
+  border: 1px solid var(--border);
+  border-bottom: none;
+  overflow: hidden;
+}
+.agent-profile-header {
+  position: relative;
+  padding: 0 28px 24px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  margin-bottom: 20px;
+}
+.agent-profile-avatar {
+  width: 88px;
+  height: 88px;
+  border-radius: 20px;
+  margin-top: -44px;
+  background: linear-gradient(135deg, var(--accent-soft), rgba(251, 191, 36, 0.08));
+  border: 3px solid var(--bg-elevated);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32px;
+  font-weight: 800;
+  color: var(--accent);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.agent-profile-avatar.agent-avatar-svg {
+  background: var(--bg-surface);
+}
+.agent-profile-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.agent-profile-name {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.agent-profile-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.agent-profile-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.agent-profile-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+}
+.verified-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  color: var(--status-completed);
+}
+.verified-badge svg {
+  flex-shrink: 0;
+}
+.verified-badge.unverified {
+  background: rgba(134, 142, 150, 0.08);
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+.agent-profile-bio {
+  margin-top: 16px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--text-muted);
+  max-width: 680px;
+}
+.agent-profile-grid {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 20px;
+  align-items: start;
+}
+.agent-profile-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+.agent-profile-panel:last-child {
+  margin-bottom: 0;
+}
+.agent-profile-panel-header {
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.agent-profile-panel-body {
+  padding: 18px 22px;
+}
+/* Rating breakdown */
+.rating-summary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.rating-score {
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+.rating-stars {
+  display: inline-flex;
+  gap: 2px;
+  color: var(--logo-yellow);
+}
+.rating-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.rating-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rating-bar-row {
+  display: grid;
+  grid-template-columns: 28px 1fr 34px;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.rating-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.rating-bar-track span {
+  display: block;
+  height: 100%;
+  background: var(--logo-yellow);
+  transition: width 0.25s var(--ease);
+}
+/* Pricing schedule */
+.pricing-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.pricing-row:last-child {
+  border-bottom: none;
+}
+.pricing-label {
+  color: var(--text-muted);
+}
+.pricing-value {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text);
+}
+.pricing-value .unit {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 400;
+  margin-left: 3px;
+}
+/* Capabilities */
+.capability-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.capability-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+/* Recent job history */
+.agent-history-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.agent-history-row:last-child {
+  border-bottom: none;
+}
+.agent-history-body {
+  flex: 1;
+  min-width: 0;
+}
+.agent-history-title {
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-history-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  margin-top: 2px;
+}
+.agent-history-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.agent-history-amount {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+/* Hire CTA */
+.agent-hire-cta {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.agent-hire-cta .btn {
+  justify-content: center;
+  width: 100%;
+}
+.agent-hire-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+}
+/* Copy share link */
+.agent-share-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.agent-share-row .agent-share-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-share-row .copy-btn {
+  width: 24px;
+  height: 24px;
+}
+
+/* ────────────────────────────────────────────
    #581 — SSE Connection Status Pill
    ──────────────────────────────────────────── */
 .sse-status-pill {

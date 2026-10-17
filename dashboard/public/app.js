@@ -4,19 +4,12 @@
 // backend API (Stellar addresses, contract state). No untrusted user input.
 
 (() => {
-  // ── Theme (dark/light) ── #461, #578
-  (function initTheme() {
-    var saved = localStorage.getItem("bear-theme");
-    var theme = saved;
-    if (!theme) {
-      // Respect OS system preference (#578)
-      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
-        theme = "light";
-      } else {
-        theme = "dark";
-      }
-    }
-    document.documentElement.setAttribute("data-theme", theme);
+  // ── Theme (dark/light) ── #461, #578, #758
+  // The initial data-theme attribute is set by the inline blocking script in
+  // <head> (index.html) so the very first painted frame already uses the
+  // correct theme (no FOUC). Here we only wire up the toggle button, which
+  // reads the current attribute set by that inline script.
+  (function initThemeToggle() {
     var btn = document.getElementById("theme-toggle-btn");
     if (btn) {
       btn.addEventListener("click", function () {
@@ -27,6 +20,45 @@
       });
     }
   })();
+  // ── Network presets (#761) ──
+  // Contract addresses / RPC endpoints per network. The backend exposes the
+  // active network via /api/config; these presets are used for the switcher
+  // UI, wallet-network mismatch warnings and mainnet safety banner.
+  var NETWORK_PRESETS = {
+    testnet: {
+      id: "testnet",
+      label: "Testnet",
+      passphrase: "Test SDF Network ; September 2015",
+      rpcUrl: "https://soroban-testnet.stellar.org",
+      explorer: "https://stellar.expert/explorer/testnet",
+      realFunds: false,
+    },
+    futurenet: {
+      id: "futurenet",
+      label: "Futurenet",
+      passphrase: "Test SDF Future Network ; October 2022",
+      rpcUrl: "https://rpc-futurenet.stellar.org",
+      explorer: "https://stellar.expert/explorer/futurenet",
+      realFunds: false,
+    },
+    mainnet: {
+      id: "mainnet",
+      label: "Mainnet",
+      passphrase: "Public Global Stellar Network ; September 2015",
+      rpcUrl: "https://soroban-rpc.mainnet.stellar.gateway.fm",
+      explorer: "https://stellar.expert/explorer/public",
+      realFunds: true,
+    },
+  };
+
+  function readPersistedNetwork() {
+    try {
+      var saved = localStorage.getItem("bear-network");
+      if (saved && NETWORK_PRESETS[saved]) return saved;
+    } catch (e) {}
+    return "testnet";
+  }
+
   // ── State Store ──
   const state = {
     stats: null,
@@ -598,6 +630,8 @@
   async function api(path, opts = {}) {
     const headers = opts.body ? { "Content-Type": "application/json" } : {};
     if (window.__sessionToken) headers.Authorization = "Bearer " + window.__sessionToken;
+    // #761 — tell the backend which network the dashboard is configured for
+    headers["X-Bear-Network"] = state.network || "testnet";
     let res;
     try {
       res = await fetch(`/api${path}`, {
@@ -2546,7 +2580,8 @@
   };
   window.__searchAgentsDebounced = debounce(_searchAgentsImmediate, 200);
 
-  window.__showCreateJob = function () {
+  window.__showCreateJob = function (prefill) {
+    var prefillProvider = prefill && prefill.provider != null ? String(prefill.provider) : "";
     var walletField = wallet.connected
       ? '<div class="form-group"><label class="form-label">Signing Wallet</label>' +
          '<div class="form-input signing-wallet-display" style="color:var(--accent);cursor:default">' +
@@ -2562,7 +2597,7 @@
         '<div class="form-group"><label class="form-label">Budget (MUSD units, 7 decimals)</label>' +
         '<input class="form-input" id="cj-budget" value="10000000" placeholder="10000000 = 1 MUSD"></div>' +
         '<div class="form-group"><label class="form-label">Provider Address <span style="color:var(--text-muted);font-weight:400">(must be a registered agent)</span></label>' +
-        '<input class="form-input" id="cj-provider" placeholder="Leave blank to use default seller" autocomplete="off" spellcheck="false"></div>' +
+        '<input class="form-input" id="cj-provider" value="' + escapeAttr(prefillProvider) + '" placeholder="Leave blank to use default seller" autocomplete="off" spellcheck="false"></div>' +
         '<div class="modal-actions">' +
         '<button class="btn btn-secondary" onclick="this.closest(\'.modal-overlay\').remove()">Cancel</button>' +
         '<button class="btn btn-primary" onclick="window.__doCreateJob()">Create Job</button></div>',
@@ -2831,6 +2866,154 @@
     }
   };
 
+  // ── Agent Profile view (#760) ──
+  function setMetaTag(attr, key, content) {
+    var el = document.head.querySelector('meta[' + attr + '="' + key + '"]');
+    if (!el) {
+      el = document.createElement("meta");
+      el.setAttribute(attr, key);
+      document.head.appendChild(el);
+    }
+    el.setAttribute("content", content);
+  }
+
+  function injectAgentOpenGraph(agent) {
+    var title = "Agent #" + agent.id + " — Bear Protocol";
+    var desc = agent.description || agent.uri || "On-chain AI agent profile on Bear Protocol";
+    var url = window.location.href;
+    document.title = title;
+    setMetaTag("property", "og:title", title);
+    setMetaTag("property", "og:description", desc);
+    setMetaTag("property", "og:type", "profile");
+    setMetaTag("property", "og:url", url);
+    setMetaTag("name", "twitter:card", "summary");
+    setMetaTag("name", "twitter:title", title);
+    setMetaTag("name", "twitter:description", desc);
+  }
+
+  function resetOpenGraph() {
+    document.title = "Bear Protocol Dashboard";
+    setMetaTag("property", "og:title", "Bear Protocol Dashboard");
+    setMetaTag("property", "og:description", "Escrow-based AI agent marketplace on Stellar");
+    setMetaTag("property", "og:url", window.location.href);
+  }
+
+  async function renderAgentProfile(id) {
+    setPage(
+      '<div class="page-header"><div class="page-title">Agent Profile</div></div>' +
+        skeletonCards(2) +
+        skeletonList(3),
+    );
+
+    var agent = null;
+    try {
+      agent = await api("/agents/" + encodeURIComponent(String(id)));
+    } catch (e) {
+      agent = null;
+    }
+    if (!agent) {
+      setPage(
+        '<div class="empty-state">' +
+          '<div class="empty-title">Agent not found</div>' +
+          '<div class="empty-desc">No agent with ID #' + escapeHtml(String(id)) + " exists.</div>" +
+          '<a href="#/agents" class="btn btn-secondary" style="margin-top:16px">Back to agents</a>' +
+          "</div>",
+      );
+      return;
+    }
+
+    injectAgentOpenGraph(agent);
+
+    // Load verified badges from the agent-identity contract
+    var badges = [];
+    try {
+      var badgeData = await api("/agents/" + encodeURIComponent(String(id)) + "/badges", { _silent: true });
+      var nowSeconds = Math.floor(Date.now() / 1000);
+      badges = normalizeBadges(badgeData).filter(function (b) {
+        return isBadgeActive(b, nowSeconds);
+      });
+    } catch (e) {
+      badges = [];
+    }
+
+    // Recent job history for this agent
+    var jobs = [];
+    try {
+      jobs = (await api("/jobs?agent=" + encodeURIComponent(String(id)), { _silent: true })) || [];
+      if (!Array.isArray(jobs)) jobs = jobs.items || [];
+    } catch (e) {
+      jobs = [];
+    }
+
+    var shareUrl = window.location.origin + window.location.pathname + "#/agent/" + id;
+    var capabilities = Array.isArray(agent.tags) ? agent.tags : [];
+    var pricing = agent.pricing || agent.price || null;
+
+    var capabilitiesHtml = "";
+    if (capabilities.length > 0) {
+      capabilitiesHtml = '<div class="agent-profile-section"><div class="agent-profile-heading">Capabilities</div><div class="agent-badges">';
+      for (var i = 0; i < capabilities.length; i++) {
+        capabilitiesHtml += '<span class="badge-chip"><span class="badge-chip-tag">' + escapeHtml(String(capabilities[i])) + "</span></span>";
+      }
+      capabilitiesHtml += "</div></div>";
+    }
+
+    var pricingHtml = "";
+    if (pricing) {
+      pricingHtml =
+        '<div class="agent-profile-section"><div class="agent-profile-heading">Pricing</div>' +
+        '<div class="agent-profile-pricing">' + escapeHtml(String(pricing)) + "</div></div>";
+    }
+
+    var historyHtml = '<div class="agent-profile-section"><div class="agent-profile-heading">Recent Jobs</div>';
+    if (jobs.length === 0) {
+      historyHtml += '<div class="empty-desc">No jobs yet.</div>';
+    } else {
+      historyHtml += '<div class="history-list">';
+      for (var j = 0; j < jobs.length && j < 10; j++) {
+        var job = jobs[j];
+        historyHtml +=
+          '<div class="history-row">' +
+          '<div class="history-body"><div class="history-label">' + escapeHtml(job.description || "—") + "</div>" +
+          '<div class="history-meta">' + formatMusd(job.budget) + " USDC</div></div>" +
+          '<div class="history-right">' + statusBadge(job.status) + "</div>" +
+          "</div>";
+      }
+      historyHtml += "</div>";
+    }
+    historyHtml += "</div>";
+
+    setPage(
+      '<div class="agent-profile">' +
+        '<div class="agent-profile-banner"></div>' +
+        '<div class="agent-profile-header">' +
+        agentIdenticon(agent.owner) +
+        '<div class="agent-profile-title-wrap">' +
+        '<div class="agent-profile-title">Agent #' + escapeHtml(String(agent.id)) + "</div>" +
+        '<div class="agent-profile-owner">Owner: ' + copyable(agent.owner, "wallet public key") + "</div>" +
+        "</div>" +
+        '<div class="agent-profile-actions">' +
+        '<button class="btn btn-primary" onclick="window.__hireAgent(\'' + escapeHtml(String(agent.id)) + "')\">Hire Agent</button>" +
+        '<button class="btn btn-secondary" onclick="window.__copyShareLink(\'' + escapeAttr(shareUrl) + "')\">Copy Link</button>" +
+        "</div></div>" +
+        renderBadgeChips(badges) +
+        '<div class="agent-profile-section"><div class="agent-profile-heading">Bio</div>' +
+        '<div class="agent-profile-bio">' + escapeHtml(agent.description || agent.uri || "No bio provided.") + "</div></div>" +
+        pricingHtml +
+        capabilitiesHtml +
+        historyHtml +
+        "</div>",
+    );
+  }
+
+  window.__copyShareLink = function (url) {
+    copyToClipboard(url, null);
+  };
+
+  window.__hireAgent = function (agentId) {
+    window.__showCreateJob({ provider: agentId });
+  };
+
   // ── Router ──
   const routes = {
     "/": renderDashboard,
@@ -2844,9 +3027,17 @@
     return window.location.hash.slice(1) || "/";
   }
 
+  function parseRoute(route) {
+    var agentMatch = route.match(/^\/agent\/([^/]+)$/);
+    if (agentMatch) {
+      return { name: "agent", id: decodeURIComponent(agentMatch[1]) };
+    }
+    return { name: route, id: null };
+  }
+
   function navigate() {
     const route = getRoute();
-    const render = routes[route] || renderDashboard;
+    const parsed = parseRoute(route);
 
     // Update active nav
     document.querySelectorAll(".nav-item").forEach(function (el) {
@@ -2859,7 +3050,13 @@
     void page.offsetHeight;
     page.style.animation = "";
 
-    render();
+    if (parsed.name === "agent") {
+      renderAgentProfile(parsed.id);
+    } else {
+      resetOpenGraph();
+      const render = routes[route] || renderDashboard;
+      render();
+    }
 
     // Close mobile sidebar on navigation
     if (typeof closeDrawer === "function") closeDrawer();
@@ -3067,6 +3264,7 @@
   }
 
   // Initial render
+  renderNetworkBadge();
   navigate();
 
   // Sync the refresh-interval dropdown to the restored/default interval
