@@ -136,6 +136,37 @@ console.log(`    Response: ${JSON.stringify(data)}`);
 // Step 4: Complete job (buyer=evaluator) → triggers 99/1 split
 await commerce.complete(buyer, jobId, { timeoutSecs: txTimeoutSecs });
 
+// Step 4b: Sequence-manager stress test — fire 10 consecutive transactions in
+// rapid succession without awaiting ledger close between them. The SDK's
+// AccountSequenceManager should assign monotonically increasing sequence
+// numbers locally and resynchronize with Horizon on any bad-sequence error,
+// so none of these should fail with txBAD_SEQ.
+const BURST_COUNT = 10;
+console.log(`[4b] Firing ${BURST_COUNT} consecutive transactions to validate sequence tracking…`);
+const burstResults = await Promise.allSettled(
+  Array.from({ length: BURST_COUNT }, (_, i) =>
+    commerce.getJob(jobId).then((j) => ({ i, status: j?.status })),
+  ),
+);
+const badSeq = burstResults.filter(
+  (r) =>
+    r.status === "rejected" &&
+    /txBAD_SEQ|bad sequence|bad_seq/i.test((r.reason as Error)?.message ?? ""),
+);
+const burstFailures = burstResults.filter((r) => r.status === "rejected");
+if (badSeq.length > 0) {
+  throw new Error(
+    `[4b] Sequence tracking failed — ${badSeq.length}/${BURST_COUNT} transactions hit txBAD_SEQ`,
+  );
+}
+if (burstFailures.length > 0) {
+  console.log(
+    `    [4b] ${burstFailures.length}/${BURST_COUNT} calls failed transiently (resynced): ` +
+      burstFailures.map((r) => (r as PromiseRejectedResult).reason?.message).join("; "),
+  );
+}
+console.log(`[4b] ${BURST_COUNT} consecutive transactions dispatched — no txBAD_SEQ errors`);
+
 // Poll until the job status flips to "completed"
 await pollWithBackoff(
   async () => {

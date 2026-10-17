@@ -12,10 +12,47 @@ set -euo pipefail
 #   - target/wasm32v1-none/release/{agent_identity,agentic_commerce}.wasm (optimized in place)
 #   - deployments/testnet.json with the deployed contract addresses
 
+# Network name and RPC URL are parameterizable so the docker-compose init
+# service can target the local standalone network, e.g.:
+#   scripts/deploy-testnet.sh --network local --rpc-url http://soroban-rpc:8000/soroban/rpc
+# Defaults preserve the original testnet behaviour.
 NETWORK="testnet"
+RPC_URL=""
 IDENTITY="deployer"
 OUT_DIR="deployments"
-OUT_FILE="$OUT_DIR/testnet.json"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --network)
+      NETWORK="$2"
+      shift 2
+      ;;
+    --rpc-url)
+      RPC_URL="$2"
+      shift 2
+      ;;
+    --identity)
+      IDENTITY="$2"
+      shift 2
+      ;;
+    --out-dir)
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    *)
+      echo "ERROR: unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+OUT_FILE="$OUT_DIR/$NETWORK.json"
+
+# Build the common `--network` / `--rpc-url` flags for stellar CLI invocations.
+NETWORK_FLAGS=(--network "$NETWORK")
+if [[ -n "$RPC_URL" ]]; then
+  NETWORK_FLAGS+=(--rpc-url "$RPC_URL")
+fi
 
 IDENTITY_WASM="target/wasm32v1-none/release/agent_identity.wasm"
 COMMERCE_WASM="target/wasm32v1-none/release/agentic_commerce.wasm"
@@ -45,27 +82,28 @@ echo "==> Deploying agent_identity"
 # contract C... address on stdout, so capturing $(...) yields just the ID.
 IDENTITY_ADDR=$(stellar contract deploy \
   --source-account "$IDENTITY" \
-  --network "$NETWORK" \
+  "${NETWORK_FLAGS[@]}" \
   --wasm "$IDENTITY_WASM")
 echo "    agent_identity   = $IDENTITY_ADDR"
 
 echo "==> Deploying agentic_commerce"
 COMMERCE_ADDR=$(stellar contract deploy \
   --source-account "$IDENTITY" \
-  --network "$NETWORK" \
+  "${NETWORK_FLAGS[@]}" \
   --wasm "$COMMERCE_WASM")
 echo "    agentic_commerce = $COMMERCE_ADDR"
 
 echo "==> Initializing agentic_commerce (admin=treasury=$ADMIN)"
 stellar contract invoke \
   --source-account "$IDENTITY" \
-  --network "$NETWORK" \
+  "${NETWORK_FLAGS[@]}" \
   --id "$COMMERCE_ADDR" \
   -- init --admin "$ADMIN" --treasury "$ADMIN"
 
 cat > "$OUT_FILE" <<EOF
 {
-  "network": "testnet",
+  "network": "$NETWORK",
+  "rpc_url": "$RPC_URL",
   "deployer": "$ADMIN",
   "agent_identity": "$IDENTITY_ADDR",
   "agentic_commerce": "$COMMERCE_ADDR",
@@ -73,4 +111,26 @@ cat > "$OUT_FILE" <<EOF
 }
 EOF
 echo "==> Wrote $OUT_FILE"
+
+# When targeting the local standalone network, also export the deployed
+# addresses to .env.docker so the dashboard and agents can consume them.
+if [[ "$NETWORK" == "local" ]]; then
+  ENV_FILE=".env.docker"
+  echo "==> Updating $ENV_FILE with local deployment addresses"
+  touch "$ENV_FILE"
+  # Drop any previous values so re-runs stay idempotent.
+  if [[ -s "$ENV_FILE" ]]; then
+    grep -v -E '^(AGENT_IDENTITY_CONTRACT|AGENTIC_COMMERCE_CONTRACT|SOROBAN_RPC_URL|STELLAR_NETWORK)=' \
+      "$ENV_FILE" > "$ENV_FILE.tmp" || true
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
+  fi
+  {
+    echo "STELLAR_NETWORK=$NETWORK"
+    echo "SOROBAN_RPC_URL=${RPC_URL:-http://soroban-rpc:8000/soroban/rpc}"
+    echo "AGENT_IDENTITY_CONTRACT=$IDENTITY_ADDR"
+    echo "AGENTIC_COMMERCE_CONTRACT=$COMMERCE_ADDR"
+  } >> "$ENV_FILE"
+  echo "==> Wrote local deployment addresses to $ENV_FILE"
+fi
+
 echo "==> Done."

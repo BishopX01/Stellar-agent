@@ -1,0 +1,302 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-typedoc:
+    name: Build TypeDoc (TypeScript SDK)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: sdk/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate TypeDoc HTML
+        run: npx typedoc --options typedoc.json
+
+      - name: Upload TypeDoc artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typedoc-html
+          path: sdk/docs
+          if-no-files-found: error
+
+  build-rustdoc:
+    name: Build rustdoc (Soroban crates)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doc-
+
+      - name: Generate rustdoc HTML
+        run: cargo doc --no-deps --workspace
+
+      - name: Upload rustdoc artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc-html
+          path: target/doc
+          if-no-files-found: error
+
+  merge-and-deploy:
+    name: Merge docs and deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs:
+      - build-typedoc
+      - build-rustdoc
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download TypeDoc artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: typedoc-html
+          path: site/typescript
+
+      - name: Download rustdoc artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rustdoc-html
+          path: site/rust
+
+      - name: Merge documentation outputs
+        run: |
+          set -euo pipefail
+          mkdir -p site
+
+          # Shared navigation header injected into every generated HTML page.
+          cat > /tmp/nav-header.html <<'EOF'
+          <header class="sdk-docs-nav">
+            <nav>
+              <a class="sdk-docs-nav__brand" href="/">marc-stellar-sdk Docs</a>
+              <a href="/typescript/">TypeScript SDK</a>
+              <a href="/rust/">Rust Contracts</a>
+              <a href="/search/">Search</a>
+            </nav>
+          </header>
+          <style>
+            .sdk-docs-nav { position: sticky; top: 0; z-index: 9999; background: #0b1020; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+            .sdk-docs-nav nav { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; padding: 0.75rem 1.25rem; }
+            .sdk-docs-nav a { color: #cbd5e1; text-decoration: none; font-size: 0.95rem; }
+            .sdk-docs-nav a:hover { color: #fff; text-decoration: underline; }
+            .sdk-docs-nav__brand { font-weight: 700; color: #fff !important; margin-right: auto; }
+          </style>
+          EOF
+
+          # Inject the shared nav header right after <body> in every HTML file.
+          find site -name '*.html' -print0 | while IFS= read -r -d '' file; do
+            if grep -qi '<body' "$file"; then
+              awk -v nav="$(cat /tmp/nav-header.html)" '
+                BEGIN { inserted = 0 }
+                {
+                  print
+                  if (!inserted && tolower($0) ~ /<body[^>]*>/) {
+                    print nav
+                    inserted = 1
+                  }
+                }
+              ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+            fi
+          done
+
+          # Build a combined search index across TypeScript and Rust docs.
+          mkdir -p site/search
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const entries = [];
+
+          function walk(dir, kind) {
+            if (!fs.existsSync(dir)) return;
+            for (const name of fs.readdirSync(dir)) {
+              const full = path.join(dir, name);
+              const stat = fs.statSync(full);
+              if (stat.isDirectory()) {
+                walk(full, kind);
+              } else if (name.endsWith('.html')) {
+                const rel = path.relative('site', full).split(path.sep).join('/');
+                const html = fs.readFileSync(full, 'utf8');
+                const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
+                const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+                const title = (titleMatch ? titleMatch[1] : (h1Match ? h1Match[1].replace(/<[^>]+>/g, '') : name))
+                  .replace(/\s+/g, ' ')
+                  .trim();
+                entries.push({ kind, title, url: '/' + rel });
+              }
+            }
+          }
+
+          walk('site/typescript', 'typescript');
+          walk('site/rust', 'rust');
+
+          entries.sort((a, b) => a.title.localeCompare(b.title));
+
+          fs.writeFileSync(
+            'site/search/search-index.json',
+            JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2)
+          );
+
+          const rows = entries
+            .map(e => `<li><a href="${e.url}"><span class="kind">${e.kind}</span> ${e.title}</a></li>`)
+            .join('\n');
+
+          fs.writeFileSync('site/search/index.html', `<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Search - marc-stellar-sdk Docs</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
+              main { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+              input { width: 100%; padding: 0.75rem; font-size: 1rem; border: 1px solid #cbd5e1; border-radius: 6px; }
+              ul { list-style: none; padding: 0; }
+              li { padding: 0.5rem 0; border-bottom: 1px solid #e2e8f0; }
+              a { color: #1d4ed8; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .kind { display: inline-block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; background: #e2e8f0; color: #334155; border-radius: 4px; padding: 0.1rem 0.4rem; margin-right: 0.5rem; }
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1>Search</h1>
+              <input id="q" type="search" placeholder="Search classes, methods, structs..." autofocus>
+              <ul id="results"></ul>
+            </main>
+            <script>
+              const input = document.getElementById('q');
+              const results = document.getElementById('results');
+              let entries = [];
+              fetch('search-index.json')
+                .then(r => r.json())
+                .then(data => { entries = data.entries; render(entries); })
+                .catch(() => {});
+              function render(list) {
+                results.innerHTML = list
+                  .slice(0, 500)
+                  .map(e => '<li><a href="' + e.url + '"><span class="kind">' + e.kind + '</span>' + e.title + '</a></li>')
+                  .join('');
+              }
+              input.addEventListener('input', () => {
+                const q = input.value.toLowerCase().trim();
+                if (!q) { render(entries); return; }
+                render(entries.filter(e => e.title.toLowerCase().includes(q)));
+              });
+            </script>
+          </body>
+          </html>`);
+          NODE
+
+          # Landing page linking both documentation sets.
+          cat > site/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>marc-stellar-sdk Documentation</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background: #0b1020; color: #e2e8f0; }
+              main { max-width: 900px; margin: 0 auto; padding: 4rem 1.5rem; }
+              h1 { font-size: 2.25rem; margin-bottom: 0.5rem; }
+              p { color: #94a3b8; }
+              .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-top: 2rem; }
+              .card { display: block; padding: 1.5rem; border-radius: 10px; background: #111827; border: 1px solid #1f2937; color: inherit; text-decoration: none; transition: border-color 0.15s ease; }
+              .card:hover { border-color: #3b82f6; }
+              .card h2 { margin: 0 0 0.5rem; font-size: 1.15rem; }
+              .card span { color: #94a3b8; font-size: 0.9rem; }
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1>marc-stellar-sdk Documentation</h1>
+              <p>Unified API reference for the TypeScript SDK and Soroban smart contracts.</p>
+              <div class="cards">
+                <a class="card" href="typescript/">
+                  <h2>TypeScript SDK</h2>
+                  <span>TypeDoc reference for classes, methods, and interfaces.</span>
+                </a>
+                <a class="card" href="rust/">
+                  <h2>Rust Contracts</h2>
+                  <span>rustdoc reference for all Soroban crates and structs.</span>
+                </a>
+                <a class="card" href="search/">
+                  <h2>Search</h2>
+                  <span>Combined search index across all documentation.</span>
+                </a>
+              </div>
+            </main>
+          </body>
+          </html>
+          EOF
+
+          # Prevent Jekyll processing on GitHub Pages.
+          touch site/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Publish to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          force_orphan: true
+          enable_jekyll: false

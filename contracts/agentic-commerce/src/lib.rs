@@ -25,6 +25,9 @@ pub enum Error {
     NotAdmin = 9,
     /// The token address is not on the approved whitelist.
     UnsupportedToken = 10,
+    /// #706 — the evaluator-asserted deliverable content hash does not match
+    /// the hash committed by the provider at submission time.
+    HashMismatch = 11,
 }
 
 /// Lifecycle states for a job escrow.
@@ -83,6 +86,10 @@ pub struct Job {
     pub status: JobStatus,
     pub description: String,
     pub deliverable: String,
+    /// #706 — SHA-256 content hash of the deliverable payload, committed by
+    /// the provider at `submit()` time. Immutable once set: `complete()` can
+    /// only assert equality against it, never overwrite it.
+    pub deliverable_hash: soroban_sdk::BytesN<32>,
     pub funded_at: u64,
     pub created_at: u64,
     pub updated_at: u64,
@@ -100,12 +107,25 @@ pub struct Job {
 }
 
 /// Evaluator quorum stored separately from `Job` to preserve existing job XDR.
+///
+/// #704 — Supports weighted voting: each evaluator may carry a distinct
+/// weight (`evaluator_weights`), and completion is triggered once the sum of
+/// the weights of approving evaluators (`accumulated_weight`) reaches
+/// `threshold`. For unweighted jobs created via `create_job_multi_eval`, every
+/// evaluator is assigned weight 1 and `total_weight == evaluators.len()`, so
+/// the weighted logic degenerates to the original 1-evaluator-1-vote quorum.
 #[contracttype]
 #[derive(Clone)]
 pub struct JobEvaluators {
     pub evaluators: Vec<Address>,
     pub threshold: u32,
     pub approvals: soroban_sdk::Map<Address, bool>,
+    /// #704 — per-evaluator voting weight. Absent entries are treated as 0.
+    pub evaluator_weights: soroban_sdk::Map<Address, u32>,
+    /// #704 — sum of all evaluator weights, validated at job creation.
+    pub total_weight: u32,
+    /// #704 — running sum of weights of evaluators that have approved.
+    pub accumulated_weight: u32,
 }
 
 /// Monotonic payment commitment signed by the payer's channel key.
@@ -145,6 +165,20 @@ pub struct TokenInfo {
     pub normalization_factor: i128,
 }
 
+/// A single job request within a batch (#698).
+///
+/// Mirrors the per-job arguments of `create_job` so an agent orchestrator can
+/// escrow funds for multiple specialized worker agents in one atomic call.
+#[contracttype]
+#[derive(Clone)]
+pub struct JobRequest {
+    pub provider: Address,
+    pub evaluator: Address,
+    pub token: Address,
+    pub budget: i128,
+    pub description: String,
+}
+
 /// A single milestone within a milestone-based escrow job.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -181,6 +215,8 @@ enum DataKey {
     AllowedToken(Address),
     /// Ordered list of whitelisted token addresses for enumeration.
     AllowedTokenList,
+    /// #713 — address of the AMM/DEX router contract used for path payments.
+    AmmRouter,
 }
 
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
@@ -191,13 +227,13 @@ const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 const MIN_BUDGET: i128 = 1;
 /// #619 — maximum deliverable URI length to prevent storage griefing.
 const MAX_DELIVERABLE_LEN: u32 = 1024;
+/// #706 — maximum metadata URI length accepted alongside a content hash.
+const MAX_METADATA_URI_LEN: u32 = 1024;
 const MAX_EVALUATORS: u32 = 5;
 const DEFAULT_MULTI_EVAL_THRESHOLD: i128 = i128::MAX;
 const CHANNEL_DISPUTE_WINDOW_SECS: u64 = 24 * 60 * 60;
-/// #716 — maximum SLA penalty as a fraction of budget (50%).
-const MAX_SLA_PENALTY_BPS: u32 = 5_000;
-/// #716 — seconds per hour, used for overdue duration math.
-const SECS_PER_HOUR: u64 = 3_600;
+/// #698 — maximum number of jobs that may be created in a single atomic batch.
+const MAX_BATCH_SIZE: u32 = 10;
 
 // --- Events ---
 
@@ -218,11 +254,25 @@ pub struct JobCreated {
     pub budget: i128,
 }
 
+/// #698 — Emitted when a batch of jobs is created and funded atomically.
+#[contractevent]
+pub struct BatchJobsCreated {
+    #[topic]
+    pub client: Address,
+    pub job_ids: Vec<u64>,
+}
+
 /// Emitted when the provider submits a deliverable.
+///
+/// #706 — `deliverable_hash` is emitted as a topic so off-chain indexers can
+/// independently verify that the content they fetched matches the on-chain
+/// commitment, and detect any post-approval mutation of the deliverable.
 #[contractevent]
 pub struct JobSubmitted {
     #[topic]
     pub provider: Address,
+    #[topic]
+    pub deliverable_hash: soroban_sdk::BytesN<32>,
     pub job_id: u64,
 }
 
@@ -380,6 +430,24 @@ pub struct MilestonesPartialCancelled {
     pub client: Address,
     pub job_id: u64,
     pub refund: i128,
+}
+
+/// #713 — Emitted when a job is funded via a cross-currency path payment swap.
+#[contractevent]
+pub struct SwapFunded {
+    #[topic]
+    pub client: Address,
+    pub job_id: u64,
+    /// The token the client paid with (e.g. XLM).
+    pub input_token: Address,
+    /// The token the escrow was funded in (e.g. USDC).
+    pub target_token: Address,
+    /// Amount of `input_token` actually consumed by the swap.
+    pub input_spent: i128,
+    /// Amount of `input_token` refunded to the client (unspent remainder).
+    pub refund: i128,
+    /// The full target budget locked into escrow.
+    pub budget: i128,
 }
 
 #[contractevent]
@@ -752,6 +820,8 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            // #706 — zero hash until the provider commits a real content hash.
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
@@ -773,7 +843,177 @@ impl AgenticCommerceContract {
         next
     }
 
+    /// Create and fund multiple jobs in a single atomic transaction (#698).
+    ///
+    /// Agent orchestrators frequently dispatch tasks to a swarm of sub-agents
+    /// (e.g. namer, researcher, copywriter). This entry point lets them escrow
+    /// funds for all of those workers in one call, avoiding N base fees,
+    /// sequential ledger waits, and partial-failure states.
+    ///
+    /// # Atomicity
+    ///
+    /// The whole invocation is a single Soroban transaction: if any individual
+    /// request fails validation, or any token transfer fails (e.g. insufficient
+    /// allowance), the entire batch reverts and no job is created.
+    ///
+    /// # Bulk funding
+    ///
+    /// Budgets are aggregated per token contract and a single `transfer` is
+    /// performed per distinct token, pulling the summed budget from `client`
+    /// into the contract escrow. The client must pre-approve the contract for
+    /// at least the aggregated amount of each token used.
+    ///
+    /// # Panics
+    /// - `BatchTooLarge` if `requests` is empty or longer than `MAX_BATCH_SIZE`.
+    /// - `SelfEscrow` / `InvalidParties` / `UnsupportedToken` for invalid requests.
+    /// - `"budget below minimum"` if any request's budget is below `MIN_BUDGET`.
+    pub fn batch_create_jobs(
+        env: Env,
+        client: Address,
+        requests: Vec<JobRequest>,
+    ) -> Vec<u64> {
+        Self::require_not_paused(&env); // #29
+        client.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+        // (2) Reject empty batches and batches larger than the cap.
+        if requests.is_empty() || requests.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        let multi_eval_threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiEvalThreshold)
+            .unwrap_or(DEFAULT_MULTI_EVAL_THRESHOLD);
+        let snapshotted_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+        let next_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+
+        // (3) Validate every request before any state change or transfer so a
+        // bad request reverts the whole batch.
+        // (4) Aggregate budgets per token for a single bulk transfer each.
+        let mut tokens: Vec<Address> = Vec::new(&env);
+        let mut totals: Vec<i128> = Vec::new(&env);
+        let mut index = 0u32;
+        while index < requests.len() {
+            let req = requests.get(index).unwrap();
+            if req.budget < MIN_BUDGET {
+                panic!("budget below minimum");
+            }
+            if req.budget > multi_eval_threshold {
+                panic!("high-value job requires multiple evaluators");
+            }
+            if client == req.provider {
+                panic_with_error!(&env, Error::SelfEscrow);
+            }
+            if req.provider == req.evaluator {
+                panic_with_error!(&env, Error::InvalidParties);
+            }
+            // #694 — reject tokens not on the approved whitelist. If no tokens
+            // have been whitelisted yet the check is skipped, matching create_job.
+            if env.storage().instance().has(&DataKey::AllowedToken(req.token.clone())) == false {
+                let list: Vec<Address> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AllowedTokenList)
+                    .unwrap_or_else(|| Vec::new(&env));
+                if !list.is_empty() {
+                    panic_with_error!(&env, Error::UnsupportedToken);
+                }
+            }
+            // Accumulate the per-token total.
+            let mut found = false;
+            let mut t = 0u32;
+            while t < tokens.len() {
+                if tokens.get(t).unwrap() == req.token {
+                    let updated = totals
+                        .get(t)
+                        .unwrap()
+                        .checked_add(req.budget)
+                        .expect("batch budget overflow");
+                    totals.set(t, updated);
+                    found = true;
+                    break;
+                }
+                t += 1;
+            }
+            if !found {
+                tokens.push_back(req.token.clone());
+                totals.push_back(req.budget);
+            }
+            index += 1;
+        }
+
+        // (4) One bulk transfer per distinct token, client -> contract escrow.
+        let contract_addr = env.current_contract_address();
+        let mut t = 0u32;
+        while t < tokens.len() {
+            let token_addr = tokens.get(t).unwrap();
+            let total = totals.get(t).unwrap();
+            let token_client = token::TokenClient::new(&env, &token_addr);
+            // Sanity check (#17): `balance()` panics if `token` isn't a real SAC.
+            token_client.balance(&contract_addr);
+            token_client.transfer(&client, &contract_addr, &total);
+            t += 1;
+        }
+
+        // (5) Store each job with a fresh sequential id and Funded status.
+        let now = env.ledger().timestamp();
+        let mut job_ids: Vec<u64> = Vec::new(&env);
+        let mut offset = 0u64;
+        let mut index = 0u32;
+        while index < requests.len() {
+            let req = requests.get(index).unwrap();
+            let id = next_start + offset;
+            let job = Job {
+                id,
+                client: client.clone(),
+                provider: req.provider,
+                evaluator: req.evaluator,
+                token: req.token,
+                budget: req.budget,
+                released: 0,
+                status: JobStatus::Funded,
+                description: req.description,
+                deliverable: String::from_str(&env, ""),
+                funded_at: now,
+                created_at: now,
+                updated_at: now,
+                fee_bps: snapshotted_fee_bps, // #23
+            };
+            env.storage().persistent().set(&DataKey::Job(id), &job);
+            job_ids.push_back(id);
+            offset += 1;
+            index += 1;
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::NextId, &(next_start + offset));
+
+        // (6) Emit the batch event with the assigned job ids.
+        BatchJobsCreated {
+            client,
+            job_ids: job_ids.clone(),
+        }
+        .publish(&env);
+
+        job_ids
+    }
+
     /// Create and fund a high-value job with an explicit evaluator quorum.
+    ///
+    /// #704 — Backward-compatible unweighted path: every evaluator is assigned
+    /// weight 1, so `total_weight == evaluators.len()` and the weighted
+    /// threshold check degenerates to the original raw-count quorum.
     #[allow(clippy::too_many_arguments)]
     pub fn create_job_multi_eval(
         env: Env,
@@ -871,6 +1111,8 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            // #706 — zero hash until the provider commits a real content hash.
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
@@ -880,12 +1122,23 @@ impl AgenticCommerceContract {
             submitted_at: 0,      // #716
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
+        // #704 — assign weight 1 to every evaluator for the unweighted path.
+        let mut weights: soroban_sdk::Map<Address, u32> = soroban_sdk::Map::new(&env);
+        let mut widx = 0u32;
+        while widx < evaluators.len() {
+            weights.set(evaluators.get(widx).unwrap(), 1u32);
+            widx += 1;
+        }
+        let total_weight = evaluators.len();
         env.storage().persistent().set(
             &DataKey::Evaluators(next),
             &JobEvaluators {
                 evaluators,
                 threshold,
                 approvals: soroban_sdk::Map::new(&env),
+                evaluator_weights: weights,
+                total_weight,
+                accumulated_weight: 0,
             },
         );
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
@@ -898,8 +1151,167 @@ impl AgenticCommerceContract {
         next
     }
 
-    /// Provider submits the deliverable. Flips status Funded → Submitted.
-    pub fn submit(env: Env, caller: Address, id: u64, deliverable: String) {
+    /// #704 — Create and fund a job with a weighted evaluator quorum.
+    ///
+    /// `weights[i]` is the voting weight of `evaluators[i]`. Each weight must
+    /// be strictly positive, and the sum of all weights (`total_weight`) must
+    /// be at least `weight_threshold` so the quorum is actually reachable.
+    /// Completion is triggered once the accumulated weight of approving
+    /// evaluators reaches `weight_threshold`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_job_multi_eval_weighted(
+        env: Env,
+        client_addr: Address,
+        provider: Address,
+        evaluators: Vec<Address>,
+        weights: Vec<u32>,
+        weight_threshold: u32,
+        token: Address,
+        budget: i128,
+        description: String,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        client_addr.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+        if budget < MIN_BUDGET {
+            panic!("budget below minimum");
+        }
+        let multi_eval_threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiEvalThreshold)
+            .unwrap_or(DEFAULT_MULTI_EVAL_THRESHOLD);
+        if budget <= multi_eval_threshold {
+            panic!("job does not meet multi-evaluator threshold");
+        }
+        if evaluators.is_empty()
+            || evaluators.len() > MAX_EVALUATORS
+            || weights.len() != evaluators.len()
+            || weight_threshold == 0
+        {
+            panic!("invalid evaluator quorum");
+        }
+        if provider == client_addr {
+            panic_with_error!(&env, Error::SelfEscrow);
+        }
+        // Validate evaluators: no provider, no duplicates, and build the
+        // weight map while summing total weight.
+        let mut weight_map: soroban_sdk::Map<Address, u32> = soroban_sdk::Map::new(&env);
+        let mut total_weight: u32 = 0;
+        let mut index = 0u32;
+        while index < evaluators.len() {
+            let evaluator = evaluators.get(index).unwrap();
+            if evaluator == provider {
+                panic_with_error!(&env, Error::InvalidParties);
+            }
+            let weight = weights.get(index).unwrap();
+            if weight == 0 {
+                panic!("evaluator weight must be positive");
+            }
+            let mut previous = 0;
+            while previous < index {
+                if evaluators.get(previous).unwrap() == evaluator {
+                    panic!("duplicate evaluator");
+                }
+                previous += 1;
+            }
+            weight_map.set(evaluator, weight);
+            total_weight = total_weight
+                .checked_add(weight)
+                .expect("total weight overflow");
+            index += 1;
+        }
+        // Acceptance criteria: sum of weights must be >= weight_threshold.
+        if total_weight < weight_threshold {
+            panic!("total weight below threshold");
+        }
+
+        // #694 — reject tokens not on the approved whitelist.
+        // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
+        // is skipped so the contract can still be used before whitelist setup.
+        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+            let list: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AllowedTokenList)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !list.is_empty() {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+        }
+
+        let next: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+        let token_client = token::TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+        token_client.balance(&contract_addr);
+        token_client.transfer(&client_addr, &contract_addr, &budget);
+
+        let now = env.ledger().timestamp();
+        let primary_evaluator = evaluators.get(0).unwrap();
+        let job = Job {
+            id: next,
+            client: client_addr.clone(),
+            provider,
+            evaluator: primary_evaluator,
+            token,
+            budget,
+            released: 0,
+            status: JobStatus::Funded,
+            description,
+            deliverable: String::from_str(&env, ""),
+            funded_at: now,
+            created_at: now,
+            updated_at: now,
+            fee_bps,
+        };
+        env.storage().persistent().set(&DataKey::Job(next), &job);
+        env.storage().persistent().set(
+            &DataKey::Evaluators(next),
+            &JobEvaluators {
+                evaluators,
+                threshold: weight_threshold,
+                approvals: soroban_sdk::Map::new(&env),
+                evaluator_weights: weight_map,
+                total_weight,
+                accumulated_weight: 0,
+            },
+        );
+        env.storage().instance().set(&DataKey::NextId, &(next + 1));
+        JobCreated {
+            client: client_addr,
+            job_id: next,
+            budget,
+        }
+        .publish(&env);
+        next
+    }
+
+    /// Provider submits the deliverable together with its SHA-256 content hash.
+    /// Flips status Funded → Submitted.
+    ///
+    /// #706 — `deliverable_hash` is the SHA-256 digest of the deliverable
+    /// payload (32 bytes). It is stored immutably on the job: once submitted,
+    /// neither the provider nor the evaluator can change it. The evaluator can
+    /// later assert the hash in `complete()` to prove the content they reviewed
+    /// is exactly what was committed on-chain.
+    pub fn submit(
+        env: Env,
+        caller: Address,
+        id: u64,
+        deliverable: String,
+        deliverable_hash: soroban_sdk::BytesN<32>,
+    ) {
         Self::require_not_paused(&env); // #29
         caller.require_auth();
         let mut job: Job = env
@@ -926,15 +1338,22 @@ impl AgenticCommerceContract {
         if deliverable.len() > MAX_DELIVERABLE_LEN {
             panic!("deliverable too long");
         }
-        let now = env.ledger().timestamp();
+        // #706 — reject the all-zero digest: it is the sentinel used for
+        // "no hash committed yet" and must never be accepted as a real
+        // SHA-256 commitment.
+        let zero_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        if deliverable_hash == zero_hash {
+            panic!("deliverable hash cannot be zero");
+        }
         job.status = JobStatus::Submitted;
         job.deliverable = deliverable;
-        job.submitted_at = now; // #716
-        job.updated_at = now;
+        job.deliverable_hash = deliverable_hash.clone();
+        job.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobSubmitted {
             provider: caller,
+            deliverable_hash,
             job_id: id,
         }
         .publish(&env);
@@ -948,7 +1367,17 @@ impl AgenticCommerceContract {
     /// still produce a non-zero fee. A minimum 1-unit floor is applied when
     /// the proportional fee rounds to zero but both `budget` and `fee_bps`
     /// are positive (#539).
-    pub fn complete(env: Env, caller: Address, id: u64) {
+    ///
+    /// #706 — the evaluator may pass `expected_hash` to attest that the
+    /// content they reviewed matches the hash committed at submission time.
+    /// If provided and it differs from the stored `deliverable_hash`, the call
+    /// panics with `Error::HashMismatch` and no funds move.
+    pub fn complete(
+        env: Env,
+        caller: Address,
+        id: u64,
+        expected_hash: Option<soroban_sdk::BytesN<32>>,
+    ) {
         Self::require_not_paused(&env); // #29
         caller.require_auth();
         let mut job: Job = env
@@ -960,15 +1389,28 @@ impl AgenticCommerceContract {
             panic_with_error!(&env, Error::NotEvaluator);
         }
         if env.storage().persistent().has(&DataKey::Evaluators(id)) {
-            panic!("multi-evaluator job requires approvals");
+            // #704 — for weighted jobs, require the accumulated weight to meet
+            // the threshold rather than a raw evaluator count.
+            let quorum: JobEvaluators = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Evaluators(id))
+                .unwrap();
+            if quorum.accumulated_weight < quorum.threshold {
+                panic!("multi-evaluator job requires approvals");
+            }
         }
         // #22 — evaluator may resolve a job in either Submitted or Disputed state.
         if job.status != JobStatus::Submitted && job.status != JobStatus::Disputed {
             panic_with_error!(&env, Error::InvalidStatus);
         }
-        // #716 — apply SLA penalty (if any) before computing the fee.
-        let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(&job);
-        let penalized_budget = job.budget - penalty;
+        // #706 — optional content-hash attestation. Reject any assertion that
+        // does not match the immutable hash committed by the provider.
+        if let Some(expected) = expected_hash {
+            if expected != job.deliverable_hash {
+                panic_with_error!(&env, Error::HashMismatch);
+            }
+        }
         // #23 — use the fee_bps snapshotted at job creation time so admin
         // changes to the global rate don't retroactively alter this job.
         let fee: i128 = Self::compute_fee(penalized_budget, job.fee_bps);
@@ -1008,7 +1450,14 @@ impl AgenticCommerceContract {
         .publish(&env);
     }
 
-    /// Record an evaluator approval and release escrow when quorum is reached.
+    /// Record an evaluator approval and release escrow when the weighted
+    /// quorum is reached.
+    ///
+    /// #704 — The caller's weight is looked up from `evaluator_weights` and
+    /// added to `accumulated_weight`. Duplicate approvals are rejected via the
+    /// `approvals` map so the same evaluator can never double-count weight.
+    /// Completion/payout is triggered once `accumulated_weight >= threshold`.
+    /// Returns the accumulated weight so far.
     pub fn approve_job(env: Env, evaluator: Address, job_id: u64) -> u32 {
         Self::require_not_paused(&env);
         evaluator.require_auth();
@@ -1035,30 +1484,32 @@ impl AgenticCommerceContract {
         if !member {
             panic!("not an assigned evaluator");
         }
+        // Prevent double counting: an evaluator may only approve once.
         if quorum.approvals.get(evaluator.clone()).unwrap_or(false) {
             panic!("evaluator already approved");
         }
+        // #704 — look up this evaluator's weight and accumulate it.
+        let weight = quorum.evaluator_weights.get(evaluator.clone()).unwrap_or(0);
         quorum.approvals.set(evaluator.clone(), true);
-        let mut approval_count = 0u32;
-        for address in quorum.evaluators.iter() {
-            if quorum.approvals.get(address).unwrap_or(false) {
-                approval_count += 1;
-            }
-        }
+        quorum.accumulated_weight = quorum
+            .accumulated_weight
+            .checked_add(weight)
+            .expect("accumulated weight overflow");
+        let accumulated_weight = quorum.accumulated_weight;
         env.storage()
             .persistent()
             .set(&DataKey::Evaluators(job_id), &quorum);
         JobApproved {
             evaluator: evaluator.clone(),
             job_id,
-            approvals: approval_count,
+            approvals: accumulated_weight,
             threshold: quorum.threshold,
         }
         .publish(&env);
-        if approval_count >= quorum.threshold {
+        if accumulated_weight >= quorum.threshold {
             Self::settle_job(&env, &mut job, job_id, evaluator);
         }
-        approval_count
+        accumulated_weight
     }
 
     fn settle_job(env: &Env, job: &mut Job, id: u64, evaluator: Address) {
@@ -1342,6 +1793,173 @@ impl AgenticCommerceContract {
         env.storage().instance().get(&DataKey::AllowedToken(token))
     }
 
+    // -----------------------------------------------------------------------
+    // #713 — Cross-currency escrow settlements via Stellar Path Payments
+    // -----------------------------------------------------------------------
+
+    /// Admin-only: set the AMM/DEX router contract used for cross-currency swaps.
+    ///
+    /// The router is expected to expose a `swap_exact_out`-style entry point
+    /// that pulls `input_token` from the caller and delivers exactly
+    /// `target_amount` of `target_token` to the caller, returning the amount of
+    /// `input_token` consumed. This mirrors a Stellar DEX path payment
+    /// (`PathPaymentStrictReceive`) routed through a Soroban AMM pool.
+    pub fn set_amm_router(env: Env, admin: Address, router: Address) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != current_admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::AmmRouter, &router);
+    }
+
+    /// Read-only: return the configured AMM/DEX router address, if any.
+    pub fn get_amm_router(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AmmRouter)
+    }
+
+    /// #713 — Fund an existing job's escrow using a cross-currency swap.
+    ///
+    /// The client pays in `input_token` (e.g. XLM or EURC) and the escrow is
+    /// credited with exactly the job's `budget` denominated in the job's target
+    /// token (e.g. USDC). The swap is executed atomically against the configured
+    /// AMM/DEX router; if the required input exceeds `max_input_amount` the call
+    /// reverts with `Error::SlippageExceeded`, protecting the client from
+    /// adverse market movement.
+    ///
+    /// Any `input_token` not consumed by the swap is refunded to the client in
+    /// the same transaction, so the client never overpays.
+    ///
+    /// # Panics
+    /// - `ContractPaused` if the contract is paused.
+    /// - `JobNotFound` if no job exists for `job_id`.
+    /// - `NotClient` if `client` is not the job's client.
+    /// - `InvalidStatus` if the job is not in a fundable state.
+    /// - `UnsupportedToken` if either token is not whitelisted.
+    /// - `SlippageExceeded` if the required input exceeds `max_input_amount`.
+    pub fn fund_job_with_swap(
+        env: Env,
+        client: Address,
+        input_token: Address,
+        max_input_amount: i128,
+        job_id: u64,
+    ) -> i128 {
+        Self::require_not_paused(&env);
+        client.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+        if max_input_amount <= 0 {
+            panic!("max_input_amount must be positive");
+        }
+
+        let mut job: Job = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Job(job_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::JobNotFound));
+        if client != job.client {
+            panic_with_error!(&env, Error::NotClient);
+        }
+        // The job must be fundable: either freshly created (Open) or awaiting
+        // its escrow deposit. Jobs already Funded/Submitted/Completed cannot be
+        // re-funded through this path.
+        if job.status != JobStatus::Open && job.status != JobStatus::Funded {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+        // Guard against double-funding an already-escrowed job.
+        if job.released != 0 || job.status == JobStatus::Funded {
+            panic_with_error!(&env, Error::InvalidStatus);
+        }
+
+        // Both the input token and the job's target token must be whitelisted.
+        // As with create_job, the check is skipped when no tokens have been
+        // whitelisted yet (fresh deploy) so the contract remains usable.
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenList)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            if !env.storage().instance().has(&DataKey::AllowedToken(input_token.clone())) {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+            if !env.storage().instance().has(&DataKey::AllowedToken(job.token.clone())) {
+                panic_with_error!(&env, Error::UnsupportedToken);
+            }
+        }
+
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AmmRouter)
+            .unwrap_or_else(|| panic!("amm router not configured"));
+
+        let contract_addr = env.current_contract_address();
+        let input_client = token::TokenClient::new(&env, &input_token);
+        let target_client = token::TokenClient::new(&env, &job.token);
+
+        // Pull the maximum the client is willing to spend into the contract so
+        // the router can draw from it. Any unspent remainder is refunded below.
+        input_client.balance(&contract_addr);
+        input_client.transfer(&client, &contract_addr, &max_input_amount);
+
+        // Ask the router to deliver exactly `job.budget` of the target token to
+        // the escrow, spending at most `max_input_amount` of the input token.
+        // The router returns the amount of input actually consumed.
+        let input_spent: i128 = env.invoke_contract(
+            &router,
+            &soroban_sdk::Symbol::new(&env, "swap_exact_out"),
+            soroban_sdk::vec![
+                &env,
+                contract_addr.clone().into_val(&env),
+                input_token.clone().into_val(&env),
+                job.token.clone().into_val(&env),
+                job.budget.into_val(&env),
+                max_input_amount.into_val(&env),
+            ],
+        );
+
+        // Slippage guard: the router must not have consumed more than the
+        // client authorised, and must have consumed a sane positive amount.
+        if input_spent <= 0 || input_spent > max_input_amount {
+            panic_with_error!(&env, Error::SlippageExceeded);
+        }
+
+        // Verify the escrow actually received the full target budget. If the
+        // router under-delivered we revert rather than silently under-funding.
+        let escrow_balance = target_client.balance(&contract_addr);
+        if escrow_balance < job.budget {
+            panic_with_error!(&env, Error::SlippageExceeded);
+        }
+
+        // Refund any unspent input remainder back to the client.
+        let refund = max_input_amount - input_spent;
+        if refund > 0 {
+            input_client.transfer(&contract_addr, &client, &refund);
+        }
+
+        // Transition the job to Funded and stamp the funding time.
+        let now = env.ledger().timestamp();
+        job.status = JobStatus::Funded;
+        job.funded_at = now;
+        job.updated_at = now;
+        env.storage().persistent().set(&DataKey::Job(job_id), &job);
+
+        SwapFunded {
+            client,
+            job_id,
+            input_token,
+            target_token: job.token.clone(),
+            input_spent,
+            refund,
+            budget: job.budget,
+        }
+        .publish(&env);
+
+        input_spent
+    }
+
     /// Read the configured high-value threshold in token smallest units.
     pub fn multi_eval_threshold(env: Env) -> i128 {
         env.storage()
@@ -1371,21 +1989,26 @@ impl AgenticCommerceContract {
         env.storage().persistent().get(&DataKey::Job(id))
     }
 
-    /// Read the evaluator list, quorum, and approval count for a multi-eval job.
+    /// Read the evaluator list, quorum, and accumulated approval weight for a
+    /// multi-eval job.
+    ///
+    /// #704 — The third tuple element is now the accumulated weight of
+    /// approving evaluators (which equals the raw approval count for
+    /// unweighted jobs where every evaluator has weight 1).
     pub fn get_evaluator_progress(env: Env, id: u64) -> Option<(Vec<Address>, u32, u32)> {
         let quorum: Option<JobEvaluators> = env
             .storage()
             .persistent()
             .get(&DataKey::Evaluators(id));
         quorum.map(|quorum| {
-            let mut approvals = 0u32;
-            for evaluator in quorum.evaluators.iter() {
-                if quorum.approvals.get(evaluator).unwrap_or(false) {
-                    approvals += 1;
-                }
-            }
-            (quorum.evaluators, quorum.threshold, approvals)
+            (quorum.evaluators, quorum.threshold, quorum.accumulated_weight)
         })
+    }
+
+    /// #704 — Read the full weighted quorum state for a job, including the
+    /// per-evaluator weights, total weight, and accumulated approval weight.
+    pub fn get_evaluator_weights(env: Env, id: u64) -> Option<JobEvaluators> {
+        env.storage().persistent().get(&DataKey::Evaluators(id))
     }
 
     /// Open a one-way channel by escrowing a fixed token deposit.
@@ -1807,6 +2430,8 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            // #706 — zero hash until the provider commits a real content hash.
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
@@ -1870,7 +2495,7 @@ impl AgenticCommerceContract {
         if is_blank {
             panic!("deliverable cannot be empty");
         }
-        if deliverable.len() > MAX_DELIVERABLE_LEN {
+        if deliverable.len() > MAX_METADATA_URI_LEN {
             panic!("deliverable too long");
         }
         let mut milestones: Vec<Milestone> = env

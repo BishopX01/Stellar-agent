@@ -11,34 +11,70 @@ version: "3.9"
 #   docker compose up buyer            # interactive TUI only
 #
 # Services:
-#   soroban-rpc   local Stellar devnet (Soroban-enabled, port 8000)
+#   stellar       local standalone Stellar network + Soroban RPC (port 8000)
+#   init          one-shot: waits for RPC, compiles + deploys contracts, funds keys
 #   sdk           build the marc-stellar-sdk TypeScript package
 #   dashboard     web dashboard UI (port 3000)
 #   registry      agent discovery API (port 4500)
 #   seller-*      agent workers (ports 4501-4504)
 #   buyer         interactive Blessed TUI (healthcheck port 4550, stdin required)
+#
+# Offline Local Development:
+#   Everything runs against the in-container standalone network — no external
+#   network access is required. `docker compose up` generates .env.docker with
+#   the local RPC URL and deployed contract IDs, then boots the full stack.
 
 x-node: &node
-  image: node:22-slim
   working_dir: /app
   volumes:
     - .:/app
-  env_file: ${ENV_FILE:-.env}
+  env_file:
+    - path: ${ENV_FILE:-.env}
+      required: false
+    - path: .env.docker
+      required: false
   networks:
     - marc-net
+  user: nonroot
 
 services:
-  soroban-rpc:
-    image: stellar/quickstart:latest
-    command: --local --enable-soroban
+  # ── Local Stellar / Soroban Standalone Network ────────────────────────────
+  stellar:
+    image: stellar/quickstart:testing
+    command: --standalone --enable-soroban-rpc --enable-core-artificially-accelerate-time
     ports:
       - "8000:8000"
+    environment:
+      NETWORK: standalone
+      ENABLE_SOROBAN_RPC: "true"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/.well-known/stellar.toml"]
-      interval: 15s
+      test: ["CMD-SHELL", "curl -sf -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' http://localhost:8000/soroban/rpc || exit 1"]
+      interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 40s
+      retries: 30
+      start_period: 30s
+    networks:
+      - marc-net
+
+  # ── Init: compile + deploy contracts, fund test keypairs ──────────────────
+  init:
+    <<: *node
+    working_dir: /app
+    command: sh -c "
+      echo '[init] waiting for local Soroban RPC...' &&
+      until curl -sf -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' http://stellar:8000/soroban/rpc >/dev/null 2>&1; do sleep 2; done &&
+      echo '[init] RPC ready' &&
+      sh scripts/init-local.sh
+    "
+    environment:
+      SOROBAN_RPC_URL: http://stellar:8000/soroban/rpc
+      STELLAR_NETWORK: standalone
+      STELLAR_NETWORK_PASSPHRASE: 'Standalone Network ; February 2017'
+      ENV_FILE: .env.docker
+    restart: "no"
+    depends_on:
+      stellar:
+        condition: service_healthy
     networks:
       - marc-net
 
@@ -53,27 +89,25 @@ services:
   # ── Web Dashboard ──────────────────────────────────────────────────────────
   dashboard:
     <<: *node
-    working_dir: /app/dashboard
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx server.ts
-    "
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    working_dir: /app
     ports:
       - "3000:3000"
     depends_on:
       sdk:
         condition: service_completed_successfully
-      soroban-rpc:
-        condition: service_healthy
+      init:
+        condition: service_completed_successfully
 
   # ── Agent Registry ────────────────────────────────────────────────────────
   registry:
     <<: *node
-    working_dir: /app/agents/registry
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx server.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/registry/Dockerfile
+    working_dir: /app
     ports:
       - "4500:4500"
     healthcheck:
@@ -88,11 +122,10 @@ services:
   # ── Seller Agents ─────────────────────────────────────────────────────────
   seller-webbuilder:
     <<: *node
-    working_dir: /app/agents/seller-webbuilder
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-webbuilder/Dockerfile
+    working_dir: /app
     ports:
       - "4501:4501"
     healthcheck:
@@ -109,11 +142,10 @@ services:
 
   seller-copywriter:
     <<: *node
-    working_dir: /app/agents/seller-copywriter
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-copywriter/Dockerfile
+    working_dir: /app
     ports:
       - "4502:4502"
     healthcheck:
@@ -130,11 +162,10 @@ services:
 
   seller-namer:
     <<: *node
-    working_dir: /app/agents/seller-namer
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-namer/Dockerfile
+    working_dir: /app
     ports:
       - "4503:4503"
     healthcheck:
@@ -151,11 +182,10 @@ services:
 
   seller-researcher:
     <<: *node
-    working_dir: /app/agents/seller-researcher
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/seller-researcher/Dockerfile
+    working_dir: /app
     ports:
       - "4504:4504"
     healthcheck:
@@ -173,25 +203,23 @@ services:
   # ── Soroban Event Indexer ─────────────────────────────────────────────────
   indexer:
     <<: *node
-    working_dir: /app/indexer
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx src/index.ts
-    "
+    build:
+      context: .
+      dockerfile: indexer/Dockerfile
+    working_dir: /app
     depends_on:
       sdk:
         condition: service_completed_successfully
-      soroban-rpc:
-        condition: service_healthy
+      init:
+        condition: service_completed_successfully
 
   # ── Buyer TUI (interactive) ───────────────────────────────────────────────
   buyer:
     <<: *node
-    working_dir: /app/agents/buyer
-    command: sh -c "
-      npm install --silent 2>/dev/null &&
-      npx tsx index.ts
-    "
+    build:
+      context: .
+      dockerfile: agents/buyer/Dockerfile
+    working_dir: /app
     ports:
       - "4550:4550"
     healthcheck:

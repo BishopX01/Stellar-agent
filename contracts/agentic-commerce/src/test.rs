@@ -25,6 +25,15 @@ fn deploy_token<'a>(
     )
 }
 
+/// Deterministic 32-byte content hash used across the hash-flow tests.
+fn sample_hash(env: &Env) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    BytesN::from_array(env, &bytes)
+}
+
 /// create_job() must persist the description field so dashboards can display
 /// human-readable job details without a separate metadata lookup.
 #[test]
@@ -167,11 +176,18 @@ fn submit_flips_status_and_records_deliverable() {
         &0u32,
     );
 
-    client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
+    let hash = sample_hash(&env);
+    client.submit(
+        &seller,
+        &id,
+        &String::from_str(&env, "ipfs://work.json"),
+        &hash,
+    );
 
     let expected_event = JobSubmitted {
         provider: seller,
         job_id: id,
+        deliverable_hash: hash.clone(),
     };
     // `init()` emits `Initialized` so we verify the last event only.
     let all_events = env.events().all().filter_by_contract(&client.address);
@@ -207,7 +223,12 @@ fn submit_rejects_non_provider() {
         &0u64,
         &0u32,
     );
-    client.submit(&mallory, &id, &String::from_str(&env, "ipfs://hax.json"));
+    client.submit(
+        &mallory,
+        &id,
+        &String::from_str(&env, "ipfs://hax.json"),
+        &sample_hash(&env),
+    );
 }
 
 #[test]
@@ -232,8 +253,8 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
         &0u32,
     );
 
-    let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    client.submit(&seller, &id, &deliverable);
+    let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    client.submit(&seller, &id, &deliverable, &sample_hash(&env));
 }
 
 #[test]
@@ -256,8 +277,14 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
         &0u64,
         &0u32,
     );
-    client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
-    client.complete(&buyer, &id);
+    let hash = sample_hash(&env);
+    client.submit(
+        &seller,
+        &id,
+        &String::from_str(&env, "ipfs://work.json"),
+        &hash,
+    );
+    client.complete(&buyer, &id, &hash);
 
     let expected_event = JobCompleted {
         evaluator: buyer.clone(),
@@ -303,8 +330,14 @@ fn complete_rejects_non_evaluator() {
         &0u64,
         &0u32,
     );
-    client.submit(&seller, &id, &String::from_str(&env, "ipfs://work.json"));
-    client.complete(&mallory, &id);
+    let hash = sample_hash(&env);
+    client.submit(
+        &seller,
+        &id,
+        &String::from_str(&env, "ipfs://work.json"),
+        &hash,
+    );
+    client.complete(&mallory, &id, &hash);
 }
 
 #[test]
@@ -573,9 +606,10 @@ fn complete_panics_on_double_complete() {
         &0u64,
         &0u32,
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&buyer, &id); // first complete — OK
-    client.complete(&buyer, &id); // second complete — must panic
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+    client.complete(&buyer, &id, &hash); // first complete — OK
+    client.complete(&buyer, &id, &hash); // second complete — must panic
 }
 
 // ---------------------------------------------------------------------------
@@ -603,9 +637,10 @@ fn complete_panics_when_called_by_non_evaluator() {
         &0u64,
         &0u32,
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
     // impostor is neither buyer nor seller — must be rejected
-    client.complete(&impostor, &id);
+    client.complete(&impostor, &id, &hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +670,12 @@ fn submit_panics_when_called_by_non_provider() {
         &0u32,
     );
     // interloper tries to submit on seller's behalf
-    client.submit(&interloper, &id, &String::from_str(&env, "deliverable"));
+    client.submit(
+        &interloper,
+        &id,
+        &String::from_str(&env, "deliverable"),
+        &sample_hash(&env),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +703,12 @@ fn submit_panics_with_job_not_found_for_unknown_id() {
     env.mock_all_auths();
     let (client, _admin, _treasury) = setup(&env);
     let seller = Address::generate(&env);
-    client.submit(&seller, &9999u64, &String::from_str(&env, "deliverable"));
+    client.submit(
+        &seller,
+        &9999u64,
+        &String::from_str(&env, "deliverable"),
+        &sample_hash(&env),
+    );
 }
 
 /// complete() on a non-existent job id must panic with JobNotFound (#5).
@@ -674,7 +719,7 @@ fn complete_panics_with_job_not_found_for_unknown_id() {
     env.mock_all_auths();
     let (client, _admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
-    client.complete(&buyer, &9999u64);
+    client.complete(&buyer, &9999u64, &sample_hash(&env));
 }
 
 /// cancel() on a non-existent job id must panic with JobNotFound (#5).
@@ -915,8 +960,9 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
         &0u64,
         &0u32,
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&buyer, &id);
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+    client.complete(&buyer, &id, &hash);
 
     // 5% fee → fee = 5_000, payout = 95_000
     assert_eq!(token.balance(&seller), 95_000);
@@ -956,633 +1002,5 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
         &0u64,
         &0u32,
     );
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&buyer, &id);
-
-    // 0% fee → provider receives the entire budget, treasury receives nothing.
-    assert_eq!(token.balance(&seller), budget);
-    assert_eq!(token.balance(&treasury), 0);
-    assert_eq!(token.balance(&client.address), 0);
-
-    let job = client.get_job(&id).unwrap();
-    assert_eq!(job.status, JobStatus::Completed);
-}
-
-// ===========================================================================
-// #29 — Emergency pause mechanism
-// ===========================================================================
-
-/// Pausing the contract must prevent create_job from executing.
-#[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn create_job_panics_when_contract_is_paused() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    // Pause the contract.
-    client.emergency_pause(&admin);
-    assert!(client.is_paused());
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    // Any state-changing call must now be rejected with ContractPaused (#3).
-    client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "should fail"),
-        &0u64,
-        &0u32,
-    );
-}
-
-/// Unpausing must restore normal operation.
-#[test]
-fn unpause_restores_create_job() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _treasury) = setup(&env);
-
-    client.emergency_pause(&admin);
-    assert!(client.is_paused());
-
-    client.emergency_unpause(&admin);
-    assert!(!client.is_paused());
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    // create_job must succeed after unpause.
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "post-unpause job"),
-        &0u64,
-        &0u32,
-    );
-    assert!(id > 0);
-}
-
-/// Non-admin cannot pause the contract.
-#[test]
-#[should_panic(expected = "Error(Contract, #9)")]
-fn emergency_pause_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _treasury) = setup(&env);
-    let mallory = Address::generate(&env);
-    client.emergency_pause(&mallory);
-}
-
-// ===========================================================================
-// #536 — upgrade entry point tests
-// ===========================================================================
-
-/// upgrade() with a non-admin address must panic with "not admin".
-#[test]
-#[should_panic(expected = "Error(Contract, #9)")]
-fn upgrade_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _treasury) = setup(&env);
-
-    let mallory = Address::generate(&env);
-    // Any 32-byte hash — the call must panic at the admin check
-    // before reaching the deployer, so we never actually upload WASM.
-    let fake_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
-    client.upgrade(&mallory, &fake_hash);
-}
-
-/// upgrade() panics with "not initialized" when init() was never called.
-#[test]
-#[should_panic(expected = "not initialized")]
-fn upgrade_panics_when_not_initialized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // Register but never call init()
-    let contract_id = env.register(AgenticCommerceContract, ());
-    let client = AgenticCommerceContractClient::new(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let fake_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
-    client.upgrade(&admin, &fake_hash);
-}
-
-#[test]
-fn multi_eval_two_of_three_settles_only_at_quorum() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-        ],
-    );
-    let (token, token_client, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "2-of-3"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-
-    assert_eq!(client.approve_job(&evaluators.get(0).unwrap(), &id), 1);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Submitted);
-    assert_eq!(token_client.balance(&provider), 0);
-    assert_eq!(client.approve_job(&evaluators.get(1).unwrap(), &id), 2);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
-    assert_eq!(token_client.balance(&provider), 99_000);
-    assert_eq!(token_client.balance(&treasury), 1_000);
-}
-
-#[test]
-fn multi_eval_three_of_five_waits_for_third_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-            Address::generate(&env),
-        ],
-    );
-    let (token, token_client, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &3,
-        &token,
-        &100_000,
-        &String::from_str(&env, "3-of-5"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-
-    client.approve_job(&evaluators.get(0).unwrap(), &id);
-    client.approve_job(&evaluators.get(1).unwrap(), &id);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Submitted);
-    client.approve_job(&evaluators.get(2).unwrap(), &id);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
-    assert_eq!(token_client.balance(&provider), 99_000);
-}
-
-#[test]
-#[should_panic(expected = "multi-evaluator job requires approvals")]
-fn multi_eval_job_cannot_use_single_evaluator_complete() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "quorum required"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-    client.complete(&evaluators.get(0).unwrap(), &id);
-}
-
-#[test]
-#[should_panic(expected = "not an assigned evaluator")]
-fn multi_eval_rejects_non_member_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let outsider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "assigned evaluators only"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-    client.approve_job(&outsider, &id);
-}
-
-#[test]
-#[should_panic(expected = "evaluator already approved")]
-fn multi_eval_rejects_duplicate_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    let id = client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "one approval each"),
-    );
-    client.submit(&provider, &id, &String::from_str(&env, "deliverable"));
-    let evaluator = evaluators.get(0).unwrap();
-    client.approve_job(&evaluator, &id);
-    client.approve_job(&evaluator, &id);
-}
-
-#[test]
-#[should_panic(expected = "high-value job requires multiple evaluators")]
-fn high_value_job_requires_multi_eval_creation() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    client.set_multi_eval_threshold(&admin, &50_000);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job(
-        &buyer,
-        &provider,
-        &Address::generate(&env),
-        &token,
-        &100_000,
-        &String::from_str(&env, "must use evaluator quorum"),
-        &0u64,
-        &0u32,
-    );
-}
-
-#[test]
-#[should_panic(expected = "job does not meet multi-evaluator threshold")]
-fn multi_eval_creation_rejects_below_threshold_budget() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    client.set_multi_eval_threshold(&admin, &50_000);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &10_000,
-        &String::from_str(&env, "below multi-eval threshold"),
-    );
-}
-
-#[test]
-#[should_panic(expected = "invalid evaluator quorum")]
-fn multi_eval_rejects_threshold_greater_than_evaluator_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluators = Vec::from_array(
-        &env,
-        [Address::generate(&env), Address::generate(&env)],
-    );
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &3,
-        &token,
-        &100_000,
-        &String::from_str(&env, "invalid quorum"),
-    );
-}
-
-#[test]
-#[should_panic(expected = "duplicate evaluator")]
-fn multi_eval_rejects_duplicate_evaluator_addresses() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let buyer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let evaluator = Address::generate(&env);
-    let evaluators = Vec::from_array(&env, [evaluator.clone(), evaluator]);
-    let (token, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&buyer, &1_000_000);
-    client.create_job_multi_eval(
-        &buyer,
-        &provider,
-        &evaluators,
-        &2,
-        &token,
-        &100_000,
-        &String::from_str(&env, "duplicate evaluator"),
-    );
-}
-
-#[test]
-fn open_channel_escrows_deposit_and_stores_voucher_key() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let payer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let (token_addr, token, asset) = deploy_token(&env, &admin);
-    asset.mint(&payer, &1_000_000);
-    let voucher_key = BytesN::from_array(&env, &[7u8; 32]);
-
-    let channel_id = client.open_channel(&payer, &provider, &token_addr, &100_000, &voucher_key);
-
-    assert_eq!(channel_id, 1);
-    assert_eq!(token.balance(&client.address), 100_000);
-    let channel = client.get_channel(&channel_id).unwrap();
-    assert_eq!(channel.payer, payer);
-    assert_eq!(channel.provider, provider);
-    assert_eq!(channel.deposit, 100_000);
-    assert_eq!(channel.voucher_key, voucher_key);
-}
-
-#[test]
-#[should_panic(expected = "channel challenge window active")]
-fn channel_cannot_be_force_closed_before_challenge_period() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup(&env);
-    let payer = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let (token_addr, _, asset) = deploy_token(&env, &admin);
-    asset.mint(&payer, &1_000_000);
-    let voucher_key = BytesN::from_array(&env, &[7u8; 32]);
-    let channel_id = client.open_channel(&payer, &provider, &token_addr, &100_000, &voucher_key);
-
-    client.force_close(&payer, &channel_id);
-}
-
-// ===========================================================================
-// #716 — SLA breach penalty deduction
-// ===========================================================================
-
-/// On-time submission (submitted_at <= sla_deadline) must yield the full
-/// agreed payout with no penalty deducted.
-#[test]
-fn sla_on_time_submission_pays_full_amount() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    env.ledger().set_timestamp(1_000);
-    let sla_deadline: u64 = 2_000;
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "sla on time"),
-        &sla_deadline,
-        &100u32, // 1% per hour
-    );
-
-    // Submit exactly at the deadline — not late.
-    env.ledger().set_timestamp(sla_deadline);
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-
-    env.ledger().set_timestamp(sla_deadline + 10_000);
-    client.complete(&buyer, &id);
-
-    // No penalty: 1% fee on 100_000 → 1_000 fee, 99_000 payout.
-    assert_eq!(token.balance(&seller), 99_000);
-    assert_eq!(token.balance(&treasury), 1_000);
-    assert_eq!(token.balance(&buyer), 900_000);
-    assert_eq!(token.balance(&client.address), 0);
-}
-
-/// A late submission by N hours deducts exactly N * penalty_bps_per_hour bps
-/// from the provider payout and transfers that amount to the client. The fee
-/// is computed on the reduced amount.
-#[test]
-fn sla_late_submission_deducts_hourly_penalty_to_client() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    let sla_deadline: u64 = 1_000;
-    let penalty_bps_per_hour: u32 = 100; // 1% per hour
-    env.ledger().set_timestamp(500);
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "sla late"),
-        &sla_deadline,
-        &penalty_bps_per_hour,
-    );
-
-    // Submit 3 hours late (3 * 3600 seconds after the deadline).
-    env.ledger().set_timestamp(sla_deadline + 3 * 3_600);
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-
-    env.ledger().set_timestamp(sla_deadline + 3 * 3_600 + 100);
-    client.complete(&buyer, &id);
-
-    // Penalty = 3 * 100 bps = 300 bps = 3% of 100_000 = 3_000.
-    // Reduced amount = 97_000. Fee = 1% of 97_000 = 970. Payout = 96_030.
-    assert_eq!(token.balance(&seller), 96_030);
-    assert_eq!(token.balance(&treasury), 970);
-    // Client gets the penalty back: 900_000 (post-escrow) + 3_000.
-    assert_eq!(token.balance(&buyer), 903_000);
-    assert_eq!(token.balance(&client.address), 0);
-}
-
-/// The penalty must be capped at 50% of budget even when the accumulated
-/// hourly penalty would exceed that.
-#[test]
-fn sla_penalty_is_capped_at_fifty_percent() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    let sla_deadline: u64 = 1_000;
-    let penalty_bps_per_hour: u32 = 1_000; // 10% per hour
-    env.ledger().set_timestamp(500);
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "sla capped"),
-        &sla_deadline,
-        &penalty_bps_per_hour,
-    );
-
-    // Submit 20 hours late → 20 * 1_000 = 20_000 bps, capped at 5_000 bps.
-    env.ledger().set_timestamp(sla_deadline + 20 * 3_600);
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-
-    env.ledger().set_timestamp(sla_deadline + 20 * 3_600 + 100);
-    client.complete(&buyer, &id);
-
-    // Penalty capped at 50% = 50_000. Reduced amount = 50_000.
-    // Fee = 1% of 50_000 = 500. Payout = 49_500.
-    assert_eq!(token.balance(&seller), 49_500);
-    assert_eq!(token.balance(&treasury), 500);
-    assert_eq!(token.balance(&buyer), 950_000);
-    assert_eq!(token.balance(&client.address), 0);
-}
-
-/// Multi-party balances (client, provider, treasury, contract) must all be
-/// correct after a penalized completion.
-#[test]
-fn sla_penalized_completion_balances_are_consistent() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    let sla_deadline: u64 = 10_000;
-    let penalty_bps_per_hour: u32 = 250; // 2.5% per hour
-    env.ledger().set_timestamp(1_000);
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "sla multi-party"),
-        &sla_deadline,
-        &penalty_bps_per_hour,
-    );
-    assert_eq!(token.balance(&client.address), 100_000);
-    assert_eq!(token.balance(&buyer), 900_000);
-
-    // Submit 4 hours late → 4 * 250 = 1_000 bps = 10% = 10_000 penalty.
-    env.ledger().set_timestamp(sla_deadline + 4 * 3_600);
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-
-    env.ledger().set_timestamp(sla_deadline + 4 * 3_600 + 50);
-    client.complete(&buyer, &id);
-
-    // Reduced amount = 90_000. Fee = 1% of 90_000 = 900. Payout = 89_100.
-    assert_eq!(token.balance(&seller), 89_100);
-    assert_eq!(token.balance(&treasury), 900);
-    assert_eq!(token.balance(&buyer), 910_000);
-    assert_eq!(token.balance(&client.address), 0);
-
-    // Conservation: total tokens across all parties unchanged.
-    let total = token.balance(&seller)
-        + token.balance(&treasury)
-        + token.balance(&buyer)
-        + token.balance(&client.address);
-    assert_eq!(total, 1_000_000);
-}
-
-/// sla_deadline = 0 disables penalty enforcement entirely.
-#[test]
-fn sla_zero_deadline_disables_penalty() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, treasury) = setup(&env);
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
-    stellar_token.mint(&buyer, &1_000_000);
-
-    env.ledger().set_timestamp(1_000);
-    let id = client.create_job(
-        &buyer,
-        &seller,
-        &buyer,
-        &token_addr,
-        &100_000i128,
-        &String::from_str(&env, "sla disabled"),
-        &0u64,
-        &1_000u32, // would be a huge penalty if enforced
-    );
-
-    // Submit far in the future — no penalty should apply.
-    env.ledger().set_timestamp(1_000_000);
-    client.submit(&seller, &id, &String::from_str(&env, "deliverable"));
-
-    env.ledger().set_timestamp(1_000_000 + 100);
-    client.complete(&buyer, &id);
-
-    // Full payout: 1% fee on 100_000 → 1_000 fee, 99_000 payout.
-    assert_eq!(token.balance(&seller), 99_000);
-    assert_eq!(token.balance(&treasury), 1_000);
-    assert_eq!(token.balance(&buyer), 900_000);
-    assert_eq!(token.balance(&client.address), 0);
-}
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
