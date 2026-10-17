@@ -42,6 +42,11 @@ import {
   requireAuth,
   requireMatchingWallet,
 } from "./lib/auth.js";
+import {
+  createMatchmakingEngine,
+  type MatchmakingEngine,
+  type AgentDocument,
+} from "./lib/matchmaking.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -176,6 +181,58 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
 const identityContract = new Contract(cfg.identityContract);
 const commerceContract = new Contract(cfg.commerceContract);
 
+// ── #736: Semantic matchmaking engine ────────────────────────────────────────
+// Embeddings are generated lazily and cached in a vector index (sqlite-vec when
+// available, otherwise an in-memory cosine index). When the embedding engine is
+// disabled via EMBEDDINGS_ENABLED=false, the engine transparently falls back to
+// lexical (token-overlap) search so the endpoint keeps working.
+const matchmaking: MatchmakingEngine = createMatchmakingEngine({
+  enabled: process.env.EMBEDDINGS_ENABLED !== "false",
+  dimensions: Number(process.env.EMBEDDING_DIMENSIONS ?? 384),
+  model: process.env.EMBEDDING_MODEL ?? "Xenova/all-MiniLM-L6-v2",
+  sqlitePath: process.env.VECTOR_DB_PATH,
+});
+
+/** Build the text document that represents an agent for embedding purposes. */
+function agentToDocument(agent: {
+  id?: unknown;
+  owner?: unknown;
+  uri?: unknown;
+  [key: string]: unknown;
+}): AgentDocument {
+  const id = String(agent.id ?? agent.owner ?? "");
+  const parts: string[] = [];
+  if (agent.uri) parts.push(String(agent.uri));
+  for (const key of ["name", "description", "capabilities", "skills", "tags", "category"]) {
+    const value = agent[key];
+    if (typeof value === "string" && value.trim()) parts.push(value);
+    else if (Array.isArray(value)) parts.push(value.map(String).join(" "));
+  }
+  return { id, text: parts.join(" \n ").trim() || id };
+}
+
+/** Index a batch of agents into the matchmaking engine. */
+async function indexAgents(agents: Array<Record<string, unknown>>): Promise<void> {
+  const docs = agents.map((agent) => agentToDocument(agent));
+  await matchmaking.upsert(docs);
+}
+
+/** Index a single agent (called after registration). */
+async function indexAgent(agent: Record<string, unknown>): Promise<void> {
+  await matchmaking.upsert([agentToDocument(agent)]);
+}
+
+/** Warm the index on startup so the first match request is fast. */
+async function warmMatchmakingIndex(): Promise<void> {
+  try {
+    const agents = (await getAllAgents()) as unknown as Array<Record<string, unknown>>;
+    await indexAgents(agents);
+    console.log(`[matchmaking] indexed ${agents.length} agents (mode=${matchmaking.mode})`);
+  } catch (err) {
+    console.warn("[matchmaking] failed to warm index:", (err as Error).message);
+  }
+}
+
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
@@ -299,6 +356,11 @@ const jobsQuerySchema = z.object({
 const agentsQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(24),
+});
+
+const agentMatchSchema = z.object({
+  query: z.string().min(1, "query must be a non-empty string"),
+  topK: z.coerce.number().int().positive().max(100).default(10),
 });
 
 function parseBudget(value: string | number | undefined, defaultValue = 10_000_000n): bigint {
@@ -744,6 +806,26 @@ app.get("/api/agents", async (req, res) => {
   }
 });
 
+// POST /api/agents/match — semantic agent discovery (#736)
+app.post("/api/agents/match", async (req, res) => {
+  try {
+    const parsed = agentMatchSchema.parse(req.body);
+    const started = process.hrtime.bigint();
+    const results = await matchmaking.match(parsed.query, parsed.topK);
+    const latencyMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+    res.json({
+      query: parsed.query,
+      topK: parsed.topK,
+      mode: matchmaking.mode,
+      latencyMs: Number(latencyMs.toFixed(2)),
+      results,
+    });
+  } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // POST /api/agents/register
 app.post(
   "/api/agents/register",
@@ -766,6 +848,12 @@ app.post(
       const kp = getKeypair(parsed.wallet);
       const agentId = await identity.register(kp, parsed.uri || "ipfs://dashboard-agent");
       invalidateAgents();
+      // Index the newly registered agent for semantic discovery.
+      await indexAgent({
+        id: agentId.toString(),
+        owner: kp.publicKey(),
+        uri: parsed.uri || "ipfs://dashboard-agent",
+      }).catch((err) => console.warn("[matchmaking] index failed:", (err as Error).message));
       res.json({ agentId: agentId.toString() });
     } catch (err: unknown) {
       handleRouteError(err, res);
@@ -1225,4 +1313,7 @@ app.listen(PORT, () => {
   console.log(`Bear Dashboard → http://localhost:${PORT}`);
   console.log(`  Buyer:  ${buyerKeypair.publicKey()}`);
   console.log(`  Seller: ${sellerKeypair.publicKey()}`);
+  void warmMatchmakingIndex();
 });
+
+export { app, matchmaking };
