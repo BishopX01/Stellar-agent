@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 3 * * *'
 
 jobs:
   build:
@@ -64,3 +66,93 @@ jobs:
             echo "commerce WASM exceeds its configured size budget" >&2
             exit 1
           fi
+
+  gas-profile:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gas-profile-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            gas-profile-${{ runner.os }}-
+      - name: Profile contract gas usage
+        run: bash scripts/profile-gas.sh > gas-report.json
+      - name: Compare against baseline
+        id: compare
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const baseline = JSON.parse(fs.readFileSync('.gas-baseline.json', 'utf8'));
+          const current = JSON.parse(fs.readFileSync('gas-report.json', 'utf8'));
+          const metrics = ['cpu_instructions', 'memory_bytes'];
+          const rows = [];
+          let failed = false;
+          for (const [entry, base] of Object.entries(baseline)) {
+            const cur = current[entry] || {};
+            for (const metric of metrics) {
+              const b = base[metric] ?? 0;
+              const c = cur[metric] ?? 0;
+              const delta = b === 0 ? 0 : ((c - b) / b) * 100;
+              const regressed = delta > 10;
+              if (regressed) failed = true;
+              rows.push(`| ${entry} | ${metric} | ${b} | ${c} | ${delta.toFixed(2)}% | ${regressed ? '❌' : '✅'} |`);
+            }
+          }
+          const body = [
+            '## Gas Profiling Report',
+            '',
+            '| Entry point | Metric | Baseline | Current | Delta | Status |',
+            '| --- | --- | --- | --- | --- | --- |',
+            ...rows,
+            '',
+            failed ? '❌ Gas regression greater than 10% detected.' : '✅ No gas regressions detected.',
+          ].join('\n');
+          fs.writeFileSync('gas-comment.md', body);
+          fs.writeFileSync('gas-failed', failed ? 'true' : 'false');
+          EOF
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('gas-comment.md')) return;
+            const body = fs.readFileSync('gas-comment.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+      - name: Fail on regression
+        run: |
+          if [ "$(cat gas-failed 2>/dev/null)" = "true" ]; then
+            echo "Gas regression exceeds 10% threshold" >&2
+            exit 1
+          fi
+
+  fuzz-smoke:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run 10-minute fuzzing smoke check
+        run: |
+          cd contracts/fuzz
+          for target in $(cargo fuzz list); do
+            timeout 600 cargo fuzz run "$target" -- -max_total_time=600 -rss_limit_mb=4096 || exit 1
+          done

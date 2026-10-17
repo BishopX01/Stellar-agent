@@ -348,3 +348,138 @@ test("getJobsByClient rejects invalid client address synchronously", async () =>
 
   client.disconnect();
 });
+
+// ---------------------------------------------------------------------------
+// #706 — SHA-256 deliverable content hash verification
+// ---------------------------------------------------------------------------
+
+test("computeDeliverableHash produces the correct 32-byte SHA-256 digest", () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  assert.equal(typeof client.computeDeliverableHash, "function");
+
+  // Known SHA-256 test vectors.
+  const empty = client.computeDeliverableHash(Buffer.alloc(0));
+  assert.equal(empty.length, 32);
+  assert.equal(
+    Buffer.from(empty).toString("hex"),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  );
+
+  const abc = client.computeDeliverableHash(Buffer.from("abc"));
+  assert.equal(abc.length, 32);
+  assert.equal(
+    Buffer.from(abc).toString("hex"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+
+  client.disconnect();
+});
+
+test("computeDeliverableHash handles large buffers deterministically", () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  const large = Buffer.alloc(1024 * 1024, 0x61); // 1 MiB of 'a'
+  const digest = client.computeDeliverableHash(large);
+  assert.equal(digest.length, 32);
+
+  // Deterministic: hashing the same buffer twice yields the same digest.
+  const again = client.computeDeliverableHash(Buffer.from(large));
+  assert.deepEqual(Buffer.from(digest), Buffer.from(again));
+
+  // Different content yields a different digest.
+  const other = client.computeDeliverableHash(Buffer.alloc(1024 * 1024, 0x62));
+  assert.notDeepEqual(Buffer.from(digest), Buffer.from(other));
+
+  client.disconnect();
+});
+
+test("submit encodes the deliverable hash argument in the correct position", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  const captured: any[] = [];
+  (client as any).invoke = async (...args: any[]) => {
+    captured.push(args);
+    return { ok: true };
+  };
+
+  const provider = Keypair.random();
+  const hash = client.computeDeliverableHash(Buffer.from("deliverable"));
+
+  await client.submit(provider, 1n, "https://example.com/deliverable", hash);
+
+  assert.equal(captured.length, 1);
+  const [, method, params] = captured[0];
+  assert.equal(method, "submit");
+  // submit(job_id, deliverable, deliverable_hash)
+  assert.equal(params.length, 3);
+  assert.equal(params[0].value(), 1n);
+  assert.equal(params[1].value(), "https://example.com/deliverable");
+  assert.equal(params[2].value().length, 32);
+  assert.deepEqual(
+    Buffer.from(params[2].value()),
+    Buffer.from(hash),
+  );
+
+  client.disconnect();
+});
+
+test("submit rejects a deliverable hash that is not 32 bytes", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  await assert.rejects(
+    client.submit(
+      Keypair.random(),
+      1n,
+      "https://example.com/deliverable",
+      new Uint8Array(16) as any,
+    ),
+    /32 bytes/i,
+  );
+
+  client.disconnect();
+});
+
+test("complete encodes the optional deliverable hash assertion in the correct position", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  const captured: any[] = [];
+  (client as any).invoke = async (...args: any[]) => {
+    captured.push(args);
+    return { ok: true };
+  };
+
+  const evaluator = Keypair.random();
+  const hash = client.computeDeliverableHash(Buffer.from("deliverable"));
+
+  await client.complete(evaluator, 1n, hash);
+
+  assert.equal(captured.length, 1);
+  const [, method, params] = captured[0];
+  assert.equal(method, "complete");
+  // complete(job_id, deliverable_hash?)
+  assert.equal(params.length, 2);
+  assert.equal(params[0].value(), 1n);
+  assert.equal(params[1].value().length, 32);
+  assert.deepEqual(
+    Buffer.from(params[1].value()),
+    Buffer.from(hash),
+  );
+
+  client.disconnect();
+});

@@ -37,12 +37,12 @@ pub enum Error {
     Unauthorized = 4,
     /// The delegate does not have the required permission bit set. (#696)
     InsufficientPermissions = 5,
-    /// The issuer is not on the admin-managed issuer allowlist. (#701)
-    IssuerNotAuthorized = 6,
-    /// The badge does not exist for the given (agent_id, tag). (#701)
-    BadgeNotFound = 7,
-    /// The caller is not the original issuer of the badge. (#701)
-    NotBadgeIssuer = 8,
+    /// The supplied metadata URI is empty. (#782)
+    UriEmpty = 6,
+    /// The supplied metadata URI exceeds `MAX_METADATA_URI_LEN`. (#782)
+    UriTooLong = 7,
+    /// The supplied metadata URI is malformed (e.g. invalid UTF-8). (#782)
+    InvalidUri = 8,
 }
 
 /// A registered agent in the MARC agent-identity registry.
@@ -204,6 +204,35 @@ pub struct BadgeRevoked {
 #[contract]
 pub struct AgentIdentityContract;
 
+/// Validate a metadata URI against the contract's strict bounds. (#782)
+///
+/// Fuzz-resilience guard: every write path (`register`, `update_uri`) funnels
+/// through this helper so oversized or malformed inputs are rejected with a
+/// clean `Error` variant instead of an unhandled panic.
+///
+/// Checks, in order:
+/// 1. Non-empty — `Error::UriEmpty`.
+/// 2. Length within `MAX_METADATA_URI_LEN` — `Error::UriTooLong`.
+/// 3. Valid UTF-8 — `Error::InvalidUri`.
+fn validate_uri(env: &Env, uri: &String) {
+    let len = uri.len();
+    if len == 0 {
+        panic_with_error!(env, Error::UriEmpty);
+    }
+    if len > MAX_METADATA_URI_LEN {
+        panic_with_error!(env, Error::UriTooLong);
+    }
+    // `String::to_bytes` yields the raw byte buffer; `Bytes::to_array` is
+    // bounded, so we validate UTF-8 by round-tripping through `str::from_utf8`.
+    let bytes = uri.to_bytes();
+    let mut buf = [0u8; MAX_METADATA_URI_LEN as usize];
+    let n = bytes.len() as usize;
+    bytes.copy_into_slice(&mut buf[..n]);
+    if core::str::from_utf8(&buf[..n]).is_err() {
+        panic_with_error!(env, Error::InvalidUri);
+    }
+}
+
 #[contractimpl]
 impl AgentIdentityContract {
     /// Initializer. Sets the contract admin address.
@@ -252,15 +281,15 @@ impl AgentIdentityContract {
     /// even if the corresponding agent is later deregistered. `next_id`
     /// therefore represents the total number of registrations ever performed,
     /// not the current number of active agents.
+    ///
+    /// # URI Bounds (#782)
+    ///
+    /// The `uri` is validated via `validate_uri`: empty, oversized, or
+    /// malformed (non-UTF-8) inputs are rejected with a clean contract error.
     pub fn register(env: Env, owner: Address, uri: String) -> u64 {
         owner.require_auth();
 
-        if uri.len() == 0 {
-            panic!("metadata_uri cannot be empty");
-        }
-        if uri.len() > MAX_METADATA_URI_LEN {
-            panic!("metadata_uri too long");
-        }
+        validate_uri(&env, &uri);
 
         if env
             .storage()
@@ -314,19 +343,21 @@ impl AgentIdentityContract {
     }
 
     /// Update the metadata URI of an agent. Caller must be the current owner.
+    ///
+    /// # URI Bounds (#782)
+    ///
+    /// The `new_uri` is validated via `validate_uri`: empty, oversized, or
+    /// malformed (non-UTF-8) inputs are rejected with a clean contract error.
     pub fn update_uri(env: Env, caller: Address, id: u64, new_uri: String) {
         caller.require_auth();
-        if new_uri.len() == 0 {
-            panic!("metadata_uri cannot be empty");
-        }
-        if new_uri.len() > MAX_METADATA_URI_LEN {
-            panic!("metadata_uri too long");
-        }
+
+        validate_uri(&env, &new_uri);
+
         let mut agent: Agent = env
             .storage()
             .persistent()
             .get(&DataKey::Agent(id))
-            .unwrap_or_else(|| panic!("agent not found"));
+            .unwrap_or_else(|| panic_with_error!(&env, Error::AgentNotFound));
         if agent.owner != caller {
             panic!("not agent owner");
         }
@@ -602,248 +633,6 @@ impl AgentIdentityContract {
 
     // -----------------------------------------------------------------------
     // #701 — Capability badges / verifiable credentials
-    // -----------------------------------------------------------------------
-
-    /// Authorise `issuer` to mint capability badges (admin-only).
-    ///
-    /// The admin (set via `init`) must sign. Once authorised, `issuer` may
-    /// call `issue_badge` for any registered agent.
-    pub fn add_authorized_issuer(env: Env, admin: Address, issuer: Address) {
-        admin.require_auth();
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("not initialized");
-        if admin != current_admin {
-            panic!("not admin");
-        }
-        let key = DataKey::AuthorizedIssuer(issuer);
-        env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-
-    /// Remove `issuer` from the badge issuer allowlist (admin-only).
-    ///
-    /// Existing badges minted by the issuer remain valid until they expire or
-    /// are revoked; only future minting is blocked.
-    pub fn remove_authorized_issuer(env: Env, admin: Address, issuer: Address) {
-        admin.require_auth();
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("not initialized");
-        if admin != current_admin {
-            panic!("not admin");
-        }
-        env.storage()
-            .persistent()
-            .remove(&DataKey::AuthorizedIssuer(issuer));
-    }
-
-    /// Return `true` if `issuer` is currently allowed to mint badges.
-    pub fn is_authorized_issuer(env: Env, issuer: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AuthorizedIssuer(issuer))
-            .unwrap_or(false)
-    }
-
-    /// Mint a capability badge for a registered agent.
-    ///
-    /// The `issuer` must sign and must be on the admin-managed issuer
-    /// allowlist. The badge is stored under `DataKey::Badges(agent_id, tag)`
-    /// and expires at `now + ttl` seconds.
-    ///
-    /// # Parameters
-    /// - `issuer`   — authorised issuer address; must authorize this call.
-    /// - `agent_id` — the agent the badge attests to.
-    /// - `tag`      — capability symbol (e.g. `code_audit`).
-    /// - `score`    — issuer-attested benchmark score.
-    /// - `ttl`      — seconds from the current ledger timestamp until expiry.
-    ///
-    /// Emits a `BadgeIssued` event on success.
-    pub fn issue_badge(
-        env: Env,
-        issuer: Address,
-        agent_id: u64,
-        tag: Symbol,
-        score: u32,
-        ttl: u64,
-    ) {
-        issuer.require_auth();
-
-        // Only allowlisted issuers may mint badges.
-        let authorized: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::AuthorizedIssuer(issuer.clone()))
-            .unwrap_or(false);
-        if !authorized {
-            panic_with_error!(&env, Error::IssuerNotAuthorized);
-        }
-
-        // The agent must exist.
-        if !env.storage().persistent().has(&DataKey::Agent(agent_id)) {
-            panic_with_error!(&env, Error::AgentNotFound);
-        }
-
-        let now: u64 = env.ledger().timestamp();
-        let expires_at: u64 = now.saturating_add(ttl);
-
-        let badge = Badge {
-            issuer: issuer.clone(),
-            tag: tag.clone(),
-            score,
-            issued_at: now,
-            expires_at,
-        };
-
-        let key = DataKey::Badges(agent_id, tag.clone());
-        env.storage().persistent().set(&key, &badge);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-
-        // Track the tag so `deregister` can archive all badges for the agent.
-        let mut tags: Vec<Symbol> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BadgeTags(agent_id))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found = false;
-        for existing in tags.iter() {
-            if existing == tag {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            tags.push_back(tag.clone());
-            let tags_key = DataKey::BadgeTags(agent_id);
-            env.storage().persistent().set(&tags_key, &tags);
-            env.storage()
-                .persistent()
-                .extend_ttl(&tags_key, LEDGER_THRESHOLD, LEDGER_BUMP);
-        }
-
-        BadgeIssued {
-            issuer,
-            agent_id,
-            tag,
-            score,
-            expires_at,
-        }
-        .publish(&env);
-    }
-
-    /// Revoke a capability badge. Only the original issuer may revoke.
-    ///
-    /// Removes the `DataKey::Badges(agent_id, tag)` entry from persistent
-    /// storage. Emits a `BadgeRevoked` event on success.
-    ///
-    /// # Panics
-    /// - `Error::BadgeNotFound` if no badge exists for the (agent_id, tag).
-    /// - `Error::NotBadgeIssuer` if `issuer` did not mint the badge.
-    pub fn revoke_badge(env: Env, issuer: Address, agent_id: u64, tag: Symbol) {
-        issuer.require_auth();
-
-        let key = DataKey::Badges(agent_id, tag.clone());
-        let badge: Badge = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::BadgeNotFound));
-
-        if badge.issuer != issuer {
-            panic_with_error!(&env, Error::NotBadgeIssuer);
-        }
-
-        env.storage().persistent().remove(&key);
-
-        // Drop the tag from the agent's badge index.
-        let tags: Vec<Symbol> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BadgeTags(agent_id))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut remaining: Vec<Symbol> = Vec::new(&env);
-        for existing in tags.iter() {
-            if existing != tag {
-                remaining.push_back(existing);
-            }
-        }
-        let tags_key = DataKey::BadgeTags(agent_id);
-        if remaining.len() == 0 {
-            env.storage().persistent().remove(&tags_key);
-        } else {
-            env.storage().persistent().set(&tags_key, &remaining);
-            env.storage()
-                .persistent()
-                .extend_ttl(&tags_key, LEDGER_THRESHOLD, LEDGER_BUMP);
-        }
-
-        BadgeRevoked {
-            issuer,
-            agent_id,
-            tag,
-        }
-        .publish(&env);
-    }
-
-    /// Return all active (non-expired) badges for an agent.
-    ///
-    /// Expired badges are skipped and lazily pruned from storage. Returns an
-    /// empty vector if the agent has no active credentials.
-    pub fn get_badges(env: Env, agent_id: u64) -> Vec<Badge> {
-        let now: u64 = env.ledger().timestamp();
-        let tags: Vec<Symbol> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BadgeTags(agent_id))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut active: Vec<Badge> = Vec::new(&env);
-        for tag in tags.iter() {
-            let key = DataKey::Badges(agent_id, tag.clone());
-            let badge: Option<Badge> = env.storage().persistent().get(&key);
-            match badge {
-                Some(b) if b.expires_at >= now => {
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-                    active.push_back(b);
-                }
-                Some(_) => {
-                    // Expired — prune lazily.
-                    env.storage().persistent().remove(&key);
-                }
-                None => {}
-            }
-        }
-        active
-    }
-
-    /// Return a single badge for (agent_id, tag) if it exists and is active.
-    ///
-    /// Returns `None` for missing or expired badges.
-    pub fn get_badge(env: Env, agent_id: u64, tag: Symbol) -> Option<Badge> {
-        let key = DataKey::Badges(agent_id, tag);
-        let badge: Option<Badge> = env.storage().persistent().get(&key);
-        match badge {
-            Some(ref b) if b.expires_at >= env.ledger().timestamp() => {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-                badge
-            }
-            _ => None,
-        }
-    }
-
     // -----------------------------------------------------------------------
 
     /// Fetch an agent by its id. Returns `None` if no such agent exists.

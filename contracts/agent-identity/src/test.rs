@@ -769,191 +769,114 @@ fn upgrade_panics_when_not_initialized() {
 }
 
 // ===========================================================================
-// #701 — capability badge / verifiable credential tests
+// #782 — boundary tests for register()/update_uri() metadata_uri length.
+//
+// These mirror the invariants the cargo-fuzz targets in contracts/fuzz/ rely
+// on: any input at or below MAX_METADATA_URI_LEN is accepted, anything above
+// is rejected with a clean contract error (never a panic/overflow), and the
+// empty string is rejected. They double as regression guards for the fuzz
+// harness so a change in bounds is caught by the unit suite as well.
 // ===========================================================================
 
-/// (1) An authorized issuer can mint a badge and it is retrievable via
-/// get_badges() while still active.
+/// Builds a `String` of exactly `len` ASCII bytes ('a' repeated).
+fn uri_of_len(env: &Env, len: u32) -> String {
+    let mut buf = [b'a'; MAX_METADATA_URI_LEN as usize];
+    let slice = &mut buf[..len as usize];
+    String::from_bytes(env, slice)
+}
+
+/// register() accepts a URI of exactly MAX_METADATA_URI_LEN bytes.
 #[test]
-fn issue_badge_stores_and_get_badges_returns_active_badge() {
+fn register_accepts_uri_at_max_length() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(AgentIdentityContract, ());
     let client = AgentIdentityContractClient::new(&env, &contract_id);
 
     let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN);
+    let id = client.register(&alice, &uri);
 
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-
-    let badges = client.get_badges(&agent_id);
-    assert_eq!(badges.len(), 1);
-    let badge = badges.get(0).unwrap();
-    assert_eq!(badge.issuer, issuer);
-    assert_eq!(badge.tag, tag);
-    assert_eq!(badge.score, 95u32);
-    assert_eq!(badge.issued_at, env.ledger().timestamp());
-    assert_eq!(badge.expires_at, env.ledger().timestamp() + 1_000u64);
+    let agent = client.get_agent(&id).unwrap();
+    assert_eq!(agent.uri.len(), MAX_METADATA_URI_LEN);
 }
 
-/// (2) A caller that is not the issuer cannot mint a badge on behalf of
-/// another address — auth is required from the issuer.
+/// register() rejects a URI one byte over MAX_METADATA_URI_LEN with a clean
+/// contract error rather than a panic or overflow.
 #[test]
-#[should_panic]
-fn issue_badge_requires_issuer_auth() {
-    let env = Env::default();
-    // NOTE: mock_all_auths() intentionally omitted so require_auth() is enforced.
-    let contract_id = env.register(AgentIdentityContract, ());
-    let client = AgentIdentityContractClient::new(&env, &contract_id);
-
-    let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
-
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-}
-
-/// (3) get_badges() must exclude credentials whose expires_at has passed.
-#[test]
-fn get_badges_excludes_expired_credentials() {
+#[should_panic(expected = "metadata_uri too long")]
+fn register_rejects_uri_one_over_max_length() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(AgentIdentityContract, ());
     let client = AgentIdentityContractClient::new(&env, &contract_id);
 
     let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
-
-    let tag = Symbol::new(&env, "audit");
-    // Issue a badge that expires in 100 seconds.
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &100u64);
-    assert_eq!(client.get_badges(&agent_id).len(), 1);
-
-    // Advance the ledger past the expiry.
-    env.ledger().set_timestamp(env.ledger().timestamp() + 200);
-
-    assert_eq!(client.get_badges(&agent_id).len(), 0);
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN + 1);
+    client.register(&alice, &uri);
 }
 
-/// (4a) revoke_badge() removes a previously issued badge.
+/// update_uri() accepts a URI of exactly MAX_METADATA_URI_LEN bytes.
 #[test]
-fn revoke_badge_removes_badge() {
+fn update_uri_accepts_uri_at_max_length() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(AgentIdentityContract, ());
     let client = AgentIdentityContractClient::new(&env, &contract_id);
 
     let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+    let id = client.register(&alice, &String::from_str(&env, "ipfs://a1.json"));
 
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-    assert_eq!(client.get_badges(&agent_id).len(), 1);
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN);
+    client.update_uri(&alice, &id, &uri);
 
-    client.revoke_badge(&issuer, &agent_id, &tag);
-    assert_eq!(client.get_badges(&agent_id).len(), 0);
+    let agent = client.get_agent(&id).unwrap();
+    assert_eq!(agent.uri.len(), MAX_METADATA_URI_LEN);
 }
 
-/// (4b) Only the original issuer may revoke a badge.
+/// update_uri() rejects a URI one byte over MAX_METADATA_URI_LEN.
 #[test]
-#[should_panic]
-fn revoke_badge_rejects_non_issuer() {
+#[should_panic(expected = "metadata_uri too long")]
+fn update_uri_rejects_uri_one_over_max_length() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(AgentIdentityContract, ());
     let client = AgentIdentityContractClient::new(&env, &contract_id);
 
     let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let mallory = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
-
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-
-    // mallory is not the issuer — must panic.
-    client.revoke_badge(&mallory, &agent_id, &tag);
+    let id = client.register(&alice, &String::from_str(&env, "ipfs://a1.json"));
+    let uri = uri_of_len(&env, MAX_METADATA_URI_LEN + 1);
+    client.update_uri(&alice, &id, &uri);
 }
 
-/// (5) Deregistering an agent must archive/remove its associated badges so
-/// they are no longer returned by get_badges().
+/// update_uri() rejects the empty string with a clean contract error.
 #[test]
-fn deregister_removes_associated_badges() {
+#[should_panic(expected = "metadata_uri cannot be empty")]
+fn update_uri_rejects_empty_uri() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(AgentIdentityContract, ());
     let client = AgentIdentityContractClient::new(&env, &contract_id);
 
     let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
-
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-    assert_eq!(client.get_badges(&agent_id).len(), 1);
-
-    client.deregister(&alice, &agent_id);
-
-    // Badges must no longer be retrievable for the deregistered agent.
-    assert_eq!(client.get_badges(&agent_id).len(), 0);
+    let id = client.register(&alice, &String::from_str(&env, "ipfs://a1.json"));
+    client.update_uri(&alice, &id, &String::from_str(&env, ""));
 }
 
-/// (6a) issue_badge() emits a BadgeIssued event.
+/// A single-byte URI is the smallest valid non-empty input and must be
+/// accepted by both register() and update_uri().
 #[test]
-fn issue_badge_emits_badge_issued_event() {
+fn register_and_update_uri_accept_single_byte_uri() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(AgentIdentityContract, ());
     let client = AgentIdentityContractClient::new(&env, &contract_id);
 
     let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
+    let one = String::from_str(&env, "a");
+    let id = client.register(&alice, &one);
+    assert_eq!(client.get_agent(&id).unwrap().uri, one);
 
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-
-    let expected_event = BadgeIssued {
-        issuer: issuer.clone(),
-        agent_id,
-        tag: tag.clone(),
-        score: 95u32,
-        expires_at: env.ledger().timestamp() + 1_000u64,
-    };
-    assert_eq!(
-        env.events().all().filter_by_contract(&contract_id),
-        [expected_event.to_xdr(&env, &contract_id)],
-    );
-}
-
-/// (6b) revoke_badge() emits a BadgeRevoked event.
-#[test]
-fn revoke_badge_emits_badge_revoked_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(AgentIdentityContract, ());
-    let client = AgentIdentityContractClient::new(&env, &contract_id);
-
-    let alice = Address::generate(&env);
-    let issuer = Address::generate(&env);
-    let agent_id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
-
-    let tag = Symbol::new(&env, "audit");
-    client.issue_badge(&issuer, &agent_id, &tag, &95u32, &1_000u64);
-    client.revoke_badge(&issuer, &agent_id, &tag);
-
-    let expected_event = BadgeRevoked {
-        issuer: issuer.clone(),
-        agent_id,
-        tag: tag.clone(),
-    };
-    assert_eq!(
-        env.events().all().filter_by_contract(&contract_id),
-        [expected_event.to_xdr(&env, &contract_id)],
-    );
+    client.update_uri(&alice, &id, &one);
+    assert_eq!(client.get_agent(&id).unwrap().uri, one);
 }

@@ -158,6 +158,70 @@ cd dashboard && npm start
 # Visit http://localhost:3000/app
 ```
 
+## Offline Local Development
+
+Bear ships with a fully autonomous, offline Soroban sandbox defined in `docker-compose.yml`. It runs a local Stellar Quickstart node (`stellar/quickstart:testing`) on a standalone network, auto-compiles and deploys the contracts, funds test keypairs, and wires up the indexer, dashboard, and agents — no internet connection or remote testnet access required.
+
+### Prerequisites
+
+- **Docker** 24+ with **Compose v2** (`docker compose` plugin)
+- No other tooling is needed — Rust, `stellar-cli`, and Node are all provided inside the containers
+
+### Quick Start
+
+```bash
+docker compose up
+```
+
+That single command spins up the full stack:
+
+1. **Stellar node** — a local standalone network via Stellar Quickstart, exposing the RPC endpoint (default `http://localhost:8000/soroban/rpc`).
+2. **Init service** — waits for the local RPC healthcheck to pass, then compiles the `agent-identity` and `agentic-commerce` contracts to WASM, deploys them to the local network, initializes them, and funds the test keypairs used by the dashboard and agents.
+3. **Indexer, dashboard, and agents** — start only after the init service reports the contracts are deployed and the RPC is healthy.
+
+The environment is **100% offline**: it never contacts the remote Stellar testnet or any external network. All accounts, contracts, and balances are local and deterministic, so runs are reproducible.
+
+### Environment Configuration
+
+The init service exports the local network configuration to `.env.docker`, which the dashboard and agents load automatically:
+
+```bash
+# .env.docker (generated on boot)
+STELLAR_RPC_URL=http://localhost:8000/soroban/rpc
+STELLAR_NETWORK_PASSPHRASE=Standalone Network ; February 2017
+IDENTITY_CONTRACT=<deployed contract id>
+COMMERCE_CONTRACT=<deployed contract id>
+USDC_TOKEN=<local SAC contract id>
+```
+
+To point the SDK at the local sandbox instead of the remote testnet, load these values in place of the `TESTNET` defaults:
+
+```typescript
+import { IdentityClient, CommerceClient } from "marc-stellar-sdk";
+import { Keypair } from "@stellar/stellar-sdk";
+
+const config = {
+  rpcUrl: process.env.STELLAR_RPC_URL!, // http://localhost:8000/soroban/rpc
+  networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE!,
+  identityContract: process.env.IDENTITY_CONTRACT!,
+  commerceContract: process.env.COMMERCE_CONTRACT!,
+  usdcToken: process.env.USDC_TOKEN!,
+};
+
+const identity = new IdentityClient(config);
+await identity.register(Keypair.fromSecret(process.env.TEST_SECRET!), "https://ipfs.agent/metadata.json");
+```
+
+### Teardown
+
+Stop and remove the containers, network, and volumes:
+
+```bash
+docker compose down -v
+```
+
+The next `docker compose up` recreates the sandbox from scratch, recompiling and redeploying the contracts and re-funding the test keypairs.
+
 ## Dashboard Theming
 
 The dashboard supports a dark/light mode toggle that respects your OS preference by default and remembers your manual choice.
