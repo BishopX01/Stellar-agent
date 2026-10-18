@@ -306,6 +306,9 @@ async function getUsdc(pubkey: string): Promise<string> {
 
 const buyer = Keypair.fromSecret(process.env.BUYER_SECRET!);
 const REGISTRY = "http://localhost:4500/agents";
+// Only online providers are considered: the registry filters out agents that
+// have been marked Offline by the heartbeat monitor (issue #721).
+const REGISTRY_ONLINE = `${REGISTRY}?status=Online`;
 const POLL_INTERVAL_MS = 5000;
 const MAX_POLL_ATTEMPTS = 120; // 10 minutes
 
@@ -468,7 +471,7 @@ function watchSellerLog(picked: any) {
 
 async function loadAgents() {
   try {
-    agents = await tracedFetch(REGISTRY, {}, "registry.list").then((r) => r.json());
+    agents = await tracedFetch(REGISTRY_ONLINE, {}, "registry.list").then((r) => r.json());
     renderAgents();
   } catch {
     agentsBox.setContent("{red-fg}Registry not running — start agents/registry first{/red-fg}");
@@ -533,7 +536,7 @@ async function runSmartJob(description: string): Promise<BuyerResult | null> {
         const available =
           agents.length > 0
             ? agents
-            : await tracedFetch(REGISTRY, {}, "registry.list").then((r) => r.json());
+            : await tracedFetch(REGISTRY_ONLINE, {}, "registry.list").then((r) => r.json());
         const selection = selectProvider(available, capabilities);
         if (!selection) {
           log("{red-fg}No matching provider found in registry{/red-fg}");
