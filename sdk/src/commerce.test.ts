@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Keypair, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import { Keypair, nativeToScVal, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { CommerceClient } from "./commerce.js";
 import { TESTNET } from "./types.js";
 import {
@@ -533,6 +533,93 @@ test("getJob maps a numeric status to its JobStatus string", async () => {
 
   const job = await client.getJob(7n);
   assert.equal(job?.status, "Submitted");
+
+  client.disconnect();
+});
+
+// ---------------------------------------------------------------------------
+// #833 — createJob forwards sla_deadline and penalty_bps_per_hour
+// ---------------------------------------------------------------------------
+
+function captureCreateJobArgs(client: CommerceClient): xdr.ScVal[][] {
+  const captured: xdr.ScVal[][] = [];
+  (client as any).invoke = async (_signer: unknown, op: xdr.Operation) => {
+    captured.push(op.body().invokeHostFunctionOp().hostFunction().invokeContract().args());
+    return 1n;
+  };
+  return captured;
+}
+
+test("createJob defaults sla_deadline and penalty_bps_per_hour to zero", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+  const captured = captureCreateJobArgs(client);
+
+  await client.createJob(
+    Keypair.random(),
+    Keypair.random().publicKey(),
+    Keypair.random().publicKey(),
+    TESTNET.usdcToken,
+    1_000n,
+    "test job",
+  );
+
+  const args = captured[0];
+  assert.equal(args.length, 8);
+  assert.equal(args[6].switch().name, "scvU64");
+  assert.equal(scValToNative(args[6]), 0n);
+  assert.equal(args[7].switch().name, "scvU32");
+  assert.equal(scValToNative(args[7]), 0);
+
+  client.disconnect();
+});
+
+test("createJob encodes SLA parameters as u64 and u32", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+  const captured = captureCreateJobArgs(client);
+
+  await client.createJob(
+    Keypair.random(),
+    Keypair.random().publicKey(),
+    Keypair.random().publicKey(),
+    TESTNET.usdcToken,
+    1_000n,
+    "test job",
+    { slaDeadline: 1_700_000_000n, penaltyBpsPerHour: 25 },
+  );
+
+  const args = captured[0];
+  assert.equal(scValToNative(args[6]), 1_700_000_000n);
+  assert.equal(scValToNative(args[7]), 25);
+
+  client.disconnect();
+});
+
+test("createJobAndWait and approveAndCreateJob forward SLA parameters", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+  const captured = captureCreateJobArgs(client);
+  (client as any).allowance = async () => 1_000n;
+
+  const sla = { slaDeadline: 1_800_000_000n, penaltyBpsPerHour: 50 };
+  const provider = Keypair.random().publicKey();
+  const evaluator = Keypair.random().publicKey();
+
+  await client.createJobAndWait(Keypair.random(), provider, evaluator, TESTNET.usdcToken, 1_000n, "a", sla);
+  await client.approveAndCreateJob(Keypair.random(), provider, evaluator, TESTNET.usdcToken, 1_000n, "b", sla);
+
+  assert.equal(captured.length, 2);
+  for (const args of captured) {
+    assert.equal(scValToNative(args[6]), 1_800_000_000n);
+    assert.equal(scValToNative(args[7]), 50);
+  }
 
   client.disconnect();
 });

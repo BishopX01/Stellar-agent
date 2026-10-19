@@ -8,7 +8,7 @@ import {
   BASE_FEE,
 } from "@stellar/stellar-sdk";
 import type { Keypair } from "@stellar/stellar-sdk";
-import type { Job, MarcConfig } from "./types.js";
+import type { CreateJobOptions, Job, MarcConfig } from "./types.js";
 import { JobStatusFromNumber } from "./jobStatus.js";
 import type { JobStatus } from "./jobStatus.js";
 import { BaseClient } from "./baseClient.js";
@@ -267,6 +267,8 @@ export class CommerceClient extends BaseClient {
    * @param budget - The escrow amount in the token's smallest unit (e.g. `10_000_000n` = 10 USDC).
    *                 Must be greater than 0 and fit within a signed 128-bit integer.
    * @param description - Human-readable description of the work to be done.
+   * @param options - Optional memo, SLA deadline (`slaDeadline`, unix seconds, default `0n`)
+   *                  and late-delivery penalty (`penaltyBpsPerHour`, default `0`).
    * @returns The new job's on-chain ID as a `bigint`.
    * @throws {Error} If `budget <= 0`, `budget` exceeds `i128` max, the client
    *                 has insufficient funds, or the transaction fails.
@@ -286,7 +288,7 @@ export class CommerceClient extends BaseClient {
     token: string,
     budget: bigint,
     description: string,
-    options: { memo?: string } = {},
+    options: CreateJobOptions = {},
   ): Promise<bigint> {
     if (budget <= 0n) throw new Error("budget must be greater than 0");
     if (budget > MAX_I128) throw new Error("budget exceeds i128 max");
@@ -300,13 +302,15 @@ export class CommerceClient extends BaseClient {
       new Address(token).toScVal(),
       nativeToScVal(budget, { type: "i128" }),
       nativeToScVal(description, { type: "string" }),
+      nativeToScVal(options.slaDeadline ?? 0n, { type: "u64" }),
+      nativeToScVal(options.penaltyBpsPerHour ?? 0, { type: "u32" }),
     );
     return await this.invoke(
       signer,
       op,
       (v) => BigInt(scValToNative(v) as string),
       "commerce",
-      options,
+      { memo: options.memo },
     );
   }
 
@@ -568,6 +572,7 @@ export class CommerceClient extends BaseClient {
    * @param token - The token contract address (C...) for payment.
    * @param budget - The escrow amount in the token's smallest unit.
    * @param description - Human-readable description of the work.
+   * @param options - Optional memo, SLA deadline and late-delivery penalty (see {@link createJob}).
    * @returns The new job's on-chain ID as a `bigint`, resolved after on-chain finality.
    * @throws {Error} If `budget <= 0`, `budget` exceeds `i128` max, or the transaction fails.
    */
@@ -578,8 +583,9 @@ export class CommerceClient extends BaseClient {
     token: string,
     budget: bigint,
     description: string,
+    options: CreateJobOptions = {},
   ): Promise<bigint> {
-    return this.createJob(client, provider, evaluator, token, budget, description);
+    return this.createJob(client, provider, evaluator, token, budget, description, options);
   }
 
   /**
@@ -650,6 +656,7 @@ export class CommerceClient extends BaseClient {
    * @param token - The token contract address for payment.
    * @param budget - The escrow budget in smallest token units.
    * @param description - Human-readable description of the work.
+   * @param options - Optional memo, SLA deadline and late-delivery penalty (see {@link createJob}).
    * @returns The newly created job ID as a `bigint`.
    */
   async approveAndCreateJob(
@@ -659,6 +666,7 @@ export class CommerceClient extends BaseClient {
     token: string,
     budget: bigint,
     description: string,
+    options: CreateJobOptions = {},
   ): Promise<bigint> {
     if (budget <= 0n) throw new Error("budget must be greater than 0");
     if (budget > MAX_I128) throw new Error("budget exceeds i128 max");
@@ -680,7 +688,7 @@ export class CommerceClient extends BaseClient {
       await this.approve(signer, this.contract.address().toString(), token, budget);
     }
 
-    return await this.createJob(signer, provider, evaluator, token, budget, description);
+    return await this.createJob(signer, provider, evaluator, token, budget, description, options);
   }
 
   /**
