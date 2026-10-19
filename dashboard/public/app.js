@@ -19,6 +19,19 @@
         localStorage.setItem("bear-theme", next);
       });
     }
+    // Follow live OS theme changes until the user makes a manual choice (#832).
+    if (window.matchMedia) {
+      var mql = window.matchMedia("(prefers-color-scheme: dark)");
+      var onSystemThemeChange = function (e) {
+        try {
+          var stored = localStorage.getItem("bear-theme");
+          if (stored === "dark" || stored === "light") return;
+        } catch (err) {}
+        document.documentElement.setAttribute("data-theme", e.matches ? "dark" : "light");
+      };
+      if (mql.addEventListener) mql.addEventListener("change", onSystemThemeChange);
+      else if (mql.addListener) mql.addListener(onSystemThemeChange);
+    }
   })();
   // ── Network presets (#761) ──
   // Contract addresses / RPC endpoints per network. The backend exposes the
