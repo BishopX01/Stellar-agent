@@ -77,6 +77,9 @@ body {
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
+  transition:
+    background-color 0.2s,
+    color 0.2s;
 }
 a {
   color: inherit;
@@ -1161,6 +1164,48 @@ textarea:focus-visible,
   font-family: var(--mono);
   color: var(--text-muted);
   word-break: break-all;
+}
+/* Job lifecycle timeline (#831) */
+.job-timeline {
+  display: flex;
+  flex-direction: column;
+  border-left: 2px solid var(--border-hover);
+  margin-left: 5px;
+  padding-left: 16px;
+}
+.job-timeline-item {
+  position: relative;
+  padding: 6px 0;
+}
+.job-timeline-dot {
+  position: absolute;
+  left: -22px;
+  top: 12px;
+  width: 10px;
+  height: 10px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+.job-timeline-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.job-timeline-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.job-timeline-time,
+.job-timeline-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.job-timeline-meta {
+  display: block;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-muted);
 }
 .evaluator-progress-heading {
   display: flex;
