@@ -3,6 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import path from "path";
 import crypto from "crypto";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { z, ZodError } from "zod";
 import {
@@ -708,26 +709,96 @@ type AuditEntry = {
   path: string;
   wallet?: string;
   statusCode: number;
-  ip?: string;
+  ipHash?: string;
 };
 
-const auditTrail: AuditEntry[] = [];
 const MAX_AUDIT_ENTRIES = 500;
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH ?? path.join(__dirname, "audit.jsonl");
+const AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const AUDIT_LOG_MAX_FILES = 3;
+const AUDIT_SALT = process.env.AUDIT_SALT ?? crypto.randomBytes(32).toString("hex");
+
+const auditQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(100).default(50),
+});
+
+function hashIp(ip: string | undefined): string | undefined {
+  if (!ip) return undefined;
+  return crypto.createHash("sha256").update(ip + AUDIT_SALT).digest("hex");
+}
+
+// Rotated files are AUDIT_LOG_PATH.1 (newest) … AUDIT_LOG_PATH.<MAX_FILES - 1> (oldest).
+function auditLogFiles(): string[] {
+  const files = [AUDIT_LOG_PATH];
+  for (let i = 1; i < AUDIT_LOG_MAX_FILES; i++) files.push(`${AUDIT_LOG_PATH}.${i}`);
+  return files;
+}
+
+function rotateAuditLog(): void {
+  const files = auditLogFiles();
+  for (let i = files.length - 1; i > 0; i--) {
+    if (fs.existsSync(files[i - 1])) fs.renameSync(files[i - 1], files[i]);
+  }
+}
+
+function appendAuditEntry(entry: AuditEntry): void {
+  const line = JSON.stringify(entry) + "\n";
+  try {
+    if (
+      fs.existsSync(AUDIT_LOG_PATH) &&
+      fs.statSync(AUDIT_LOG_PATH).size + Buffer.byteLength(line) > AUDIT_LOG_MAX_BYTES
+    ) {
+      rotateAuditLog();
+    }
+    fs.appendFileSync(AUDIT_LOG_PATH, line);
+  } catch (err) {
+    console.warn("[audit] failed to persist entry:", (err as Error).message);
+  }
+}
+
+/** All persisted audit entries, oldest first. */
+function readAuditLog(): AuditEntry[] {
+  const entries: AuditEntry[] = [];
+  for (const file of auditLogFiles().reverse()) {
+    if (!fs.existsSync(file)) continue;
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        entries.push(JSON.parse(line) as AuditEntry);
+      } catch {
+        // Skip a partially written line.
+      }
+    }
+  }
+  return entries;
+}
+
+const auditTrail: AuditEntry[] = (() => {
+  try {
+    return readAuditLog().slice(-MAX_AUDIT_ENTRIES);
+  } catch (err) {
+    console.warn("[audit] failed to load persisted entries:", (err as Error).message);
+    return [];
+  }
+})();
 
 function auditAdminAction(req: Request, res: Response, next: NextFunction) {
   const path = req.originalUrl || req.url;
   res.on("finish", () => {
-    auditTrail.push({
+    const entry: AuditEntry = {
       at: new Date().toISOString(),
       method: req.method,
       path,
       wallet: String((req as any).walletAddress ?? req.body?.wallet ?? req.body?.publicKey ?? ""),
       statusCode: res.statusCode,
-      ip: req.ip,
-    });
+      ipHash: hashIp(req.ip),
+    };
+    auditTrail.push(entry);
     if (auditTrail.length > MAX_AUDIT_ENTRIES) {
       auditTrail.splice(0, auditTrail.length - MAX_AUDIT_ENTRIES);
     }
+    appendAuditEntry(entry);
   });
   next();
 }
@@ -1294,6 +1365,23 @@ app.get("/api/stats/historical", async (_req, res) => {
 
 app.get("/api/audit-trail", requireAuth, (_req, res) => {
   res.json(auditTrail.slice().reverse());
+});
+
+// GET /api/admin/audit — paginated persisted audit entries, newest first
+app.get("/api/admin/audit", requireAuth, (req, res) => {
+  try {
+    const { page, pageSize } = auditQuerySchema.parse(req.query);
+    const entries = readAuditLog().reverse();
+    const start = (page - 1) * pageSize;
+    res.json({
+      items: entries.slice(start, start + pageSize),
+      page,
+      pageSize,
+      total: entries.length,
+    });
+  } catch (err: unknown) {
+    handleRouteError(err, res);
+  }
 });
 
 // ── #719: GET /api/events/stream — SSE stream of newly indexed events ────────
