@@ -82,6 +82,10 @@
     loading: { stats: false, wallets: false, agents: false, jobs: false },
     jobFilter: "Active",
     jobSearch: "",
+    jobPage: 1,
+    jobPageSize: 24,
+    jobTotal: 0,
+    jobHasNext: false,
     jobDateFrom: "",
     jobDateTo: "",
     agentSearch: "",   // #583 — agent name/description/tag filter
@@ -1842,11 +1846,17 @@
     if (!chips) return "";
     return '<div class="agent-badges" aria-label="Verified capability badges">' + chips + "</div>";
   }
-  async function loadJobs(status) {
+  async function loadJobs(status, page = state.jobPage) {
     state.loading.jobs = true;
     try {
-      const query = status ? "?status=" + encodeURIComponent(status) : "";
-      state.jobs = await api("/jobs" + query);
+      const params = new URLSearchParams({ page: String(page), limit: String(state.jobPageSize) });
+      if (status) params.set("status", status);
+      const query = "?" + params.toString();
+      const result = await api("/jobs" + query);
+      state.jobs = Array.isArray(result) ? result : result.items || [];
+      state.jobPage = result.page || page;
+      state.jobTotal = result.total || 0;
+      state.jobHasNext = Boolean(result.hasNext);
     } catch (e) {
       console.error(e);
     }
@@ -2292,12 +2302,25 @@
       content += "</div>";
     }
 
+    const pagination =
+      '<div class="job-pagination" style="display:flex;justify-content:center;align-items:center;gap:12px;margin-top:20px">' +
+      '<button class="btn btn-secondary btn-sm" onclick="window.__changeJobPage(-1)" ' +
+      (state.jobPage <= 1 ? "disabled" : "") +
+      '>Newer</button><span>Page ' +
+      state.jobPage +
+      " · " +
+      state.jobTotal +
+      " jobs</span><button class=\"btn btn-secondary btn-sm\" onclick=\"window.__changeJobPage(1)\" " +
+      (!state.jobHasNext ? "disabled" : "") +
+      ">Older</button></div>";
+
     setPage(
       '<div class="section-header"><div><div class="section-title">Jobs</div><div class="page-subtitle" style="margin-top:2px">Escrow-based job marketplace on Soroban</div></div>' +
         '<button class="btn btn-primary" onclick="window.__showCreateJob()">+ Create Job</button></div>' +
         tabs +
         toolbar +
-        content,
+        content +
+        pagination,
     );
   }
 
@@ -2767,7 +2790,19 @@
   window.__filterJobs = function (filter) {
     state.jobFilter = filter;
     state.jobSearch = ""; // reset search when switching filter tabs
+    state.jobPage = 1;
     loadJobs(filter === "All" ? undefined : filter)
+      .then(renderJobList)
+      .catch(function (e) {
+        notifyError(e);
+      });
+  };
+
+  window.__changeJobPage = function (delta) {
+    var nextPage = state.jobPage + delta;
+    if (nextPage < 1 || (delta > 0 && !state.jobHasNext)) return;
+    var status = state.jobFilter === "All" ? undefined : state.jobFilter;
+    loadJobs(status, nextPage)
       .then(renderJobList)
       .catch(function (e) {
         notifyError(e);
