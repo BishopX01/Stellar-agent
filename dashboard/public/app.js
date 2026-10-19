@@ -564,6 +564,8 @@
     widget.style.display = "";
     var xlmEl = document.getElementById("wallet-xlm-balance");
     var usdcEl = document.getElementById("wallet-usdc-balance");
+    if (xlmEl) xlmEl.innerHTML = '<span class="skeleton skeleton-balance"></span>';
+    if (usdcEl) usdcEl.innerHTML = '<span class="skeleton skeleton-balance"></span>';
     var results = await Promise.all([
       fetchXlmBalance(wallet.publicKey),
       fetchUsdcBalance(wallet.publicKey),
