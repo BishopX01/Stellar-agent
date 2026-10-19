@@ -364,10 +364,10 @@
         // Clear session token
         var token = window.__sessionToken;
         if (token) {
-          fetch("/api/auth/logout", {
+          safeFetch("/api/auth/logout", {
             method: "POST",
             headers: { Authorization: "Bearer " + token },
-          }).catch(function () {});
+          }, { _silent: true }).catch(function () {});
           window.__sessionToken = null;
         }
         // Update wallet state
@@ -397,10 +397,10 @@
     // Invalidate server-side session token if present
     var token = window.__sessionToken;
     if (token) {
-      fetch("/api/auth/logout", {
+      safeFetch("/api/auth/logout", {
         method: "POST",
         headers: { Authorization: "Bearer " + token },
-      }).catch(function () {});
+      }, { _silent: true }).catch(function () {});
       window.__sessionToken = null;
     }
     // Tell SWK to disconnect if the API supports it
@@ -626,6 +626,161 @@
     return "Wallet";
   }
 
+  // ── Reliability Layer (#750) ──
+  // Connectivity detection, global error boundaries, RPC healthcheck and
+  // automatic recovery.  All state lives on the module-level `reliability`
+  // object so other modules (polling, api client) can consult it.
+  var reliability = {
+    online: typeof navigator === "undefined" ? true : navigator.onLine !== false,
+    rpcHealthy: true,
+    lastHealthcheck: 0,
+    banner: null,
+    errorView: null,
+  };
+  window.__reliability = reliability;
+
+  function ensureBanner() {
+    if (reliability.banner && document.body.contains(reliability.banner)) {
+      return reliability.banner;
+    }
+    var el = document.getElementById("offline-banner");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "offline-banner";
+      el.className = "offline-banner";
+      el.setAttribute("role", "status");
+      el.setAttribute("aria-live", "assertive");
+      el.style.cssText =
+        "position:fixed;top:0;left:0;right:0;z-index:9999;display:none;" +
+        "padding:10px 16px;text-align:center;font-size:13px;font-weight:600;" +
+        "background:#b45309;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.35)";
+      el.textContent = "Network Disconnected — Retrying connection to Stellar RPC...";
+      document.body.appendChild(el);
+    }
+    reliability.banner = el;
+    return el;
+  }
+
+  function showOfflineBanner() {
+    var el = ensureBanner();
+    el.style.display = "block";
+  }
+  function hideOfflineBanner() {
+    var el = ensureBanner();
+    el.style.display = "none";
+  }
+
+  // Renders an actionable "Something went wrong" view in place of the page.
+  function renderErrorView(message, retryFn) {
+    var page = document.getElementById("page");
+    if (!page) return;
+    var safeMsg = escapeHtml(message || "An unexpected error occurred.");
+    page.innerHTML =
+      '<div class="error-view" role="alert" style="max-width:560px;margin:64px auto;text-align:center;padding:32px">' +
+      '<div style="font-size:40px;margin-bottom:12px">⚠️</div>' +
+      '<h2 style="margin:0 0 8px;font-size:20px">Something went wrong</h2>' +
+      '<p style="color:var(--text-muted);margin:0 0 20px;line-height:1.5">' + safeMsg + "</p>" +
+      '<button type="button" class="btn btn-primary" id="error-retry-btn">Retry</button>' +
+      "</div>";
+    reliability.errorView = message || true;
+    var btn = document.getElementById("error-retry-btn");
+    if (btn) {
+      btn.addEventListener("click", function () {
+        reliability.errorView = null;
+        if (typeof retryFn === "function") {
+          try {
+            retryFn();
+          } catch (e) {
+            renderErrorView(errorText(e), retryFn);
+          }
+        } else {
+          navigate();
+        }
+      });
+    }
+  }
+
+  // safeFetch wraps every network call in try/catch.  On failure it renders
+  // the actionable error view (unless the caller opted out) and re-throws so
+  // callers can still handle the error themselves.
+  async function safeFetch(url, init, opts) {
+    var options = opts || {};
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      if (!options._silent) {
+        renderErrorView(
+          "We could not reach the Bear backend. Check your connection and try again.",
+          function () {
+            navigate();
+          },
+        );
+      }
+      throw err;
+    }
+  }
+
+  // Startup / reconnect RPC healthcheck.  Probes the backend health endpoint
+  // which in turn verifies the Stellar RPC node is reachable.
+  async function runHealthcheck() {
+    reliability.lastHealthcheck = Date.now();
+    try {
+      var res = await fetch("/api/health", { method: "GET" });
+      reliability.rpcHealthy = res.ok;
+      return res.ok;
+    } catch (e) {
+      reliability.rpcHealthy = false;
+      return false;
+    }
+  }
+
+  // Called when connectivity is restored: re-probe the RPC node, resume
+  // polling and refresh the current view's data.
+  async function handleReconnect() {
+    reliability.online = true;
+    hideOfflineBanner();
+    var healthy = await runHealthcheck();
+    reliability.rpcHealthy = healthy;
+    if (typeof startPolling === "function") startPolling();
+    if (typeof poll === "function") {
+      try {
+        await poll();
+      } catch (e) {}
+    }
+    if (healthy) toast("Connection restored", "success", 2500);
+  }
+
+  function handleOffline() {
+    reliability.online = false;
+    showOfflineBanner();
+    if (typeof stopPolling === "function") stopPolling();
+  }
+
+  window.addEventListener("online", function () {
+    handleReconnect();
+  });
+  window.addEventListener("offline", function () {
+    handleOffline();
+  });
+
+  // Global error boundaries — render the error view instead of a blank page.
+  window.addEventListener("error", function (event) {
+    // Ignore resource load errors (no message) and errors already handled.
+    if (!event || !event.message) return;
+    renderErrorView(event.message, function () {
+      navigate();
+    });
+  });
+  window.addEventListener("unhandledrejection", function (event) {
+    var reason = event && event.reason;
+    var msg = reason && reason.message ? reason.message : errorText(reason);
+    // Network errors already surface via the offline banner / api client.
+    if (/network error|failed to fetch|load failed/i.test(String(msg))) return;
+    renderErrorView(msg || "An unexpected error occurred.", function () {
+      navigate();
+    });
+  });
+
   // ── API Client ──
   async function api(path, opts = {}) {
     const headers = opts.body ? { "Content-Type": "application/json" } : {};
@@ -634,11 +789,11 @@
     headers["X-Bear-Network"] = state.network || "testnet";
     let res;
     try {
-      res = await fetch(`/api${path}`, {
+      res = await safeFetch(`/api${path}`, {
         method: opts.method || "GET",
         headers: headers,
         body: opts.body ? JSON.stringify(opts.body) : undefined,
-      });
+      }, { _silent: opts._silent });
     } catch (networkErr) {
       var networkMsg = "Network error — could not reach the server";
       var networkError = new Error(networkMsg);
@@ -3114,6 +3269,7 @@
 
   async function poll() {
     if (polling) return;
+    if (reliability.online === false) return; // skip while offline (#750)
     polling = true;
     try {
       var route = getRoute();
