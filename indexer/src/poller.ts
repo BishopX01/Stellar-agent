@@ -2,6 +2,7 @@ import { rpc as StellarRpc } from "@stellar/stellar-sdk";
 import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { EventStore, type InsertEventParams } from "./db.js";
 import { ReputationEngine } from "./reputation.js";
+import { EventHub } from "./events.js";
 
 const tracer = trace.getTracer("bear-indexer-poller");
 
@@ -10,6 +11,26 @@ export type SorobanRpcClient = {
     params: StellarRpc.Server.GetEventsRequest,
   ): Promise<StellarRpc.Api.GetEventsResponse>;
   getLatestLedger(): Promise<StellarRpc.Api.GetLatestLedgerResponse>;
+  /**
+   * Optional: fetch a single ledger header. Used for reorg detection to
+   * verify the `previous_ledger_hash` chain. When unavailable the poller
+   * falls back to the `previousLedgerHash` field on getEvents responses.
+   */
+  getLedger?(
+    ledger: number,
+  ): Promise<{ sequence: number; hash: string; previousLedgerHash?: string }>;
+};
+
+/** Structured log record emitted for every detected chain reorganization. */
+export type ReorgLogRecord = {
+  event: "chain_reorg";
+  detectedAt: string;
+  forkLedger: number;
+  rewoundTo: number;
+  purgedEvents: number;
+  previousHash: string | null;
+  expectedHash: string | null;
+  actualHash: string | null;
 };
 
 // Known Bear Protocol event topic names
@@ -81,6 +102,10 @@ export type PollerOptions = {
   debug?: boolean;
   /** Optional reputation engine used to recalculate scores on settlement. */
   reputation?: ReputationEngine;
+  /** Optional event hub used to broadcast newly indexed events. */
+  eventHub?: EventHub;
+  /** Max number of ledgers to walk back when resolving a reorg. Default: 64 */
+  maxReorgDepth?: number;
 };
 
 /** Event types that affect an agent's reputation score. */
@@ -120,9 +145,12 @@ export class SorobanEventPoller {
   private readonly batchSize: number;
   private readonly debug: boolean;
   private readonly reputation: ReputationEngine | null;
+  private readonly eventHub: EventHub | null;
+  private readonly maxReorgDepth: number;
 
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private reorgCount = 0;
 
   constructor(
     rpc: SorobanRpcClient,
@@ -139,10 +167,107 @@ export class SorobanEventPoller {
     this.batchSize = opts.batchSize ?? 100;
     this.debug = opts.debug ?? false;
     this.reputation = opts.reputation ?? null;
+    this.eventHub = opts.eventHub ?? null;
+    this.maxReorgDepth = opts.maxReorgDepth ?? 64;
   }
 
   private log(msg: string): void {
     if (this.debug) console.log(`[indexer] ${msg}`);
+  }
+
+  /** Number of chain reorganizations detected since construction. */
+  getReorgCount(): number {
+    return this.reorgCount;
+  }
+
+  /**
+   * Fetch the hash of a ledger. Prefers `rpc.getLedger` when available and
+   * falls back to the `previousLedgerHash` reported on getEvents responses.
+   */
+  private async fetchLedgerHash(
+    ledger: number,
+  ): Promise<{ hash: string | null; previousLedgerHash: string | null }> {
+    if (this.rpc.getLedger) {
+      try {
+        const header = await this.rpc.getLedger(ledger);
+        return {
+          hash: header.hash ?? null,
+          previousLedgerHash: header.previousLedgerHash ?? null,
+        };
+      } catch (err) {
+        this.log(
+          `Failed to fetch ledger ${ledger} header: ${(err as Error).message}`,
+        );
+      }
+    }
+    return { hash: null, previousLedgerHash: null };
+  }
+
+  /**
+   * Verify that the chain has not reorganized since the last indexed ledger.
+   * Returns the ledger to resume from. On mismatch, purges orphaned events,
+   * rewinds the watermark to the last verified ancestor and returns that
+   * ancestor so the next poll re-ingests from the common fork point.
+   */
+  private async detectAndRecoverReorg(): Promise<number> {
+    const last = this.store.getLastIndexedLedger();
+    if (last === null) return this.startLedger;
+
+    const storedHash = this.store.getIndexedLedgerHash(last);
+    if (!storedHash) {
+      // No hash recorded yet (legacy state); nothing to verify against.
+      return last + 1;
+    }
+
+    // Fetch the header for the last indexed ledger and compare its hash.
+    const header = await this.fetchLedgerHash(last);
+    if (!header.hash) {
+      // Cannot verify; assume no reorg.
+      return last + 1;
+    }
+
+    if (header.hash === storedHash) {
+      return last + 1;
+    }
+
+    // Mismatch: walk back to the last verified ancestor.
+    let forkLedger = last;
+    let rewoundTo = last;
+    let expectedHash: string | null = storedHash;
+    let actualHash: string | null = header.hash;
+
+    for (let depth = 0; depth < this.maxReorgDepth; depth++) {
+      const candidate = forkLedger - 1;
+      if (candidate < this.startLedger) break;
+      const candidateHash = this.store.getIndexedLedgerHash(candidate);
+      if (!candidateHash) break;
+      const candidateHeader = await this.fetchLedgerHash(candidate);
+      if (candidateHeader.hash && candidateHeader.hash === candidateHash) {
+        rewoundTo = candidate;
+        break;
+      }
+      forkLedger = candidate;
+      expectedHash = candidateHash;
+      actualHash = candidateHeader.hash;
+    }
+
+    const purged = this.store.deleteEventsFromLedger(rewoundTo + 1);
+    this.store.setLastIndexedLedger(rewoundTo);
+    this.reorgCount += 1;
+
+    const record: ReorgLogRecord = {
+      event: "chain_reorg",
+      detectedAt: new Date().toISOString(),
+      forkLedger,
+      rewoundTo,
+      purgedEvents: purged,
+      previousHash: expectedHash,
+      expectedHash,
+      actualHash,
+    };
+    console.error(`[indexer] ${JSON.stringify(record)}`);
+
+    return rewoundTo + 1;
   }
 
   /** Returns the ledger to start polling from (resume or initial). */
@@ -178,7 +303,16 @@ export class SorobanEventPoller {
   }
 
   private async poll(): Promise<void> {
-    const fromLedger = this.getFromLedger();
+    let fromLedger: number;
+    try {
+      fromLedger = await this.detectAndRecoverReorg();
+    } catch (err) {
+      console.error(
+        "[indexer] Reorg detection failed:",
+        (err as Error).message,
+      );
+      fromLedger = this.getFromLedger();
+    }
 
     try {
       const latest = await tracer.startActiveSpan(
@@ -268,10 +402,22 @@ export class SorobanEventPoller {
 
       // Persist the entire ledger batch (events + watermark) atomically.
       // If anything fails, neither the events nor the watermark advance.
-      this.store.insertEventsBatch(allInserts, latest.sequence);
+      const latestHash = await this.fetchLedgerHash(latest.sequence);
+      this.store.insertEventsBatch(
+        allInserts,
+        latest.sequence,
+        latestHash.hash ?? undefined,
+      );
       this.log(
         `Indexed ${allInserts.length} events across ${this.contracts.length} contract(s) up to ledger ${latest.sequence}`,
       );
+
+      // Broadcast newly indexed events to SSE/WebSocket subscribers.
+      if (this.eventHub && allInserts.length > 0) {
+        for (const insert of allInserts) {
+          this.eventHub.publish(insert);
+        }
+      }
     } catch (err) {
       console.error("[indexer] Poll error:", (err as Error).message);
     }
