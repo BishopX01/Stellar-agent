@@ -21,7 +21,7 @@ export {
   verifyChannelVoucher,
 } from "./paymentChannels.js";
 export * from "./signer.js";
-export { marcPaywall, type MarcPaywallOptions } from "./marcPaywall.js";
+export { marcPaywall, FACILITATOR_URLS, type MarcPaywallOptions } from "./marcPaywall.js";
 export { marcPaywallFastify, type MarcPaywallFastifyOptions } from "./marcPaywallFastify.js";
 export { marcPaywallHono, type MarcPaywallHonoOptions } from "./marcPaywallHono.js";
 export { marcPaywallNext, type MarcPaywallNextOptions } from "./marcPaywallNext.js";

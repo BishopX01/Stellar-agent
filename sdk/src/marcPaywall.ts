@@ -41,6 +41,16 @@ export interface CachedPaymentResponse {
 }
 
 /**
+ * OpenZeppelin-hosted x402 facilitator URLs, keyed by Stellar network.
+ * `marcPaywall` picks one from its `network` option unless an explicit
+ * `facilitatorUrl` is supplied (e.g. for self-hosted facilitators).
+ */
+export const FACILITATOR_URLS = {
+  testnet: "https://channels.openzeppelin.com/x402/testnet",
+  mainnet: "https://channels.openzeppelin.com/x402/mainnet",
+} as const satisfies Record<"testnet" | "mainnet", string>;
+
+/**
  * Default time-to-live for SETTLED entries in the idempotency cache (1 hour).
  */
 export const DEFAULT_PAYMENT_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -264,7 +274,7 @@ export function marcPaywall(opts: MarcPaywallOptions): RequestHandler {
     token,
     description = "MARC-protected API call",
     mimeType = "application/json",
-    facilitatorUrl = "https://channels.openzeppelin.com/x402/testnet",
+    facilitatorUrl = FACILITATOR_URLS[network === "stellar:pubnet" ? "mainnet" : "testnet"],
     facilitatorApiKey,
   } = opts;
 
