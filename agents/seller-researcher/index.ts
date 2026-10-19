@@ -177,7 +177,15 @@ async function handleJob(
       "content-type": req.headers["content-type"],
       "user-agent": req.headers["user-agent"],
       "x-forwarded-for": req.headers["x-forwarded-for"] ?? req.socket.remoteAddress,
-    })} — body: ${JSON.stringify(req.body)}`,
+    })} — body: ${
+      process.env.LOG_LEVEL === "debug"
+        ? JSON.stringify(req.body)
+        : JSON.stringify({
+            jobId,
+            taskLength: typeof task === "string" ? task.length : 0,
+            fields: Object.keys(req.body ?? {}).filter((k) => k !== "jobId" && k !== "task"),
+          })
+    }`,
   );
 
   if (!jobId || isNaN(Number(jobId))) {
@@ -206,7 +214,13 @@ async function handleJob(
   const resolvedDepth: ResearchDepth = ["brief", "standard", "deep"].includes(depth)
     ? depth
     : "standard";
-  console.log(`[${AGENT_ID}] Job #${jobId} (depth=${resolvedDepth}): ${task}`);
+  console.log(
+    `[${AGENT_ID}] Job #${jobId} (depth=${resolvedDepth}): ${
+      process.env.LOG_LEVEL === "debug"
+        ? task
+        : `task length ${typeof task === "string" ? task.length : 0}`
+    }`,
+  );
   const response = makeSellerResponse(
     { status: "accepted", jobId, depth: resolvedDepth },
     startedAt,
