@@ -655,6 +655,39 @@ export class EventStore {
     });
   }
 
+  // ── DatabaseAdapter implementation ─────────────────────────────────────────
+
+  getIndexerState(): number | null {
+    return this.getLastIndexedLedger();
+  }
+
+  setIndexerState(ledger: number): void {
+    this.setLastIndexedLedger(ledger);
+  }
+
+  /**
+   * Generic event query.  Applies the optional timestamp range and
+   * pagination from `QueryOptions`, ordered by ledger descending.
+   */
+  getEvents(opts: QueryOptions = {}): ParsedEventRow[] {
+    const { limit = 20, offset = 0, fromTimestamp, toTimestamp } = opts;
+    let sql = `SELECT * FROM events WHERE 1 = 1`;
+    const params: (string | number)[] = [];
+    if (fromTimestamp !== undefined) {
+      sql += " AND timestamp >= ?";
+      params.push(fromTimestamp);
+    }
+    if (toTimestamp !== undefined) {
+      sql += " AND timestamp <= ?";
+      params.push(toTimestamp);
+    }
+    sql += " ORDER BY ledger DESC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+
+    const rows = this.db.prepare(sql).all(...params) as EventRow[];
+    return rows.map(parseRow);
+  }
+
   // ── Query API ──────────────────────────────────────────────────────────────
 
   getByProvider(

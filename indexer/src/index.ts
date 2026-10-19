@@ -171,6 +171,11 @@ export class BearEventIndexer {
     return this.reputation.getReputation(agentId);
   }
 
+  /** Release any resources held by the storage adapter (e.g. DB pool). */
+  async close(): Promise<void> {
+    await this.store.close?.();
+  }
+
   // ── Query API ──────────────────────────────────────────────────────────────
 
   /**

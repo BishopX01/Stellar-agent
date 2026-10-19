@@ -18,6 +18,7 @@ version: "3.9"
 #   registry      agent discovery API (port 4500)
 #   seller-*      agent workers (ports 4501-4504)
 #   buyer         interactive Blessed TUI (healthcheck port 4550, stdin required)
+#   postgres      PostgreSQL 16 backing store for the indexer (port 5432)
 #
 # Offline Local Development:
 #   Everything runs against the in-container standalone network — no external
@@ -200,6 +201,27 @@ services:
       registry:
         condition: service_healthy
 
+  # ── PostgreSQL (indexer backing store) ────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-marc_indexer}
+      POSTGRES_USER: ${POSTGRES_USER:-marc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marc_dev_password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marc} -d ${POSTGRES_DB:-marc_indexer}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./indexer/migrations/postgres:/docker-entrypoint-initdb.d:ro
+    networks:
+      - marc-net
+
   # ── Soroban Event Indexer ─────────────────────────────────────────────────
   indexer:
     <<: *node
@@ -207,11 +229,15 @@ services:
       context: .
       dockerfile: indexer/Dockerfile
     working_dir: /app
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-marc}:${POSTGRES_PASSWORD:-marc_dev_password}@postgres:5432/${POSTGRES_DB:-marc_indexer}
     depends_on:
       sdk:
         condition: service_completed_successfully
       init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   # ── Buyer TUI (interactive) ───────────────────────────────────────────────
   buyer:
@@ -239,3 +265,6 @@ services:
 networks:
   marc-net:
     driver: bridge
+
+volumes:
+  postgres-data:

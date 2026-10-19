@@ -747,7 +747,7 @@ app.use(
 
 app.get("/health", async (_req, res) => {
   try {
-    await server.getLatestLedger();
+    await instrumentRpc("getLatestLedger", () => server.getLatestLedger());
     res.json({ status: "ok", rpc: "ok", timestamp: new Date().toISOString() });
   } catch (err: unknown) {
     res.status(503).json({
@@ -1088,6 +1088,7 @@ app.get("/api/stats", async (req, res) => {
       tracedDb("getFeeBps", () => getFeeBps()),
     ]);
     const activeJobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted").length;
+    activeEscrowJobsGauge.set(activeJobs);
     const payload = {
       totalAgents: agents.length,
       totalJobs: jobs.length,
@@ -1610,10 +1611,19 @@ app.post(
     try {
       const params = numericIdParamSchema.parse(req.params);
       const parsed = submitJobSchema.parse(req.body);
+      const deliverable = parsed.deliverable || "ipfs://dashboard-delivery";
+      const inspection = await deliverableValidator.validate(deliverable);
+      if (!inspection.valid) {
+        res.status(400).json({
+          error: "Deliverable rejected by content inspection",
+          details: inspection.errors,
+        });
+        return;
+      }
       const kp = getKeypair(parsed.wallet);
-      await commerce.submit(kp, params.id, parsed.deliverable || "ipfs://dashboard-delivery");
+      await commerce.submit(kp, params.id, deliverable);
       invalidateJobs();
-      res.json({ success: true });
+      res.json({ success: true, warnings: inspection.warnings });
     } catch (err: unknown) {
       handleRouteError(err, res);
     }
@@ -1832,14 +1842,23 @@ app.post(
 app.post("/api/build/submit", rateLimitMutating, optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
   try {
     const parsed = buildUnsignedActionSchema.parse(req.body);
+    const deliverable = req.body.deliverable || "ipfs://dashboard-delivery";
+    const inspection = await deliverableValidator.validate(deliverable);
+    if (!inspection.valid) {
+      res.status(400).json({
+        error: "Deliverable rejected by content inspection",
+        details: inspection.errors,
+      });
+      return;
+    }
     const op = commerceContract.call(
       "submit",
       new Address(parsed.publicKey).toScVal(),
       nativeToScVal(BigInt(parsed.jobId), { type: "u64" }),
-      nativeToScVal(req.body.deliverable || "ipfs://dashboard-delivery", { type: "string" }),
+      nativeToScVal(deliverable, { type: "string" }),
     );
     const txXdr = await buildTxXdr(parsed.publicKey, op);
-    res.json({ xdr: txXdr });
+    res.json({ xdr: txXdr, warnings: inspection.warnings });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
@@ -1944,6 +1963,7 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
     }
     invalidateAgents();
     invalidateJobs();
+    stellarEventsIngestedTotal.inc({ contract: cfg.commerceContract, type: "transaction" });
     res.json({ hash: sent.hash, returnValue: String(returnValue ?? "") });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;

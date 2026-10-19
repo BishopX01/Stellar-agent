@@ -138,7 +138,7 @@ function extractAgentId(event: StellarRpc.Api.EventResponse): string | null {
  */
 export class SorobanEventPoller {
   private readonly rpc: SorobanRpcClient;
-  private readonly store: EventStore;
+  private readonly store: DatabaseAdapter;
   private readonly contracts: string[];
   private readonly startLedger: number;
   private readonly intervalMs: number;
@@ -154,7 +154,7 @@ export class SorobanEventPoller {
 
   constructor(
     rpc: SorobanRpcClient,
-    store: EventStore,
+    store: DatabaseAdapter,
     contracts: string[],
     startLedger: number,
     opts: PollerOptions = {},
