@@ -18,7 +18,6 @@ import {
 } from "../shared.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
-=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4501);

@@ -66,6 +66,17 @@ jobs:
           node-version: 20
       - run: npx --yes @redocly/cli@latest lint docs/openapi.yaml
 
+  conflict-markers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for git conflict markers in TypeScript files
+        run: |
+          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- '*.ts' '*.tsx'; then
+            echo "Git conflict markers found in the files above" >&2
+            exit 1
+          fi
+
   state-dump:
     runs-on: ubuntu-latest
     env:

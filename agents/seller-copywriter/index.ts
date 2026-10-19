@@ -27,7 +27,6 @@ import {
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
 
 await initTracing("seller-copywriter");
-=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4502);
