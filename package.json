@@ -23,6 +23,8 @@
     "test:ts": "npm run test --workspaces --if-present",
     "test:react": "npm run test --workspace packages/react",
     "state:dump": "tsx scripts/state-dump.ts",
+    "gas:check": "tsx scripts/measure-gas.ts",
+    "gas:update": "tsx scripts/measure-gas.ts --update",
     "prepare": "husky"
   },
   "lint-staged": {
