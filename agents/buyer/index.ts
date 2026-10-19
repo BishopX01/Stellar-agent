@@ -221,7 +221,10 @@ function selectProvider(
 
   const scored = pool.map((a) => {
     const reputation = Number(a.reputation ?? a.reputation_score ?? 0);
-    const price = Number(a.price_usdc ?? 0);
+    if (a.price_usdc === undefined) {
+      log(`{yellow-fg}Registry agent ${a.name ?? a.id} is missing price_usdc{/yellow-fg}`);
+    }
+    const price = Number.isFinite(Number(a.price_usdc)) ? Number(a.price_usdc) : 0;
     // Reputation dominates; price is a tie-breaker (lower is better).
     const score = reputation * 100 - price;
     return { agent: a, score };

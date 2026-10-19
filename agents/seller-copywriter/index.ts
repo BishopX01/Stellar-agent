@@ -27,7 +27,6 @@ import {
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
 
 await initTracing("seller-copywriter");
-=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4502);
@@ -154,7 +153,15 @@ app.post("/job", limiter, async (req, res) => {
       "content-type": req.headers["content-type"],
       "user-agent": req.headers["user-agent"],
       "x-forwarded-for": req.headers["x-forwarded-for"] ?? req.socket.remoteAddress,
-    })} — body: ${JSON.stringify(req.body)}`,
+    })} — body: ${
+      process.env.LOG_LEVEL === "debug"
+        ? JSON.stringify(req.body)
+        : JSON.stringify({
+            jobId,
+            taskLength: typeof task === "string" ? task.length : 0,
+            fields: Object.keys(req.body ?? {}).filter((k) => k !== "jobId" && k !== "task"),
+          })
+    }`,
   );
 
   if (!jobId || isNaN(Number(jobId))) {
