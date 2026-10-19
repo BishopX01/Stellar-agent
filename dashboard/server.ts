@@ -47,9 +47,57 @@ import {
   type MatchmakingEngine,
   type AgentDocument,
 } from "./lib/matchmaking.js";
+import { WebSocketServer, type WebSocket } from "ws";
+import { getReadOnlyDb } from "../../indexer/src/db.js";
+import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// ── #718: Read-only database handle ──────────────────────────────────────────
+// Dashboard queries use a dedicated read-only connection so they never contend
+// with the indexer's write lock. Falls back to null when the indexer database is
+// not available (e.g. dashboard-only deployments).
+const readOnlyDb = (() => {
+  try {
+    return getReadOnlyDb();
+  } catch (err) {
+    console.warn("[db] read-only handle unavailable:", (err as Error).message);
+    return null;
+  }
+})();
+
+// ── #719: Event streaming helpers ────────────────────────────────────────────
+// Filtering semantics shared by the SSE and WebSocket endpoints. A subscriber
+// may filter by contract id, event type, and address topic.
+type EventFilter = {
+  contract?: string;
+  eventType?: string;
+  address?: string;
+};
+
+function parseEventFilter(source: Record<string, unknown>): EventFilter {
+  const pick = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim() ? value.trim() : undefined;
+  return {
+    contract: pick(source.contract),
+    eventType: pick(source.eventType ?? source.event_type),
+    address: pick(source.address),
+  };
+}
+
+function eventMatchesFilter(event: SorobanEvent, filter: EventFilter): boolean {
+  if (filter.contract && event.contractId !== filter.contract) return false;
+  if (filter.eventType && event.eventType !== filter.eventType) return false;
+  if (filter.address) {
+    const topics = Array.isArray(event.topics) ? event.topics.map(String) : [];
+    if (!topics.includes(filter.address)) return false;
+  }
+  return true;
+}
+
+const SSE_HEARTBEAT_MS = 30_000;
+const WS_HEARTBEAT_MS = 30_000;
 
 // ── #726: OpenTelemetry distributed tracing ─────────────────────────────────
 // The SDK is initialized in ./lib/tracing.js (imported for its side effects at
@@ -1141,6 +1189,113 @@ app.get("/api/audit-trail", requireAuth, (_req, res) => {
   res.json(auditTrail.slice().reverse());
 });
 
+// ── #719: GET /api/events/stream — SSE stream of newly indexed events ────────
+// Supports filtering by contract, event_type, and address topic. Clients may
+// resume after a reconnect by sending Last-Event-ID; buffered events newer than
+// that id are replayed before live streaming resumes.
+app.get("/api/events/stream", (req, res) => {
+  const filter = parseEventFilter(req.query as Record<string, unknown>);
+  const lastEventId = req.header("last-event-id") ?? (req.query.lastEventId as string | undefined);
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const send = (event: string, data: unknown, id?: string) => {
+    try {
+      if (id) res.write(`id: ${id}\n`);
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Client disconnected mid-write; cleanup happens on 'close'.
+    }
+  };
+
+  send("hello", { message: "connected", filter });
+
+  // Replay any buffered events the client missed (Last-Event-ID resume).
+  if (lastEventId) {
+    for (const buffered of eventHub.getBufferedEvents(lastEventId)) {
+      if (eventMatchesFilter(buffered, filter)) {
+        send("event", buffered, buffered.id);
+      }
+    }
+  }
+
+  const onEvent = (event: SorobanEvent) => {
+    if (eventMatchesFilter(event, filter)) {
+      send("event", event, event.id);
+    }
+  };
+
+  eventHub.on("event", onEvent);
+
+  const heartbeat = setInterval(() => {
+    send("ping", { t: Date.now(), retryAfterMs: 25_000 });
+  }, SSE_HEARTBEAT_MS);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+});
+
+// ── #719: GET /api/events — read indexed events from the read-only handle ────
+// Uses the dedicated read-only connection (#718) so dashboard queries never
+// contend with the indexer's write lock.
+app.get("/api/events", async (req, res) => {
+  try {
+    const filter = parseEventFilter(req.query as Record<string, unknown>);
+    const limit = Math.min(Number(req.query.limit ?? 100) || 100, 1000);
+
+    if (readOnlyDb) {
+      const clauses: string[] = [];
+      const params: unknown[] = [];
+      if (filter.contract) {
+        clauses.push("contract_id = ?");
+        params.push(filter.contract);
+      }
+      if (filter.eventType) {
+        clauses.push("event_type = ?");
+        params.push(filter.eventType);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = readOnlyDb
+        .prepare(
+          `SELECT id, contract_id, event_type, topics, data, ledger, tx_hash, timestamp
+           FROM events ${where} ORDER BY id DESC LIMIT ?`,
+        )
+        .all(...params, limit) as Array<Record<string, unknown>>;
+      const items = rows
+        .map((row) => ({
+          id: String(row.id),
+          contractId: row.contract_id,
+          eventType: row.event_type,
+          topics: typeof row.topics === "string" ? JSON.parse(row.topics) : row.topics,
+          data: typeof row.data === "string" ? JSON.parse(row.data) : row.data,
+          ledger: row.ledger,
+          txHash: row.tx_hash,
+          timestamp: row.timestamp,
+        }))
+        .filter((event) => eventMatchesFilter(event as unknown as SorobanEvent, filter));
+      res.json({ items, source: "read-only" });
+      return;
+    }
+
+    // Fallback: use the discovery event cache when the indexer DB is absent.
+    const allEvents = (await events.getEvents()) as unknown as SorobanEvent[];
+    const items = allEvents
+      .filter((event) => eventMatchesFilter(event, filter))
+      .slice(-limit)
+      .reverse();
+    res.json({ items, source: "cache" });
+  } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // Server-Sent Events: simple real-time stream for dashboard clients
 app.get("/api/stream", (req, res) => {
   // Headers for SSE
@@ -1961,11 +2116,74 @@ function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFun
 app.use(errorHandler);
 
 const PORT = Number(process.env.PORT ?? process.env.DASHBOARD_PORT ?? 3000);
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`Bear Dashboard → http://localhost:${PORT}`);
   console.log(`  Buyer:  ${buyerKeypair.publicKey()}`);
   console.log(`  Seller: ${sellerKeypair.publicKey()}`);
   void warmMatchmakingIndex();
 });
 
-export { app, matchmaking };
+// ── #719: WebSocket endpoint /events — bi-directional subscription management ─
+// Clients send { action: "subscribe", contract?, eventType?, address? } to set
+// their filter and { action: "unsubscribe" } to clear it. Newly indexed events
+// matching the active filter are pushed as { type: "event", event }. A heartbeat
+// ping is sent every 30 seconds to keep intermediaries from closing the socket.
+const wss = new WebSocketServer({ server: httpServer, path: "/events" });
+
+wss.on("connection", (socket: WebSocket) => {
+  let filter: EventFilter = {};
+
+  const sendJson = (payload: unknown) => {
+    if (socket.readyState === socket.OPEN) {
+      socket.send(JSON.stringify(payload));
+    }
+  };
+
+  const onEvent = (event: SorobanEvent) => {
+    if (eventMatchesFilter(event, filter)) {
+      sendJson({ type: "event", event });
+    }
+  };
+
+  eventHub.on("event", onEvent);
+
+  const heartbeat = setInterval(() => {
+    sendJson({ type: "ping", t: Date.now() });
+  }, WS_HEARTBEAT_MS);
+
+  socket.on("message", (raw) => {
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      sendJson({ type: "error", error: "invalid JSON" });
+      return;
+    }
+    const action = message.action ?? message.type;
+    if (action === "subscribe") {
+      filter = parseEventFilter(message);
+      sendJson({ type: "subscribed", filter });
+    } else if (action === "unsubscribe") {
+      filter = {};
+      sendJson({ type: "unsubscribed" });
+    } else if (action === "ping") {
+      sendJson({ type: "pong", t: Date.now() });
+    } else {
+      sendJson({ type: "error", error: `unknown action: ${String(action)}` });
+    }
+  });
+
+  socket.on("close", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+
+  socket.on("error", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+
+  sendJson({ type: "hello", message: "connected" });
+});
+
+export { app, matchmaking, httpServer, wss, readOnlyDb };

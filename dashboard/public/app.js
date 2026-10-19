@@ -3204,64 +3204,163 @@
     }
   });
 
-  // Server-Sent Events: listen for invalidation events to refresh quickly
-  if (typeof EventSource !== "undefined") {
-    try {
-      const es = new EventSource("/api/stream");
+  // ── Server-Sent Events: real-time Soroban event stream (#719) ──
+  // Subscribes to GET /api/events/stream. When the stream is live we slow the
+  // polling fallback down (or disable it) since events arrive instantly.
+  // Browsers without EventSource keep the regular polling behaviour.
+  var sse = {
+    source: null,
+    live: false,
+    lastEventId: null,
+    retryTimer: null,
+    retryDelayMs: 1000,
+    maxRetryDelayMs: 30000,
+    // Polling interval to restore when the stream drops.
+    fallbackIntervalMs: null,
+  };
 
-      // #581 — SSE connection status helpers
-      function setSseStatus(state) {
-        // state: 'connecting' | 'live' | 'reconnecting'
-        var dots = [
-          document.getElementById("sse-dot"),
-          document.getElementById("sse-dot-desktop"),
-        ];
-        var labels = [
-          document.getElementById("sse-label"),
-          document.getElementById("sse-label-desktop"),
-        ];
-        var pills = [
-          document.getElementById("sse-status-pill"),
-          document.getElementById("sse-status-pill-desktop"),
-        ];
-        var text = state === "live" ? "Live" : state === "reconnecting" ? "Reconnecting…" : "Connecting…";
-        dots.forEach(function (d) {
-          if (!d) return;
-          d.className = "sse-dot sse-dot-" + state;
-        });
-        labels.forEach(function (l) { if (l) l.textContent = text; });
-        pills.forEach(function (p) {
-          if (!p) return;
-          p.className = "sse-status-pill sse-" + state + (p.classList.contains("sse-status-sidebar") ? " sse-status-sidebar" : "");
-        });
-      }
+  // #581 — SSE connection status helpers
+  function setSseStatus(status) {
+    // status: 'connecting' | 'live' | 'reconnecting'
+    var dots = [
+      document.getElementById("sse-dot"),
+      document.getElementById("sse-dot-desktop"),
+    ];
+    var labels = [
+      document.getElementById("sse-label"),
+      document.getElementById("sse-label-desktop"),
+    ];
+    var pills = [
+      document.getElementById("sse-status-pill"),
+      document.getElementById("sse-status-pill-desktop"),
+    ];
+    var text = status === "live" ? "Live" : status === "reconnecting" ? "Reconnecting…" : "Connecting…";
+    dots.forEach(function (d) {
+      if (!d) return;
+      d.className = "sse-dot sse-dot-" + status;
+    });
+    labels.forEach(function (l) { if (l) l.textContent = text; });
+    pills.forEach(function (p) {
+      if (!p) return;
+      p.className = "sse-status-pill sse-" + status + (p.classList.contains("sse-status-sidebar") ? " sse-status-sidebar" : "");
+    });
+  }
+
+  // While the stream is live, polling is only a safety net: slow it down to
+  // 60 s (or keep it off if the user explicitly disabled auto-refresh).
+  function applyLivePolling() {
+    if (sse.fallbackIntervalMs === null) sse.fallbackIntervalMs = pollIntervalMs;
+    if (pollIntervalMs === 0) return;
+    pollIntervalMs = 60000;
+    startPolling();
+  }
+
+  function restoreFallbackPolling() {
+    if (sse.fallbackIntervalMs === null) return;
+    pollIntervalMs = sse.fallbackIntervalMs;
+    sse.fallbackIntervalMs = null;
+    startPolling();
+  }
+
+  // Refresh whichever view is currently visible after a new event arrives.
+  function refreshCurrentView() {
+    var route = getRoute();
+    if (route === "/") {
+      renderDashboard();
+    } else if (route === "/agents") {
+      loadAgents().then(function () { renderAgents(); }).catch(function () {});
+    } else if (route === "/jobs") {
+      loadJobs().then(function () { renderJobList(); }).catch(function () {});
+    } else if (route === "/wallet") {
+      loadWallets().then(function () { renderWallets(); }).catch(function () {});
+    } else if (route === "/history") {
+      Promise.all([loadJobs(), loadAgents(1, false)])
+        .then(function () { renderHistory(); })
+        .catch(function () {});
+    }
+  }
+
+  function handleStreamEvent(e) {
+    setSseStatus("live");
+    if (e && e.lastEventId) sse.lastEventId = e.lastEventId;
+    var payload = null;
+    try {
+      payload = e && e.data ? JSON.parse(e.data) : null;
+    } catch (err) {
+      payload = null;
+    }
+    // Invalidation events from the legacy stream just trigger a poll.
+    if (payload && payload.type === "invalidate") {
+      poll();
+      return;
+    }
+    // Newly indexed Soroban events: refresh the active view immediately.
+    refreshCurrentView();
+  }
+
+  function scheduleReconnect() {
+    if (sse.retryTimer) return;
+    var delay = sse.retryDelayMs;
+    sse.retryDelayMs = Math.min(sse.retryDelayMs * 2, sse.maxRetryDelayMs);
+    sse.retryTimer = setTimeout(function () {
+      sse.retryTimer = null;
+      connectEventStream();
+    }, delay);
+  }
+
+  function connectEventStream() {
+    if (typeof EventSource === "undefined") return; // polling fallback
+    if (sse.source) {
+      try { sse.source.close(); } catch (e) {}
+      sse.source = null;
+    }
+    var url = "/api/events/stream";
+    // Resume from the last seen event id so no events are missed on reconnect.
+    if (sse.lastEventId) {
+      url += "?lastEventId=" + encodeURIComponent(sse.lastEventId);
+    }
+    setSseStatus("connecting");
+    try {
+      var es = new EventSource(url);
+      sse.source = es;
 
       es.onopen = function () {
+        sse.live = true;
+        sse.retryDelayMs = 1000;
         setSseStatus("live");
+        applyLivePolling();
       };
-      es.addEventListener("invalidate", function (e) {
-        setSseStatus("live");
-        try {
-          JSON.parse(e.data);
-          poll();
-        } catch (err) {
-          poll();
-        }
+
+      // Named event types emitted by the indexer EventHub.
+      ["event", "soroban_event", "invalidate"].forEach(function (name) {
+        es.addEventListener(name, handleStreamEvent);
       });
+
+      // Default (unnamed) messages also carry events.
+      es.onmessage = handleStreamEvent;
+
       es.addEventListener("ping", function () {
         setSseStatus("live");
       });
+
       es.onerror = function () {
+        sse.live = false;
         setSseStatus("reconnecting");
-        // Close noisy stream errors; polling remains as a fallback
-        try {
-          es.close();
-        } catch (e) {}
+        try { es.close(); } catch (e) {}
+        sse.source = null;
+        restoreFallbackPolling();
+        // EventSource auto-reconnects, but we manage backoff ourselves so we
+        // can attach Last-Event-ID and avoid hammering a downed server.
+        scheduleReconnect();
       };
     } catch (e) {
-      // ignore SSE setup failures — polling is the primary mechanism
+      // ignore SSE setup failures — polling remains the fallback
+      restoreFallbackPolling();
+      scheduleReconnect();
     }
   }
+
+  connectEventStream();
 
   // Initial render
   renderNetworkBadge();

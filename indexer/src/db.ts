@@ -193,9 +193,30 @@ export function runMigrations(
   return result;
 }
 
+/** Interval (ms) between passive WAL checkpoints. */
+export const WAL_CHECKPOINT_INTERVAL_MS = 60_000;
+
+/**
+ * Applies the performance-oriented pragmas shared by the read-write and
+ * read-only connections.  `synchronous = NORMAL` is safe under WAL and much
+ * faster than FULL; `temp_store = MEMORY` keeps sorting/aggregation temp
+ * tables off disk; `cache_size = -64000` requests a 64MB page cache.
+ */
+function applyCommonPragmas(db: Database.Database): void {
+  db.pragma("synchronous = NORMAL");
+  db.pragma("temp_store = MEMORY");
+  db.pragma("cache_size = -64000");
+  db.pragma("busy_timeout = 5000");
+}
+
 /**
  * Initialises (or opens) the SQLite database, runs any pending migrations and
  * returns the connection.  Safe to call on every startup.
+ *
+ * A passive WAL checkpoint runs in the background every
+ * {@link WAL_CHECKPOINT_INTERVAL_MS} to keep the `-wal` file bounded.  The
+ * timer is `unref()`d so it never keeps the process alive, and it is cleared
+ * automatically when the connection is closed.
  */
 export function openDatabase(
   dbPath: string,
@@ -209,9 +230,40 @@ export function openDatabase(
   // WAL mode for better concurrent read performance
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
+  applyCommonPragmas(db);
 
   runMigrations(db, options);
 
+  // Passive background checkpointing keeps the WAL file small without
+  // blocking active readers or the writer.
+  const checkpointTimer = setInterval(() => {
+    try {
+      db.pragma("wal_checkpoint(PASSIVE)");
+    } catch {
+      // The connection may already be closed; ignore.
+    }
+  }, WAL_CHECKPOINT_INTERVAL_MS);
+  if (typeof checkpointTimer.unref === "function") {
+    checkpointTimer.unref();
+  }
+
+  const originalClose = db.close.bind(db);
+  db.close = ((...args: Parameters<Database.Database["close"]>) => {
+    clearInterval(checkpointTimer);
+    return originalClose(...args);
+  }) as Database.Database["close"];
+
+  return db;
+}
+
+/**
+ * Opens a dedicated read-only connection for dashboard/server queries so that
+ * long-running reads never contend with the indexer's write lock.  The caller
+ * owns the returned handle and is responsible for closing it.
+ */
+export function getReadOnlyDb(dbPath: string): Database.Database {
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  applyCommonPragmas(db);
   return db;
 }
 
@@ -220,6 +272,7 @@ export function openDatabase(
 export type EventRow = {
   id: number;
   ledger: number;
+  ledger_hash: string | null;
   timestamp: number;
   contract: string;
   event_type: string;
@@ -234,6 +287,8 @@ function parseRow(row: EventRow): ParsedEventRow {
 
 export type InsertEventParams = {
   ledger: number;
+  /** Hash of the ledger the event was emitted in (used for reorg detection). */
+  ledger_hash?: string | null;
   timestamp: number;
   contract: string;
   event_type: string;
@@ -264,6 +319,9 @@ export type ReputationRow = {
   updated_at: number;
 };
 
+/** Callback invoked with each freshly inserted event (see issue #719). */
+export type EventEmitHook = (event: InsertEventParams) => void;
+
 export class EventStore {
   private db: Database.Database;
 
@@ -273,13 +331,16 @@ export class EventStore {
   private stmtUpsertReputation: Database.Statement;
   private stmtGetReputation: Database.Statement;
   private stmtGetAllReputations: Database.Statement;
+  private stmtDeleteFromLedger: Database.Statement;
+
+  private emitHook: EventEmitHook | null = null;
 
   constructor(db: Database.Database) {
     this.db = db;
 
     this.stmtInsert = db.prepare(`
-      INSERT INTO events (ledger, timestamp, contract, event_type, payload)
-      VALUES (@ledger, @timestamp, @contract, @event_type, @payload)
+      INSERT INTO events (ledger, ledger_hash, timestamp, contract, event_type, payload)
+      VALUES (@ledger, @ledger_hash, @timestamp, @contract, @event_type, @payload)
     `);
 
     this.stmtGetState = db.prepare(
@@ -307,6 +368,18 @@ export class EventStore {
     this.stmtGetAllReputations = db.prepare(
       `SELECT * FROM agent_reputation ORDER BY score DESC`,
     );
+
+    this.stmtDeleteFromLedger = db.prepare(
+      `DELETE FROM events WHERE ledger >= ?`,
+    );
+  }
+
+  /**
+   * Registers a hook invoked after each successful batch insert so the poller
+   * can broadcast new events through the EventHub (issue #719).
+   */
+  setEventEmitHook(hook: EventEmitHook | null): void {
+    this.emitHook = hook;
   }
 
   /**
@@ -322,6 +395,7 @@ export class EventStore {
       for (const row of rows) {
         this.stmtInsert.run({
           ledger: row.ledger,
+          ledger_hash: row.ledger_hash ?? null,
           timestamp: row.timestamp,
           contract: row.contract,
           event_type: row.event_type,
@@ -334,6 +408,31 @@ export class EventStore {
     // taking the write lock before the transaction body runs.
     this.db.pragma("busy_timeout = 5000");
     run.immediate(events);
+
+    if (this.emitHook) {
+      for (const row of events) {
+        try {
+          this.emitHook(row);
+        } catch {
+          // A misbehaving subscriber must never break ingestion.
+        }
+      }
+    }
+  }
+
+  /**
+   * Deletes every event at or above `ledger`.  Used by the reorg rollback
+   * logic (issue #720) to purge orphaned events from invalidated ledgers.
+   * Returns the number of rows removed.
+   */
+  deleteEventsFromLedger(ledger: number): number {
+    return withSpan("db.events.deleteFromLedger", (span) => {
+      span.setAttribute("db.system", "sqlite");
+      span.setAttribute("indexer.ledger", ledger);
+      const info = this.stmtDeleteFromLedger.run(ledger);
+      span.setAttribute("db.rows.deleted", info.changes);
+      return info.changes;
+    });
   }
 
   /** Bulk-insert events inside a single transaction. */
@@ -356,6 +455,25 @@ export class EventStore {
       span.setAttribute("db.system", "sqlite");
       span.setAttribute("indexer.ledger", ledger);
       this.stmtSetState.run("last_ledger", String(ledger));
+    });
+  }
+
+  /** Returns the stored hash of the last indexed ledger, if any (#720). */
+  getLedgerHash(): string | null {
+    return withSpan("db.indexer_state.getLedgerHash", (span) => {
+      span.setAttribute("db.system", "sqlite");
+      const row = this.stmtGetState.get("ledger_hash") as
+        | { value: string }
+        | undefined;
+      return row ? row.value : null;
+    });
+  }
+
+  /** Stores the hash of the last indexed ledger for reorg detection (#720). */
+  setLedgerHash(hash: string): void {
+    withSpan("db.indexer_state.setLedgerHash", (span) => {
+      span.setAttribute("db.system", "sqlite");
+      this.stmtSetState.run("ledger_hash", hash);
     });
   }
 
