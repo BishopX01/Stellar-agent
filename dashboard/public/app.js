@@ -4,19 +4,12 @@
 // backend API (Stellar addresses, contract state). No untrusted user input.
 
 (() => {
-  // ── Theme (dark/light) ── #461, #578
-  (function initTheme() {
-    var saved = localStorage.getItem("bear-theme");
-    var theme = saved;
-    if (!theme) {
-      // Respect OS system preference (#578)
-      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
-        theme = "light";
-      } else {
-        theme = "dark";
-      }
-    }
-    document.documentElement.setAttribute("data-theme", theme);
+  // ── Theme (dark/light) ── #461, #578, #758
+  // The initial data-theme attribute is set by the inline blocking script in
+  // <head> (index.html) so the very first painted frame already uses the
+  // correct theme (no FOUC). Here we only wire up the toggle button, which
+  // reads the current attribute set by that inline script.
+  (function initThemeToggle() {
     var btn = document.getElementById("theme-toggle-btn");
     if (btn) {
       btn.addEventListener("click", function () {
@@ -27,6 +20,45 @@
       });
     }
   })();
+  // ── Network presets (#761) ──
+  // Contract addresses / RPC endpoints per network. The backend exposes the
+  // active network via /api/config; these presets are used for the switcher
+  // UI, wallet-network mismatch warnings and mainnet safety banner.
+  var NETWORK_PRESETS = {
+    testnet: {
+      id: "testnet",
+      label: "Testnet",
+      passphrase: "Test SDF Network ; September 2015",
+      rpcUrl: "https://soroban-testnet.stellar.org",
+      explorer: "https://stellar.expert/explorer/testnet",
+      realFunds: false,
+    },
+    futurenet: {
+      id: "futurenet",
+      label: "Futurenet",
+      passphrase: "Test SDF Future Network ; October 2022",
+      rpcUrl: "https://rpc-futurenet.stellar.org",
+      explorer: "https://stellar.expert/explorer/futurenet",
+      realFunds: false,
+    },
+    mainnet: {
+      id: "mainnet",
+      label: "Mainnet",
+      passphrase: "Public Global Stellar Network ; September 2015",
+      rpcUrl: "https://soroban-rpc.mainnet.stellar.gateway.fm",
+      explorer: "https://stellar.expert/explorer/public",
+      realFunds: true,
+    },
+  };
+
+  function readPersistedNetwork() {
+    try {
+      var saved = localStorage.getItem("bear-network");
+      if (saved && NETWORK_PRESETS[saved]) return saved;
+    } catch (e) {}
+    return "testnet";
+  }
+
   // ── State Store ──
   const state = {
     stats: null,
@@ -37,11 +69,18 @@
     loading: { stats: false, wallets: false, agents: false, jobs: false },
     jobFilter: "Active",
     jobSearch: "",
+    jobDateFrom: "",
+    jobDateTo: "",
     agentSearch: "",   // #583 — agent name/description/tag filter
     agentPage: 1,
     agentPageSize: 24,
     agentTotal: 0,
     txPending: false,
+    // #755 — multi-tag / sort agent search state
+    agentFilters: { query: "", tags: [], sort: "Most Active" },
+    // #756 — sidebar wallet balance widget
+    walletBalances: null,
+    faucetPending: false,
   };
 
   // ── Debounce helper ──
@@ -53,6 +92,156 @@
       timer = setTimeout(function () { fn.apply(null, args); }, ms);
     };
   }
+
+  // ── Web Notifications (#754) ──
+  // Opt-in desktop notifications for background job status changes.
+  // Permission is requested at most once; a denial is remembered and never
+  // re-prompted.  All calls are guarded for browsers without the API.
+  var NOTIFY_PREF_KEY = "bear-notifications-enabled";
+  var NOTIFY_DENIED_KEY = "bear-notifications-denied";
+  var notifications = {
+    supported: typeof window !== "undefined" && "Notification" in window,
+    enabled: false,
+  };
+  try {
+    notifications.enabled = localStorage.getItem(NOTIFY_PREF_KEY) === "1";
+  } catch (e) {}
+
+  function notificationsDenied() {
+    try {
+      return localStorage.getItem(NOTIFY_DENIED_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setNotificationPref(enabled) {
+    notifications.enabled = !!enabled;
+    try {
+      localStorage.setItem(NOTIFY_PREF_KEY, enabled ? "1" : "0");
+    } catch (e) {}
+    if (!enabled) return;
+    if (!notifications.supported) {
+      toast("Desktop notifications are not supported in this browser", "error");
+      return;
+    }
+    if (Notification.permission === "granted") return;
+    if (Notification.permission === "denied" || notificationsDenied()) {
+      toast("Notifications are blocked — enable them in your browser settings", "error");
+      return;
+    }
+    // Request permission exactly once on opt-in.
+    try {
+      Notification.requestPermission().then(function (perm) {
+        if (perm === "denied") {
+          try { localStorage.setItem(NOTIFY_DENIED_KEY, "1"); } catch (e) {}
+          notifications.enabled = false;
+          try { localStorage.setItem(NOTIFY_PREF_KEY, "0"); } catch (e) {}
+          toast("Notifications were denied by the browser", "error");
+        } else if (perm === "granted") {
+          toast("Desktop notifications enabled");
+        }
+        syncNotificationToggle();
+      }).catch(function () {});
+    } catch (e) {
+      // Older Safari uses the callback form
+      try {
+        Notification.requestPermission(function (perm) {
+          if (perm === "denied") {
+            try { localStorage.setItem(NOTIFY_DENIED_KEY, "1"); } catch (e) {}
+            notifications.enabled = false;
+          }
+          syncNotificationToggle();
+        });
+      } catch (e2) {}
+    }
+  }
+
+  function syncNotificationToggle() {
+    var toggle = document.getElementById("notifications-toggle");
+    if (toggle) toggle.checked = !!notifications.enabled;
+    var status = document.getElementById("notifications-status");
+    if (status) {
+      if (!notifications.supported) status.textContent = "Not supported in this browser";
+      else if (Notification.permission === "denied") status.textContent = "Blocked by browser";
+      else if (notifications.enabled) status.textContent = "Enabled";
+      else status.textContent = "Disabled";
+    }
+  }
+
+  // Opens the jobs view and expands the specific job row.
+  function focusJob(jobId) {
+    try { window.focus(); } catch (e) {}
+    var target = "#/jobs";
+    if (getRoute() !== "/jobs") {
+      window.location.hash = target;
+    }
+    // Wait for the jobs view to render, then expand the row.
+    var attempts = 0;
+    function tryExpand() {
+      var row = document.getElementById("job-" + jobId);
+      if (row) {
+        if (!row.classList.contains("expanded")) row.classList.add("expanded");
+        try { row.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+        return;
+      }
+      if (attempts++ < 20) setTimeout(tryExpand, 250);
+    }
+    setTimeout(tryExpand, 300);
+  }
+
+  var NOTIFY_STATE_LABELS = {
+    Funded: "has been funded",
+    Submitted: "deliverable was submitted",
+    Completed: "was approved and funds released",
+    Approved: "was approved",
+  };
+
+  function notifyJobEvent(job, newStatus) {
+    if (!notifications.enabled) return;
+    if (!notifications.supported) return;
+    if (Notification.permission !== "granted") return;
+    var label = NOTIFY_STATE_LABELS[newStatus];
+    if (!label) return;
+    var title = "Bear Job #" + job.id + " " + newStatus;
+    var body = "Job #" + job.id + " " + label + (job.description ? ": " + job.description : "");
+    try {
+      var n = new Notification(title, {
+        body: body,
+        tag: "bear-job-" + job.id + "-" + newStatus,
+      });
+      n.onclick = function () {
+        try { window.focus(); } catch (e) {}
+        focusJob(job.id);
+        try { n.close(); } catch (e) {}
+      };
+    } catch (e) {
+      // Some browsers require a service worker; degrade silently.
+    }
+  }
+
+  // Compares the previous job snapshot against the freshly loaded one and
+  // fires notifications for transitions involving the connected wallet.
+  function detectJobTransitions(prevJobs, nextJobs) {
+    if (!notifications.enabled || !wallet.connected || !wallet.publicKey) return;
+    if (!Array.isArray(prevJobs) || !Array.isArray(nextJobs)) return;
+    var prevById = {};
+    for (var i = 0; i < prevJobs.length; i++) prevById[String(prevJobs[i].id)] = prevJobs[i];
+    var me = wallet.publicKey;
+    for (var k = 0; k < nextJobs.length; k++) {
+      var job = nextJobs[k];
+      var prev = prevById[String(job.id)];
+      var oldStatus = prev ? prev.status : null;
+      if (oldStatus === job.status) continue;
+      var involvesMe = job.client === me || job.provider === me || job.evaluator === me;
+      if (!involvesMe) continue;
+      notifyJobEvent(job, job.status);
+    }
+  }
+
+  window.__setNotificationsEnabled = function (enabled) {
+    setNotificationPref(enabled);
+  };
 
   // ── Stellar Wallets Kit integration ──
   const wallet = {
@@ -234,6 +423,8 @@
     var connectedEl = document.getElementById("wallet-connected");
     var modeLabel = document.getElementById("wallet-mode-label");
     var btnWrapper = document.getElementById("swk-button-wrapper");
+    // #756 — refresh the sidebar balance widget whenever wallet state changes
+    try { refreshWalletWidget(); } catch (e) {}
     if (wallet.connected && wallet.publicKey) {
       if (connectedEl) connectedEl.style.display = "flex";
       var addrDisplay = document.getElementById("wallet-addr-display");
@@ -325,6 +516,97 @@
 
   // Expose wallet functions globally
   window.__disconnectWallet = disconnectWallet;
+
+  // ── Sidebar Wallet Balance Widget (#756) ──
+  // Fetches XLM via Horizon and USDC via the backend Soroban token balance
+  // endpoint, renders them in the sidebar, and offers a one-click Friendbot
+  // faucet for testnet wallets.  Hidden entirely on Mainnet.
+  var HORIZON_TESTNET = "https://horizon-testnet.stellar.org";
+  var FRIENDBOT_URL = "https://friendbot.stellar.org";
+
+  function isMainnet() {
+    return wallet.network === "mainnet";
+  }
+
+  async function fetchXlmBalance(publicKey) {
+    try {
+      var res = await fetch(HORIZON_TESTNET + "/accounts/" + encodeURIComponent(publicKey));
+      if (!res.ok) return null;
+      var data = await res.json();
+      var balances = (data && data.balances) || [];
+      for (var i = 0; i < balances.length; i++) {
+        if (balances[i].asset_type === "native") return parseFloat(balances[i].balance);
+      }
+      return 0;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function fetchUsdcBalance(publicKey) {
+    try {
+      var data = await api("/balance/" + encodeURIComponent(publicKey), { _silent: true });
+      if (data && data.usdc != null) return parseFloat(data.usdc);
+      if (data && data.musd != null) return parseFloat(data.musd);
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function refreshWalletWidget() {
+    var widget = document.getElementById("wallet-balance-widget");
+    if (!widget) return;
+    if (!wallet.connected || !wallet.publicKey || isMainnet()) {
+      widget.style.display = "none";
+      return;
+    }
+    widget.style.display = "";
+    var xlmEl = document.getElementById("wallet-xlm-balance");
+    var usdcEl = document.getElementById("wallet-usdc-balance");
+    var results = await Promise.all([
+      fetchXlmBalance(wallet.publicKey),
+      fetchUsdcBalance(wallet.publicKey),
+    ]);
+    var xlm = results[0];
+    var usdc = results[1];
+    state.walletBalances = { xlm: xlm, usdc: usdc };
+    if (xlmEl) xlmEl.textContent = xlm == null ? "—" : xlm.toFixed(2);
+    if (usdcEl) usdcEl.textContent = usdc == null ? "—" : usdc.toFixed(2);
+  }
+
+  window.__fundViaFaucet = async function () {
+    if (state.faucetPending) return;
+    if (!wallet.connected || !wallet.publicKey) {
+      toast("Connect a wallet first", "error");
+      return;
+    }
+    if (isMainnet()) {
+      toast("Friendbot is only available on Testnet", "error");
+      return;
+    }
+    state.faucetPending = true;
+    var btn = document.getElementById("faucet-btn");
+    var originalHtml = btn ? btn.innerHTML : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Funding…';
+    }
+    try {
+      var res = await fetch(FRIENDBOT_URL + "/?addr=" + encodeURIComponent(wallet.publicKey));
+      if (!res.ok) throw new Error("Friendbot request failed (" + res.status + ")");
+      toast("Wallet funded with 10,000 testnet XLM");
+      await refreshWalletWidget();
+    } catch (e) {
+      notifyError(e);
+    } finally {
+      state.faucetPending = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+      }
+    }
+  };
 
   /**
    * Returns a display label for the currently connected wallet.
@@ -503,6 +785,8 @@
   async function api(path, opts = {}) {
     const headers = opts.body ? { "Content-Type": "application/json" } : {};
     if (window.__sessionToken) headers.Authorization = "Bearer " + window.__sessionToken;
+    // #761 — tell the backend which network the dashboard is configured for
+    headers["X-Bear-Network"] = state.network || "testnet";
     let res;
     try {
       res = await safeFetch(`/api${path}`, {
@@ -939,14 +1223,292 @@
     overlay.className = "modal-overlay";
     const modal = document.createElement("div");
     modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
     modal.innerHTML = contentHtml; // Safe: only called with our own static template strings
     overlay.appendChild(modal);
     overlay.addEventListener("click", (e) => {
       if (e.target === overlay) overlay.remove();
     });
     document.body.appendChild(overlay);
+    // #748 — focus trapping and keyboard handlers for accessibility
+    trapModalFocus(overlay);
     return overlay;
   }
+
+  // #748 — Focus trap: keep Tab cycling inside the modal, Escape closes it.
+  function trapModalFocus(overlay) {
+    var modal = overlay.querySelector(".modal");
+    if (!modal) return;
+    var previousActive = document.activeElement;
+    function focusables() {
+      return Array.prototype.slice
+        .call(
+          modal.querySelectorAll(
+            'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ),
+        )
+        .filter(function (el) {
+          return el.offsetParent !== null || el === document.activeElement;
+        });
+    }
+    function onKeyDown(e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeModal(overlay);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      var items = focusables();
+      if (items.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      var first = items[0];
+      var last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    function closeModal(el) {
+      document.removeEventListener("keydown", onKeyDown, true);
+      el.remove();
+      if (previousActive && typeof previousActive.focus === "function") {
+        try {
+          previousActive.focus();
+        } catch (err) {}
+      }
+    }
+    overlay.__closeModal = function () {
+      closeModal(overlay);
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    // Move focus into the modal
+    var items = focusables();
+    if (items.length > 0) {
+      try {
+        items[0].focus();
+      } catch (err) {}
+    }
+  }
+
+  // ── Pre-flight Transaction Simulation (#746) ──
+  // Wraps the Stellar SDK rpc.Server.simulateTransaction() so the dashboard can
+  // show estimated fees, resource consumption and balance diffs before the
+  // wallet signature prompt is opened.
+
+  // Resolve the configured RPC URL (falls back to the public testnet endpoint).
+  function getRpcUrl() {
+    if (window.__BEAR_RPC_URL) return window.__BEAR_RPC_URL;
+    var meta = document.querySelector('meta[name="bear-rpc-url"]');
+    if (meta && meta.getAttribute("content")) return meta.getAttribute("content");
+    return "https://soroban-testnet.stellar.org";
+  }
+
+  // Lazily construct an rpc.Server from the Stellar SDK (UMD global `StellarSdk`).
+  var _rpcServer = null;
+  function getRpcServer() {
+    if (_rpcServer) return _rpcServer;
+    var sdk = window.StellarSdk || window.Stellar;
+    if (!sdk || !sdk.rpc || typeof sdk.rpc.Server !== "function") {
+      throw new Error("Stellar SDK rpc.Server is not available");
+    }
+    _rpcServer = new sdk.rpc.Server(getRpcUrl(), { allowHttp: getRpcUrl().indexOf("http://") === 0 });
+    return _rpcServer;
+  }
+
+  /**
+   * Simulate a transaction XDR against the configured Soroban RPC server.
+   * Returns the raw simulation result (or throws on transport errors).
+   */
+  async function simulateTransaction(txXdr) {
+    var server = getRpcServer();
+    var sdk = window.StellarSdk || window.Stellar;
+    var tx = sdk.TransactionBuilder.fromXDR(txXdr, sdk.Networks.TESTNET);
+    return await server.simulateTransaction(tx);
+  }
+
+  /**
+   * Parse a simulateTransaction() result into a display-friendly summary.
+   * Extracts CPU instructions, memory bytes, min resource fee and balance diffs.
+   */
+  function parseSimulationResult(result) {
+    var out = {
+      success: true,
+      cpuInsns: 0,
+      memBytes: 0,
+      minResourceFee: "0",
+      networkFeeXlm: "0.0000000",
+      balanceDiffs: [],
+      error: null,
+    };
+    if (!result) {
+      out.success = false;
+      out.error = "Empty simulation result";
+      return out;
+    }
+    // Soroban RPC returns { error } on failure, or { transactionData, cost, ... } on success.
+    if (result.error) {
+      out.success = false;
+      out.error = result.error;
+      return out;
+    }
+    var cost = result.cost || (result.result && result.result.cost) || {};
+    out.cpuInsns = Number(cost.cpuInsns || cost.cpu_insns || 0) || 0;
+    out.memBytes = Number(cost.memBytes || cost.mem_bytes || 0) || 0;
+    var minFee = result.minResourceFee != null ? result.minResourceFee : result.min_resource_fee;
+    out.minResourceFee = minFee != null ? String(minFee) : "0";
+    // Convert stroops (1 XLM = 10,000,000 stroops) to XLM.
+    var stroops = Number(out.minResourceFee);
+    if (Number.isFinite(stroops)) {
+      out.networkFeeXlm = (stroops / 10000000).toFixed(7);
+    }
+    // Extract balance diffs from the returned ledger entries / events when present.
+    var diffs = result.balanceDiffs || result.balance_diffs;
+    if (Array.isArray(diffs)) {
+      out.balanceDiffs = diffs.map(function (d) {
+        return {
+          asset: d.asset || d.token || "XLM",
+          amount: String(d.amount != null ? d.amount : d.delta != null ? d.delta : "0"),
+          address: d.address || d.account || "",
+        };
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Extract a Soroban contract error code/message from a failed simulation.
+   * Returns { code, message } or null when no error is present.
+   */
+  function extractSimulationError(result) {
+    if (!result) return null;
+    var raw = result.error;
+    if (!raw && result.status && result.status !== "SUCCESS") raw = result.status;
+    if (!raw) return null;
+    var text = typeof raw === "string" ? raw : errorText(raw);
+    var code = extractSorobanCode(text);
+    return {
+      code: code,
+      message: formatSorobanError(text),
+      raw: text,
+    };
+  }
+
+  // Render the pre-flight confirmation modal. Resolves true when the user
+  // confirms, false when they cancel.
+  function showSimulationModal(details) {
+    return new Promise(function (resolve) {
+      var sim = details.simulation || {};
+      var failed = sim.success === false;
+      var body;
+      if (failed) {
+        var err = extractSimulationError({ error: sim.error });
+        body =
+          '<div class="sim-error" role="alert">' +
+          '<div class="sim-error-title">Transaction would fail</div>' +
+          '<div class="sim-error-msg">' +
+          escapeHtml(err ? err.message : "Simulation failed") +
+          "</div>" +
+          (err && err.code != null
+            ? '<div class="sim-error-code">Contract error code: ' + escapeHtml(String(err.code)) + "</div>"
+            : "") +
+          "</div>";
+      } else {
+        var diffsHtml = "";
+        if (Array.isArray(sim.balanceDiffs) && sim.balanceDiffs.length > 0) {
+          diffsHtml = '<div class="sim-section"><div class="sim-section-title">Projected Balances</div>';
+          for (var i = 0; i < sim.balanceDiffs.length; i++) {
+            var d = sim.balanceDiffs[i];
+            diffsHtml +=
+              '<div class="sim-row"><span class="sim-row-label">' +
+              escapeHtml(d.asset) +
+              "</span><span class=\"sim-row-value\">" +
+              escapeHtml(d.amount) +
+              "</span></div>";
+          }
+          diffsHtml += "</div>";
+        }
+        body =
+          '<div class="sim-section">' +
+          '<div class="sim-row"><span class="sim-row-label">Action</span><span class="sim-row-value">' +
+          escapeHtml(details.action || "Transaction") +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Target Contract</span><span class="sim-row-value sim-mono">' +
+          escapeHtml(details.targetContract || "—") +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Budget Amount</span><span class="sim-row-value">' +
+          escapeHtml(details.budgetAmount || "—") +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Network Fee</span><span class="sim-row-value">' +
+          escapeHtml(sim.networkFeeXlm) +
+          " XLM</span></div>" +
+          "</div>" +
+          '<div class="sim-section"><div class="sim-section-title">Resource Consumption</div>' +
+          '<div class="sim-row"><span class="sim-row-label">CPU Instructions</span><span class="sim-row-value">' +
+          escapeHtml(String(sim.cpuInsns)) +
+          "</span></div>" +
+          '<div class="sim-row"><span class="sim-row-label">Memory</span><span class="sim-row-value">' +
+          escapeHtml(String(sim.memBytes)) +
+          " bytes</span></div>" +
+          "</div>" +
+          diffsHtml;
+      }
+      var actions = failed
+        ? '<button class="btn btn-secondary" data-sim-cancel>Close</button>'
+        : '<button class="btn btn-secondary" data-sim-cancel>Cancel</button>' +
+          '<button class="btn btn-primary" data-sim-confirm>Confirm &amp; Sign</button>';
+      var overlay = showModal(
+        '<h2 class="modal-title">Review Transaction</h2>' + body + '<div class="modal-actions">' + actions + "</div>",
+      );
+      function finish(value) {
+        if (overlay.__closeModal) overlay.__closeModal();
+        else overlay.remove();
+        resolve(value);
+      }
+      var cancelBtn = overlay.querySelector("[data-sim-cancel]");
+      if (cancelBtn) cancelBtn.addEventListener("click", function () { finish(false); });
+      var confirmBtn = overlay.querySelector("[data-sim-confirm]");
+      if (confirmBtn) confirmBtn.addEventListener("click", function () { finish(true); });
+    });
+  }
+
+  // Build, simulate, and (on user confirmation) sign & submit a transaction.
+  // Returns the submit result, or null when the user cancels / simulation fails.
+  async function simulateThenSubmit(buildEndpoint, params, details) {
+    await ensureSession();
+    var buildRes = await api(buildEndpoint, {
+      method: "POST",
+      body: { publicKey: wallet.publicKey, ...params },
+    });
+    var simulation;
+    try {
+      var raw = await simulateTransaction(buildRes.xdr);
+      simulation = parseSimulationResult(raw);
+    } catch (e) {
+      simulation = { success: false, error: errorText(e) };
+    }
+    var confirmed = await showSimulationModal({
+      action: details && details.action,
+      targetContract: details && details.targetContract,
+      budgetAmount: details && details.budgetAmount,
+      simulation: simulation,
+    });
+    if (!confirmed || simulation.success === false) return null;
+    // User confirmed a successful simulation — now open the wallet prompt.
+    var signedXdr = await signWalletTransaction(buildRes.xdr);
+    return await apiClientSubmit(signedXdr);
+  }
+
+  // Expose parsers for unit testing (#746)
+  window.__parseSimulationResult = parseSimulationResult;
+  window.__extractSimulationError = extractSimulationError;
+  window.__simulateTransaction = simulateTransaction;
+  window.__showSimulationModal = showSimulationModal;
 
   // ── Skeleton Loaders (#582) ──
   function skeletonCards(n) {
@@ -1074,6 +1636,94 @@
       '</div>'
     );
   }
+
+  // ── CSV Export (#757) ──
+  // Builds a UTF-8 BOM-prefixed CSV from the currently filtered job records.
+  function csvEscapeCell(value) {
+    var s = String(value == null ? "" : value);
+    if (s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\n") !== -1 || s.indexOf("\r") !== -1) {
+      s = '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+
+  function formatCsvDate(unixSeconds) {
+    if (!unixSeconds) return "";
+    var d = new Date(Number(unixSeconds) * 1000);
+    if (isNaN(d.getTime())) return "";
+    return d.toISOString().slice(0, 10);
+  }
+
+  function buildTransactionCsv(jobs) {
+    var header = ["Date", "Job ID", "Type", "Counterparty", "Amount", "Status", "TxHash"];
+    var lines = [header.map(csvEscapeCell).join(",")];
+    var me = wallet.publicKey || "";
+    for (var i = 0; i < jobs.length; i++) {
+      var j = jobs[i];
+      var counterparty = "";
+      if (me && j.client === me) counterparty = j.provider || "";
+      else if (me && j.provider === me) counterparty = j.client || "";
+      else counterparty = j.client || j.provider || "";
+      lines.push(
+        [
+          formatCsvDate(j.created_at),
+          j.id,
+          "Escrow",
+          counterparty,
+          formatMusd(j.budget),
+          j.status || "",
+          j.txHash || j.tx_hash || "",
+        ]
+          .map(csvEscapeCell)
+          .join(","),
+      );
+    }
+    return "\uFEFF" + lines.join("\r\n");
+  }
+
+  function downloadBlob(content, filename, mime) {
+    var blob = new Blob([content], { type: mime });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  window.__exportHistoryCsv = function () {
+    var jobs = state.jobs || [];
+    var searchTerm = (state.jobSearch || "").toLowerCase().trim();
+    var from = state.jobDateFrom ? new Date(state.jobDateFrom).getTime() : null;
+    var to = state.jobDateTo ? new Date(state.jobDateTo).getTime() + 86400000 : null;
+    var filtered = jobs.filter(function (j) {
+      if (searchTerm) {
+        var hay = (
+          String(j.id) + " " + (j.description || "") + " " + (j.client || "") + " " + (j.provider || "")
+        ).toLowerCase();
+        if (hay.indexOf(searchTerm) === -1) return false;
+      }
+      if (from != null || to != null) {
+        var ts = Number(j.created_at) * 1000;
+        if (!Number.isFinite(ts)) return false;
+        if (from != null && ts < from) return false;
+        if (to != null && ts > to) return false;
+      }
+      return true;
+    });
+    if (filtered.length === 0) {
+      toast("No transactions to export", "error");
+      return;
+    }
+    var csv = buildTransactionCsv(filtered);
+    var walletPart = wallet.publicKey ? wallet.publicKey.slice(0, 8) : "demo";
+    var dateStr = new Date().toISOString().slice(0, 10);
+    var filename = "bear-transactions-" + walletPart + "-" + dateStr + ".csv";
+    downloadBlob(csv, filename, "text/csv;charset=utf-8");
+    toast("Exported " + filtered.length + " transactions");
+  };
 
   // ── Data Fetchers ──
   async function loadStats() {
@@ -2085,7 +2735,8 @@
   };
   window.__searchAgentsDebounced = debounce(_searchAgentsImmediate, 200);
 
-  window.__showCreateJob = function () {
+  window.__showCreateJob = function (prefill) {
+    var prefillProvider = prefill && prefill.provider != null ? String(prefill.provider) : "";
     var walletField = wallet.connected
       ? '<div class="form-group"><label class="form-label">Signing Wallet</label>' +
          '<div class="form-input signing-wallet-display" style="color:var(--accent);cursor:default">' +
@@ -2101,7 +2752,7 @@
         '<div class="form-group"><label class="form-label">Budget (MUSD units, 7 decimals)</label>' +
         '<input class="form-input" id="cj-budget" value="10000000" placeholder="10000000 = 1 MUSD"></div>' +
         '<div class="form-group"><label class="form-label">Provider Address <span style="color:var(--text-muted);font-weight:400">(must be a registered agent)</span></label>' +
-        '<input class="form-input" id="cj-provider" placeholder="Leave blank to use default seller" autocomplete="off" spellcheck="false"></div>' +
+        '<input class="form-input" id="cj-provider" value="' + escapeAttr(prefillProvider) + '" placeholder="Leave blank to use default seller" autocomplete="off" spellcheck="false"></div>' +
         '<div class="modal-actions">' +
         '<button class="btn btn-secondary" onclick="this.closest(\'.modal-overlay\').remove()">Cancel</button>' +
         '<button class="btn btn-primary" onclick="window.__doCreateJob()">Create Job</button></div>',
@@ -2119,15 +2770,24 @@
     const providerVal = providerEl && providerEl.value.trim() ? providerEl.value.trim() : undefined;
     const overlay = document.querySelector(".modal-overlay");
     if (overlay) overlay.remove();
-    showTxOverlay("Creating job on Stellar...");
     try {
       if (wallet.connected) {
         const params = { description: description, budget: budget };
         if (providerVal) params.provider = providerVal;
-        const res = await signAndSubmit("/build/createJob", params);
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/createJob", params, {
+          action: "Create Job",
+          targetContract: "Bear Escrow",
+          budgetAmount: formatMusd(budget) + " MUSD",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
         hideTxOverlay();
         toast("Job created! tx: " + (res.hash || "").slice(0, 8) + "...");
       } else {
+        showTxOverlay("Creating job on Stellar...");
         const body = { wallet: walletVal, description: description, budget: budget };
         if (providerVal) body.provider = providerVal;
         const res = await api("/jobs/create", { method: "POST", body: body });
@@ -2147,14 +2807,25 @@
   window.__submitJob = async function (id) {
     if (state.txPending) return;
     state.txPending = true;
-    showTxOverlay("Submitting work...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/submit", {
-          jobId: id,
-          deliverable: "ipfs://dashboard-delivery-" + id,
-        });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit(
+          "/build/submit",
+          { jobId: id, deliverable: "ipfs://dashboard-delivery-" + id },
+          {
+            action: "Submit Work",
+            targetContract: "Bear Escrow",
+            budgetAmount: "—",
+          },
+        );
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Submitting work...");
         await api("/jobs/" + id + "/submit", {
           method: "POST",
           body: { wallet: "seller", deliverable: "ipfs://dashboard-delivery-" + id },
@@ -2175,11 +2846,21 @@
   window.__completeJob = async function (id) {
     if (state.txPending) return;
     state.txPending = true;
-    showTxOverlay("Completing job & releasing funds...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/complete", { jobId: id });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/complete", { jobId: id }, {
+          action: "Complete Job (Release Funds)",
+          targetContract: "Bear Escrow",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Completing job & releasing funds...");
         await api("/jobs/" + id + "/complete", { method: "POST", body: { wallet: "buyer" } });
       }
       hideTxOverlay();
@@ -2197,11 +2878,21 @@
   window.__approveJob = async function (id) {
     if (state.txPending) return;
     state.txPending = true;
-    showTxOverlay("Recording evaluator approval...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/approve", { jobId: id });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/approve", { jobId: id }, {
+          action: "Approve Job",
+          targetContract: "Bear Escrow",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Recording evaluator approval...");
         await api("/jobs/" + id + "/approve", { method: "POST", body: { wallet: "buyer" } });
       }
       hideTxOverlay();
@@ -2222,11 +2913,21 @@
     if (!confirmed) return;
 
     state.txPending = true;
-    showTxOverlay("Cancelling job & refunding...");
     try {
       if (wallet.connected) {
-        await signAndSubmit("/build/cancel", { jobId: id });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/build/cancel", { jobId: id }, {
+          action: "Cancel Job (Refund)",
+          targetContract: "Bear Escrow",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
+        hideTxOverlay();
       } else {
+        showTxOverlay("Cancelling job & refunding...");
         await api("/jobs/" + id + "/cancel", { method: "POST", body: { wallet: "buyer" } });
       }
       hideTxOverlay();
@@ -2268,16 +2969,25 @@
     const walletVal = walletEl ? walletEl.value : "buyer";
     const overlay = document.querySelector(".modal-overlay");
     if (overlay) overlay.remove();
-    showTxOverlay("Registering agent on Stellar...");
     try {
       let agentId = null;
       if (wallet.connected) {
         // Pass 'connected' so the server uses the caller's public key regardless
         // of which wallet adapter (Freighter, Albedo, xBull…) is active. (#584)
-        const res = await signAndSubmit("/agents/register", { wallet: "connected", uri: uri });
+        // #746 — pre-flight simulation before wallet prompt
+        const res = await simulateThenSubmit("/agents/register", { wallet: "connected", uri: uri }, {
+          action: "Register Agent",
+          targetContract: "Agent Registry",
+          budgetAmount: "—",
+        });
+        if (!res) {
+          state.txPending = false;
+          return;
+        }
         hideTxOverlay();
         toast("Agent registered! tx: " + (res.hash || "").slice(0, 8) + "...");
       } else {
+        showTxOverlay("Registering agent on Stellar...");
         const res = await api("/agents/register", {
           method: "POST",
           body: { wallet: walletVal, uri: uri },
@@ -2311,6 +3021,154 @@
     }
   };
 
+  // ── Agent Profile view (#760) ──
+  function setMetaTag(attr, key, content) {
+    var el = document.head.querySelector('meta[' + attr + '="' + key + '"]');
+    if (!el) {
+      el = document.createElement("meta");
+      el.setAttribute(attr, key);
+      document.head.appendChild(el);
+    }
+    el.setAttribute("content", content);
+  }
+
+  function injectAgentOpenGraph(agent) {
+    var title = "Agent #" + agent.id + " — Bear Protocol";
+    var desc = agent.description || agent.uri || "On-chain AI agent profile on Bear Protocol";
+    var url = window.location.href;
+    document.title = title;
+    setMetaTag("property", "og:title", title);
+    setMetaTag("property", "og:description", desc);
+    setMetaTag("property", "og:type", "profile");
+    setMetaTag("property", "og:url", url);
+    setMetaTag("name", "twitter:card", "summary");
+    setMetaTag("name", "twitter:title", title);
+    setMetaTag("name", "twitter:description", desc);
+  }
+
+  function resetOpenGraph() {
+    document.title = "Bear Protocol Dashboard";
+    setMetaTag("property", "og:title", "Bear Protocol Dashboard");
+    setMetaTag("property", "og:description", "Escrow-based AI agent marketplace on Stellar");
+    setMetaTag("property", "og:url", window.location.href);
+  }
+
+  async function renderAgentProfile(id) {
+    setPage(
+      '<div class="page-header"><div class="page-title">Agent Profile</div></div>' +
+        skeletonCards(2) +
+        skeletonList(3),
+    );
+
+    var agent = null;
+    try {
+      agent = await api("/agents/" + encodeURIComponent(String(id)));
+    } catch (e) {
+      agent = null;
+    }
+    if (!agent) {
+      setPage(
+        '<div class="empty-state">' +
+          '<div class="empty-title">Agent not found</div>' +
+          '<div class="empty-desc">No agent with ID #' + escapeHtml(String(id)) + " exists.</div>" +
+          '<a href="#/agents" class="btn btn-secondary" style="margin-top:16px">Back to agents</a>' +
+          "</div>",
+      );
+      return;
+    }
+
+    injectAgentOpenGraph(agent);
+
+    // Load verified badges from the agent-identity contract
+    var badges = [];
+    try {
+      var badgeData = await api("/agents/" + encodeURIComponent(String(id)) + "/badges", { _silent: true });
+      var nowSeconds = Math.floor(Date.now() / 1000);
+      badges = normalizeBadges(badgeData).filter(function (b) {
+        return isBadgeActive(b, nowSeconds);
+      });
+    } catch (e) {
+      badges = [];
+    }
+
+    // Recent job history for this agent
+    var jobs = [];
+    try {
+      jobs = (await api("/jobs?agent=" + encodeURIComponent(String(id)), { _silent: true })) || [];
+      if (!Array.isArray(jobs)) jobs = jobs.items || [];
+    } catch (e) {
+      jobs = [];
+    }
+
+    var shareUrl = window.location.origin + window.location.pathname + "#/agent/" + id;
+    var capabilities = Array.isArray(agent.tags) ? agent.tags : [];
+    var pricing = agent.pricing || agent.price || null;
+
+    var capabilitiesHtml = "";
+    if (capabilities.length > 0) {
+      capabilitiesHtml = '<div class="agent-profile-section"><div class="agent-profile-heading">Capabilities</div><div class="agent-badges">';
+      for (var i = 0; i < capabilities.length; i++) {
+        capabilitiesHtml += '<span class="badge-chip"><span class="badge-chip-tag">' + escapeHtml(String(capabilities[i])) + "</span></span>";
+      }
+      capabilitiesHtml += "</div></div>";
+    }
+
+    var pricingHtml = "";
+    if (pricing) {
+      pricingHtml =
+        '<div class="agent-profile-section"><div class="agent-profile-heading">Pricing</div>' +
+        '<div class="agent-profile-pricing">' + escapeHtml(String(pricing)) + "</div></div>";
+    }
+
+    var historyHtml = '<div class="agent-profile-section"><div class="agent-profile-heading">Recent Jobs</div>';
+    if (jobs.length === 0) {
+      historyHtml += '<div class="empty-desc">No jobs yet.</div>';
+    } else {
+      historyHtml += '<div class="history-list">';
+      for (var j = 0; j < jobs.length && j < 10; j++) {
+        var job = jobs[j];
+        historyHtml +=
+          '<div class="history-row">' +
+          '<div class="history-body"><div class="history-label">' + escapeHtml(job.description || "—") + "</div>" +
+          '<div class="history-meta">' + formatMusd(job.budget) + " USDC</div></div>" +
+          '<div class="history-right">' + statusBadge(job.status) + "</div>" +
+          "</div>";
+      }
+      historyHtml += "</div>";
+    }
+    historyHtml += "</div>";
+
+    setPage(
+      '<div class="agent-profile">' +
+        '<div class="agent-profile-banner"></div>' +
+        '<div class="agent-profile-header">' +
+        agentIdenticon(agent.owner) +
+        '<div class="agent-profile-title-wrap">' +
+        '<div class="agent-profile-title">Agent #' + escapeHtml(String(agent.id)) + "</div>" +
+        '<div class="agent-profile-owner">Owner: ' + copyable(agent.owner, "wallet public key") + "</div>" +
+        "</div>" +
+        '<div class="agent-profile-actions">' +
+        '<button class="btn btn-primary" onclick="window.__hireAgent(\'' + escapeHtml(String(agent.id)) + "')\">Hire Agent</button>" +
+        '<button class="btn btn-secondary" onclick="window.__copyShareLink(\'' + escapeAttr(shareUrl) + "')\">Copy Link</button>" +
+        "</div></div>" +
+        renderBadgeChips(badges) +
+        '<div class="agent-profile-section"><div class="agent-profile-heading">Bio</div>' +
+        '<div class="agent-profile-bio">' + escapeHtml(agent.description || agent.uri || "No bio provided.") + "</div></div>" +
+        pricingHtml +
+        capabilitiesHtml +
+        historyHtml +
+        "</div>",
+    );
+  }
+
+  window.__copyShareLink = function (url) {
+    copyToClipboard(url, null);
+  };
+
+  window.__hireAgent = function (agentId) {
+    window.__showCreateJob({ provider: agentId });
+  };
+
   // ── Router ──
   const routes = {
     "/": renderDashboard,
@@ -2324,9 +3182,17 @@
     return window.location.hash.slice(1) || "/";
   }
 
+  function parseRoute(route) {
+    var agentMatch = route.match(/^\/agent\/([^/]+)$/);
+    if (agentMatch) {
+      return { name: "agent", id: decodeURIComponent(agentMatch[1]) };
+    }
+    return { name: route, id: null };
+  }
+
   function navigate() {
     const route = getRoute();
-    const render = routes[route] || renderDashboard;
+    const parsed = parseRoute(route);
 
     // Update active nav
     document.querySelectorAll(".nav-item").forEach(function (el) {
@@ -2339,7 +3205,13 @@
     void page.offsetHeight;
     page.style.animation = "";
 
-    render();
+    if (parsed.name === "agent") {
+      renderAgentProfile(parsed.id);
+    } else {
+      resetOpenGraph();
+      const render = routes[route] || renderDashboard;
+      render();
+    }
 
     // Close mobile sidebar on navigation
     if (typeof closeDrawer === "function") closeDrawer();
@@ -2488,76 +3360,166 @@
     }
   });
 
-  // Server-Sent Events: listen for invalidation events to refresh quickly
-  if (typeof EventSource !== "undefined") {
-    try {
-      const es = new EventSource("/api/stream");
+  // ── Server-Sent Events: real-time Soroban event stream (#719) ──
+  // Subscribes to GET /api/events/stream. When the stream is live we slow the
+  // polling fallback down (or disable it) since events arrive instantly.
+  // Browsers without EventSource keep the regular polling behaviour.
+  var sse = {
+    source: null,
+    live: false,
+    lastEventId: null,
+    retryTimer: null,
+    retryDelayMs: 1000,
+    maxRetryDelayMs: 30000,
+    // Polling interval to restore when the stream drops.
+    fallbackIntervalMs: null,
+  };
 
-      // #581 — SSE connection status helpers
-      function setSseStatus(state) {
-        // state: 'connecting' | 'live' | 'reconnecting'
-        var dots = [
-          document.getElementById("sse-dot"),
-          document.getElementById("sse-dot-desktop"),
-        ];
-        var labels = [
-          document.getElementById("sse-label"),
-          document.getElementById("sse-label-desktop"),
-        ];
-        var pills = [
-          document.getElementById("sse-status-pill"),
-          document.getElementById("sse-status-pill-desktop"),
-        ];
-        var text = state === "live" ? "Live" : state === "reconnecting" ? "Reconnecting…" : "Connecting…";
-        dots.forEach(function (d) {
-          if (!d) return;
-          d.className = "sse-dot sse-dot-" + state;
-        });
-        labels.forEach(function (l) { if (l) l.textContent = text; });
-        pills.forEach(function (p) {
-          if (!p) return;
-          p.className = "sse-status-pill sse-" + state + (p.classList.contains("sse-status-sidebar") ? " sse-status-sidebar" : "");
-        });
-      }
+  // #581 — SSE connection status helpers
+  function setSseStatus(status) {
+    // status: 'connecting' | 'live' | 'reconnecting'
+    var dots = [
+      document.getElementById("sse-dot"),
+      document.getElementById("sse-dot-desktop"),
+    ];
+    var labels = [
+      document.getElementById("sse-label"),
+      document.getElementById("sse-label-desktop"),
+    ];
+    var pills = [
+      document.getElementById("sse-status-pill"),
+      document.getElementById("sse-status-pill-desktop"),
+    ];
+    var text = status === "live" ? "Live" : status === "reconnecting" ? "Reconnecting…" : "Connecting…";
+    dots.forEach(function (d) {
+      if (!d) return;
+      d.className = "sse-dot sse-dot-" + status;
+    });
+    labels.forEach(function (l) { if (l) l.textContent = text; });
+    pills.forEach(function (p) {
+      if (!p) return;
+      p.className = "sse-status-pill sse-" + status + (p.classList.contains("sse-status-sidebar") ? " sse-status-sidebar" : "");
+    });
+  }
 
-      es.onopen = function () {
-        setSseStatus("live");
-      };
-      es.addEventListener("invalidate", function (e) {
-        setSseStatus("live");
-        try {
-          JSON.parse(e.data);
-          poll();
-        } catch (err) {
-          poll();
-        }
-      });
-      es.addEventListener("ping", function () {
-        setSseStatus("live");
-      });
-      es.onerror = function () {
-        setSseStatus("reconnecting");
-        // Close noisy stream errors; polling remains as a fallback
-        try {
-          es.close();
-        } catch (e) {}
-      };
-    } catch (e) {
-      // ignore SSE setup failures — polling is the primary mechanism
+  // While the stream is live, polling is only a safety net: slow it down to
+  // 60 s (or keep it off if the user explicitly disabled auto-refresh).
+  function applyLivePolling() {
+    if (sse.fallbackIntervalMs === null) sse.fallbackIntervalMs = pollIntervalMs;
+    if (pollIntervalMs === 0) return;
+    pollIntervalMs = 60000;
+    startPolling();
+  }
+
+  function restoreFallbackPolling() {
+    if (sse.fallbackIntervalMs === null) return;
+    pollIntervalMs = sse.fallbackIntervalMs;
+    sse.fallbackIntervalMs = null;
+    startPolling();
+  }
+
+  // Refresh whichever view is currently visible after a new event arrives.
+  function refreshCurrentView() {
+    var route = getRoute();
+    if (route === "/") {
+      renderDashboard();
+    } else if (route === "/agents") {
+      loadAgents().then(function () { renderAgents(); }).catch(function () {});
+    } else if (route === "/jobs") {
+      loadJobs().then(function () { renderJobList(); }).catch(function () {});
+    } else if (route === "/wallet") {
+      loadWallets().then(function () { renderWallets(); }).catch(function () {});
+    } else if (route === "/history") {
+      Promise.all([loadJobs(), loadAgents(1, false)])
+        .then(function () { renderHistory(); })
+        .catch(function () {});
     }
   }
 
-  // Startup RPC healthcheck (#750) — probe the backend before first render.
-  runHealthcheck().then(function (healthy) {
-    reliability.rpcHealthy = healthy;
-    if (!healthy && reliability.online) {
-      // Backend reachable check failed; surface a non-blocking warning.
-      toast("Stellar RPC healthcheck failed — retrying automatically", "error", 5000);
+  function handleStreamEvent(e) {
+    setSseStatus("live");
+    if (e && e.lastEventId) sse.lastEventId = e.lastEventId;
+    var payload = null;
+    try {
+      payload = e && e.data ? JSON.parse(e.data) : null;
+    } catch (err) {
+      payload = null;
     }
-  });
-  if (reliability.online === false) showOfflineBanner();
+    // Invalidation events from the legacy stream just trigger a poll.
+    if (payload && payload.type === "invalidate") {
+      poll();
+      return;
+    }
+    // Newly indexed Soroban events: refresh the active view immediately.
+    refreshCurrentView();
+  }
+
+  function scheduleReconnect() {
+    if (sse.retryTimer) return;
+    var delay = sse.retryDelayMs;
+    sse.retryDelayMs = Math.min(sse.retryDelayMs * 2, sse.maxRetryDelayMs);
+    sse.retryTimer = setTimeout(function () {
+      sse.retryTimer = null;
+      connectEventStream();
+    }, delay);
+  }
+
+  function connectEventStream() {
+    if (typeof EventSource === "undefined") return; // polling fallback
+    if (sse.source) {
+      try { sse.source.close(); } catch (e) {}
+      sse.source = null;
+    }
+    var url = "/api/events/stream";
+    // Resume from the last seen event id so no events are missed on reconnect.
+    if (sse.lastEventId) {
+      url += "?lastEventId=" + encodeURIComponent(sse.lastEventId);
+    }
+    setSseStatus("connecting");
+    try {
+      var es = new EventSource(url);
+      sse.source = es;
+
+      es.onopen = function () {
+        sse.live = true;
+        sse.retryDelayMs = 1000;
+        setSseStatus("live");
+        applyLivePolling();
+      };
+
+      // Named event types emitted by the indexer EventHub.
+      ["event", "soroban_event", "invalidate"].forEach(function (name) {
+        es.addEventListener(name, handleStreamEvent);
+      });
+
+      // Default (unnamed) messages also carry events.
+      es.onmessage = handleStreamEvent;
+
+      es.addEventListener("ping", function () {
+        setSseStatus("live");
+      });
+
+      es.onerror = function () {
+        sse.live = false;
+        setSseStatus("reconnecting");
+        try { es.close(); } catch (e) {}
+        sse.source = null;
+        restoreFallbackPolling();
+        // EventSource auto-reconnects, but we manage backoff ourselves so we
+        // can attach Last-Event-ID and avoid hammering a downed server.
+        scheduleReconnect();
+      };
+    } catch (e) {
+      // ignore SSE setup failures — polling remains the fallback
+      restoreFallbackPolling();
+      scheduleReconnect();
+    }
+  }
+
+  connectEventStream();
 
   // Initial render
+  renderNetworkBadge();
   navigate();
 
   // Sync the refresh-interval dropdown to the restored/default interval

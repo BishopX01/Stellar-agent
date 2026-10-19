@@ -19,7 +19,9 @@ import {
   scValToNative,
   StrKey,
   Networks,
+  Utils,
 } from "@stellar/stellar-sdk";
+import { trace, context, propagation, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { cfg, rpcUrls, buyerKeypair, sellerKeypair, getKeypair, DEMO_MODE } from "./lib/config.js";
 import {
   getAllAgents,
@@ -33,8 +35,6 @@ import {
   getFeeBps,
 } from "./lib/discovery.js";
 import {
-  generateNonce,
-  verifyNonceSignature,
   createSession,
   refreshSession,
   verifySession,
@@ -42,9 +42,107 @@ import {
   requireAuth,
   requireMatchingWallet,
 } from "./lib/auth.js";
+import {
+  createMatchmakingEngine,
+  type MatchmakingEngine,
+  type AgentDocument,
+} from "./lib/matchmaking.js";
+import { WebSocketServer, type WebSocket } from "ws";
+import { getReadOnlyDb } from "../../indexer/src/db.js";
+import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
+// ── #718: Read-only database handle ──────────────────────────────────────────
+// Dashboard queries use a dedicated read-only connection so they never contend
+// with the indexer's write lock. Falls back to null when the indexer database is
+// not available (e.g. dashboard-only deployments).
+const readOnlyDb = (() => {
+  try {
+    return getReadOnlyDb();
+  } catch (err) {
+    console.warn("[db] read-only handle unavailable:", (err as Error).message);
+    return null;
+  }
+})();
+
+// ── #719: Event streaming helpers ────────────────────────────────────────────
+// Filtering semantics shared by the SSE and WebSocket endpoints. A subscriber
+// may filter by contract id, event type, and address topic.
+type EventFilter = {
+  contract?: string;
+  eventType?: string;
+  address?: string;
+};
+
+function parseEventFilter(source: Record<string, unknown>): EventFilter {
+  const pick = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim() ? value.trim() : undefined;
+  return {
+    contract: pick(source.contract),
+    eventType: pick(source.eventType ?? source.event_type),
+    address: pick(source.address),
+  };
+}
+
+function eventMatchesFilter(event: SorobanEvent, filter: EventFilter): boolean {
+  if (filter.contract && event.contractId !== filter.contract) return false;
+  if (filter.eventType && event.eventType !== filter.eventType) return false;
+  if (filter.address) {
+    const topics = Array.isArray(event.topics) ? event.topics.map(String) : [];
+    if (!topics.includes(filter.address)) return false;
+  }
+  return true;
+}
+
+const SSE_HEARTBEAT_MS = 30_000;
+const WS_HEARTBEAT_MS = 30_000;
+
+// ── #726: OpenTelemetry distributed tracing ─────────────────────────────────
+// The SDK is initialized in ./lib/tracing.js (imported for its side effects at
+// process startup). Here we obtain a tracer and install HTTP middleware that
+// extracts W3C traceparent headers and starts a server span per request.
+const tracer = trace.getTracer("marc-dashboard", "1.0.0");
+
+function tracingMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Extract incoming W3C trace context (traceparent/tracestate) from headers.
+  const parentContext = propagation.extract(context.active(), req.headers);
+  const span = tracer.startSpan(
+    `${req.method} ${req.path}`,
+    {
+      kind: 1, // SpanKind.SERVER
+      attributes: {
+        "http.method": req.method,
+        "http.target": req.originalUrl || req.url,
+        "http.route": req.path,
+        "http.scheme": req.protocol,
+        "http.host": req.headers.host ?? "",
+        "http.user_agent": req.headers["user-agent"] ?? "",
+      },
+    },
+    parentContext,
+  );
+
+  // Make the span active for the remainder of the request lifecycle.
+  context.with(trace.setSpan(parentContext, span), () => {
+    (req as any).span = span;
+    res.on("finish", () => {
+      span.setAttribute("http.status_code", res.statusCode);
+      if (res.statusCode >= 500) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+      }
+      span.end();
+    });
+    res.on("close", () => {
+      if (!span.isRecording()) return;
+      span.end();
+    });
+    next();
+  });
+}
+
+app.use(tracingMiddleware);
 
 // ── #778: Strict Content Security Policy with per-request nonces ─────────────
 // Generate a fresh cryptographic nonce for every request. The nonce is stored
@@ -134,6 +232,17 @@ app.use("/app", (_req: Request, res: Response, next: NextFunction) => {
         /<script src="app\.js"/g,
         `<script nonce="${nonce}" src="app.js"`,
       );
+      // Add nonce to the inline theme-init script in <head> (#758). This must run
+      // before CSS paints to avoid a flash of the wrong theme.
+      html = html.replace(
+        /<script(\s+id="theme-init")>/g,
+        `<script nonce="${nonce}"$1>`,
+      );
+      // Add nonce to the inline network-init script in <head> (#761).
+      html = html.replace(
+        /<script(\s+id="network-init")>/g,
+        `<script nonce="${nonce}"$1>`,
+      );
       // Add nonce to Google Fonts link tags
       html = html.replace(
         /<link\s+(rel="preconnect"\s+href="https:\/\/fonts\.(googleapis|gstatic)\.com[^>]*)>/g,
@@ -149,6 +258,96 @@ app.use("/app", (_req: Request, res: Response, next: NextFunction) => {
   };
   next();
 });
+
+// ── #761: Dynamic network presets ────────────────────────────────────────────
+// Each preset bundles the RPC endpoints, network passphrase, and contract
+// addresses needed to talk to a given Stellar network. The active network is
+// selected per-request via the `x-bear-network` header (falling back to the
+// server default) so the dashboard can switch networks on the fly.
+type NetworkPreset = {
+  id: "testnet" | "futurenet" | "mainnet";
+  label: string;
+  networkPassphrase: string;
+  rpcUrl: string;
+  rpcUrls: string[];
+  identityContract: string;
+  commerceContract: string;
+  usdcToken: string;
+  horizonUrl: string;
+  isMainnet: boolean;
+};
+
+const NETWORK_PRESETS: Record<NetworkPreset["id"], NetworkPreset> = {
+  testnet: {
+    id: "testnet",
+    label: "Testnet",
+    networkPassphrase: Networks.TESTNET,
+    rpcUrl: cfg.rpcUrl,
+    rpcUrls,
+    identityContract: cfg.identityContract,
+    commerceContract: cfg.commerceContract,
+    usdcToken: cfg.usdcToken,
+    horizonUrl: "https://horizon-testnet.stellar.org",
+    isMainnet: false,
+  },
+  futurenet: {
+    id: "futurenet",
+    label: "Futurenet",
+    networkPassphrase: Networks.FUTURENET,
+    rpcUrl: process.env.FUTURENET_RPC_URL ?? "https://rpc-futurenet.stellar.org",
+    rpcUrls: [process.env.FUTURENET_RPC_URL ?? "https://rpc-futurenet.stellar.org"],
+    identityContract: process.env.FUTURENET_IDENTITY_CONTRACT ?? cfg.identityContract,
+    commerceContract: process.env.FUTURENET_COMMERCE_CONTRACT ?? cfg.commerceContract,
+    usdcToken: process.env.FUTURENET_USDC_TOKEN ?? cfg.usdcToken,
+    horizonUrl: "https://horizon-futurenet.stellar.org",
+    isMainnet: false,
+  },
+  mainnet: {
+    id: "mainnet",
+    label: "Mainnet",
+    networkPassphrase: Networks.PUBLIC,
+    rpcUrl: process.env.MAINNET_RPC_URL ?? "https://soroban-rpc.mainnet.stellar.org",
+    rpcUrls: [process.env.MAINNET_RPC_URL ?? "https://soroban-rpc.mainnet.stellar.org"],
+    identityContract: process.env.MAINNET_IDENTITY_CONTRACT ?? cfg.identityContract,
+    commerceContract: process.env.MAINNET_COMMERCE_CONTRACT ?? cfg.commerceContract,
+    usdcToken:
+      process.env.MAINNET_USDC_TOKEN ??
+      "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    horizonUrl: "https://horizon.stellar.org",
+    isMainnet: true,
+  },
+};
+
+const DEFAULT_NETWORK_ID: NetworkPreset["id"] =
+  (process.env.DEFAULT_NETWORK as NetworkPreset["id"]) ?? "testnet";
+
+function resolveNetworkId(value: unknown): NetworkPreset["id"] {
+  if (typeof value === "string" && value in NETWORK_PRESETS) {
+    return value as NetworkPreset["id"];
+  }
+  return DEFAULT_NETWORK_ID;
+}
+
+/** Resolve the active network preset for a request from the x-bear-network header. */
+function getRequestNetwork(req: Request): NetworkPreset {
+  const header = req.header("x-bear-network");
+  return NETWORK_PRESETS[resolveNetworkId(header)];
+}
+
+/** Public, client-safe view of a network preset. */
+function publicNetworkInfo(preset: NetworkPreset) {
+  return {
+    id: preset.id,
+    label: preset.label,
+    networkPassphrase: preset.networkPassphrase,
+    rpcUrl: preset.rpcUrl,
+    horizonUrl: preset.horizonUrl,
+    identityContract: preset.identityContract,
+    commerceContract: preset.commerceContract,
+    usdcToken: preset.usdcToken,
+    isMainnet: preset.isMainnet,
+  };
+}
 
 const server = new rpc.Server(cfg.rpcUrl, {
   allowHttp: cfg.rpcUrl.startsWith("http://"),
@@ -173,8 +372,77 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
   throw lastError instanceof Error ? lastError : new Error("All Stellar RPC providers failed");
 }
 
+/** Run an RPC operation against a specific network's endpoints, with fallback. */
+async function withNetworkRpc<T>(
+  preset: NetworkPreset,
+  operation: (server: rpc.Server) => Promise<T>,
+): Promise<T> {
+  let lastError: unknown;
+  for (const url of preset.rpcUrls) {
+    try {
+      const candidate = new rpc.Server(url, { allowHttp: url.startsWith("http://") });
+      return await operation(candidate);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("All Stellar RPC providers failed");
+}
+
 const identityContract = new Contract(cfg.identityContract);
 const commerceContract = new Contract(cfg.commerceContract);
+
+// ── #736: Semantic matchmaking engine ────────────────────────────────────────
+// Embeddings are generated lazily and cached in a vector index (sqlite-vec when
+// available, otherwise an in-memory cosine index). When the embedding engine is
+// disabled via EMBEDDINGS_ENABLED=false, the engine transparently falls back to
+// lexical (token-overlap) search so the endpoint keeps working.
+const matchmaking: MatchmakingEngine = createMatchmakingEngine({
+  enabled: process.env.EMBEDDINGS_ENABLED !== "false",
+  dimensions: Number(process.env.EMBEDDING_DIMENSIONS ?? 384),
+  model: process.env.EMBEDDING_MODEL ?? "Xenova/all-MiniLM-L6-v2",
+  sqlitePath: process.env.VECTOR_DB_PATH,
+});
+
+/** Build the text document that represents an agent for embedding purposes. */
+function agentToDocument(agent: {
+  id?: unknown;
+  owner?: unknown;
+  uri?: unknown;
+  [key: string]: unknown;
+}): AgentDocument {
+  const id = String(agent.id ?? agent.owner ?? "");
+  const parts: string[] = [];
+  if (agent.uri) parts.push(String(agent.uri));
+  for (const key of ["name", "description", "capabilities", "skills", "tags", "category"]) {
+    const value = agent[key];
+    if (typeof value === "string" && value.trim()) parts.push(value);
+    else if (Array.isArray(value)) parts.push(value.map(String).join(" "));
+  }
+  return { id, text: parts.join(" \n ").trim() || id };
+}
+
+/** Index a batch of agents into the matchmaking engine. */
+async function indexAgents(agents: Array<Record<string, unknown>>): Promise<void> {
+  const docs = agents.map((agent) => agentToDocument(agent));
+  await matchmaking.upsert(docs);
+}
+
+/** Index a single agent (called after registration). */
+async function indexAgent(agent: Record<string, unknown>): Promise<void> {
+  await matchmaking.upsert([agentToDocument(agent)]);
+}
+
+/** Warm the index on startup so the first match request is fast. */
+async function warmMatchmakingIndex(): Promise<void> {
+  try {
+    const agents = (await getAllAgents()) as unknown as Array<Record<string, unknown>>;
+    await indexAgents(agents);
+    console.log(`[matchmaking] indexed ${agents.length} agents (mode=${matchmaking.mode})`);
+  } catch (err) {
+    console.warn("[matchmaking] failed to warm index:", (err as Error).message);
+  }
+}
 
 const allowedOrigins = [
   "http://localhost:3000",
@@ -183,24 +451,130 @@ const allowedOrigins = [
   ...(process.env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()),
 ].filter(Boolean) as string[];
 
-const mutatingBuckets = new Map<string, { count: number; resetAt: number }>();
+// ── #722: Sliding-window rate limiter for mutating API endpoints ─────────────
+// Tracks request timestamps per key (IP + optional wallet) in a sliding window,
+// which avoids the boundary-bursting problem of fixed-window counters. Expired
+// entries are pruned periodically so memory stays bounded under many distinct
+// IP probes.
+export type SlidingWindowResult = {
+  allowed: boolean;
+  limit: number;
+  remaining: number;
+  /** Seconds until the oldest in-window request expires (0 when allowed). */
+  retryAfterSeconds: number;
+};
+
+export class SlidingWindowRateLimiter {
+  private readonly buckets = new Map<string, number[]>();
+  private readonly limit: number;
+  private readonly windowMs: number;
+  private readonly pruneIntervalMs: number;
+  private pruneTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly now: () => number;
+
+  constructor(options: {
+    limit: number;
+    windowMs: number;
+    pruneIntervalMs?: number;
+    now?: () => number;
+  }) {
+    this.limit = Math.max(1, Math.floor(options.limit));
+    this.windowMs = Math.max(1, Math.floor(options.windowMs));
+    this.pruneIntervalMs = Math.max(1, Math.floor(options.pruneIntervalMs ?? 5 * 60_000));
+    this.now = options.now ?? Date.now;
+    this.startPruning();
+  }
+
+  /** Record a request for `key` and report whether it is allowed. */
+  check(key: string): SlidingWindowResult {
+    const now = this.now();
+    const windowStart = now - this.windowMs;
+    let timestamps = this.buckets.get(key);
+    if (!timestamps) {
+      timestamps = [];
+      this.buckets.set(key, timestamps);
+    }
+    // Drop timestamps that have fallen out of the sliding window.
+    let expired = 0;
+    while (expired < timestamps.length && timestamps[expired] <= windowStart) {
+      expired += 1;
+    }
+    if (expired > 0) timestamps.splice(0, expired);
+
+    if (timestamps.length >= this.limit) {
+      const oldest = timestamps[0];
+      const retryAfterMs = Math.max(0, oldest + this.windowMs - now);
+      return {
+        allowed: false,
+        limit: this.limit,
+        remaining: 0,
+        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+      };
+    }
+
+    timestamps.push(now);
+    return {
+      allowed: true,
+      limit: this.limit,
+      remaining: Math.max(0, this.limit - timestamps.length),
+      retryAfterSeconds: 0,
+    };
+  }
+
+  /** Remove all keys whose timestamps have fully expired. */
+  prune(): void {
+    const windowStart = this.now() - this.windowMs;
+    for (const [key, timestamps] of this.buckets) {
+      let expired = 0;
+      while (expired < timestamps.length && timestamps[expired] <= windowStart) {
+        expired += 1;
+      }
+      if (expired > 0) timestamps.splice(0, expired);
+      if (timestamps.length === 0) this.buckets.delete(key);
+    }
+  }
+
+  /** Number of tracked keys (exposed for tests / metrics). */
+  size(): number {
+    return this.buckets.size;
+  }
+
+  /** Stop the background pruning timer. */
+  stop(): void {
+    if (this.pruneTimer) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
+  }
+
+  private startPruning(): void {
+    this.pruneTimer = setInterval(() => this.prune(), this.pruneIntervalMs);
+    // Do not keep the Node.js event loop alive solely for pruning.
+    this.pruneTimer.unref?.();
+  }
+}
+
 const MUTATING_RATE_LIMIT = Number(process.env.MUTATING_RATE_LIMIT ?? 30);
 const MUTATING_RATE_WINDOW_MS = Number(process.env.MUTATING_RATE_WINDOW_MS ?? 60_000);
 
+const mutatingRateLimiter = new SlidingWindowRateLimiter({
+  limit: MUTATING_RATE_LIMIT,
+  windowMs: MUTATING_RATE_WINDOW_MS,
+});
+
 function rateLimitMutating(req: Request, res: Response, next: NextFunction) {
-  const key = req.ip || "unknown";
-  const now = Date.now();
-  const bucket = mutatingBuckets.get(key);
-  if (!bucket || now >= bucket.resetAt) {
-    mutatingBuckets.set(key, { count: 1, resetAt: now + MUTATING_RATE_WINDOW_MS });
-    next();
-    return;
-  }
-  if (bucket.count >= MUTATING_RATE_LIMIT) {
+  const wallet = String(req.headers["x-stellar-wallet"] ?? "");
+  const key = `${req.ip || "unknown"}:${wallet}`;
+  const result = mutatingRateLimiter.check(key);
+
+  res.setHeader("X-RateLimit-Limit", String(result.limit));
+  res.setHeader("X-RateLimit-Remaining", String(result.remaining));
+
+  if (!result.allowed) {
+    res.setHeader("Retry-After", String(result.retryAfterSeconds));
     res.status(429).json({ error: "rate limit exceeded" });
     return;
   }
-  bucket.count += 1;
   next();
 }
 
@@ -301,6 +675,11 @@ const agentsQuerySchema = z.object({
   pageSize: z.coerce.number().int().positive().max(100).default(24),
 });
 
+const agentMatchSchema = z.object({
+  query: z.string().min(1, "query must be a non-empty string"),
+  topK: z.coerce.number().int().positive().max(100).default(10),
+});
+
 function parseBudget(value: string | number | undefined, defaultValue = 10_000_000n): bigint {
   if (value === undefined || value === null) return defaultValue;
   return typeof value === "number" ? BigInt(value) : BigInt(value);
@@ -381,53 +760,49 @@ app.get("/health", async (_req, res) => {
 });
 app.get("/healthz", (_req, res) => res.send("ok"));
 
-// GET /api/health — RPC availability probe used by the dashboard startup
-// healthcheck and reconnect logic. Tries every configured RPC provider.
-app.get("/api/health", async (_req, res) => {
-  const startedAt = Date.now();
-  try {
-    const ledger = await withRpcFallback((rpcServer) => rpcServer.getLatestLedger());
-    res.json({
-      status: "ok",
-      rpc: "ok",
-      ledger: ledger.sequence,
-      latencyMs: Date.now() - startedAt,
-      providers: rpcUrls.length,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (err: unknown) {
-    res.status(503).json({
-      status: "degraded",
-      rpc: "unavailable",
-      error: (err as Error).message,
-      latencyMs: Date.now() - startedAt,
-      timestamp: new Date().toISOString(),
-    });
-  }
-});
+// --- Authentication Endpoints (SEP-0010) ---
 
-// --- Authentication Endpoints ---
+// #728: SEP-0010 server signing key. Used to sign the challenge transaction so
+// wallets can verify the home domain. Falls back to the seller keypair in demo
+// mode when no dedicated SEP-0010 key is configured.
+const SEP10_SERVER_KEYPAIR = process.env.SEP10_SERVER_SECRET
+  ? Keypair.fromSecret(process.env.SEP10_SERVER_SECRET)
+  : sellerKeypair;
+const SEP10_HOME_DOMAIN = process.env.SEP10_HOME_DOMAIN ?? "localhost";
+const SEP10_WEB_AUTH_DOMAIN = process.env.SEP10_WEB_AUTH_DOMAIN ?? SEP10_HOME_DOMAIN;
+const SEP10_CHALLENGE_TIMEOUT_SECONDS = 300;
 
-/** GET /api/auth/challenge — Request a nonce to sign for wallet verification */
+/**
+ * GET /api/auth/challenge — Issue a SEP-0010 challenge transaction.
+ * Query: { publicKey }
+ * Returns the base64 challenge XDR for the wallet to sign.
+ */
 app.get("/api/auth/challenge", async (req, res) => {
   try {
     const publicKeySchema = z.object({
       publicKey: stellarAddressSchema,
     });
     const parsed = publicKeySchema.parse(req.query);
-    const nonce = generateNonce(parsed.publicKey);
-    const account = await withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey));
-    const challengeTx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: cfg.networkPassphrase,
-    })
-      .addOperation(Operation.manageData({ name: "marc-auth", value: nonce }))
-      .setTimeout(300)
-      .build();
+    const account = await tracedRpc(
+      "getAccount",
+      { "rpc.method": "getAccount", "stellar.account": parsed.publicKey },
+      () => withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey)),
+    );
+    const challengeTx = Utils.buildChallengeTx(
+      SEP10_SERVER_KEYPAIR,
+      parsed.publicKey,
+      SEP10_HOME_DOMAIN,
+      SEP10_CHALLENGE_TIMEOUT_SECONDS,
+      cfg.networkPassphrase,
+      SEP10_WEB_AUTH_DOMAIN,
+      cfg.networkPassphrase === Networks.PUBLIC ? undefined : cfg.networkPassphrase,
+    );
+    // buildChallengeTx builds its own sequence number; the account lookup above
+    // validates the account exists on-chain before issuing a challenge.
+    void account;
     res.json({
-      nonce,
-      message: `Sign this nonce to authenticate: ${nonce}`,
-      xdr: challengeTx.toXDR(),
+      transaction: challengeTx.toXDR(),
+      network_passphrase: cfg.networkPassphrase,
     });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
@@ -436,27 +811,33 @@ app.get("/api/auth/challenge", async (req, res) => {
 });
 
 /**
- * POST /api/auth/verify — Verify signed nonce and receive session token.
- * Body: { publicKey, nonce, signedXdr }
+ * POST /api/auth/token — Verify a signed SEP-0010 challenge and issue a JWT.
+ * Body: { transaction }
  */
-app.post("/api/auth/verify", (req, res) => {
+app.post("/api/auth/token", (req, res) => {
   try {
     const authSchema = z.object({
-      publicKey: stellarAddressSchema,
-      nonce: z.string().min(1),
-      signedXdr: z.string().min(1),
+      transaction: z.string().min(1),
     });
     const parsed = authSchema.parse(req.body);
 
-    // Verify the signature proves wallet ownership
-    if (!verifyNonceSignature(parsed.publicKey, parsed.nonce, parsed.signedXdr)) {
-      res.status(401).json({ error: "Invalid signature or expired nonce" });
+    let clientPublicKey: string;
+    try {
+      clientPublicKey = Utils.verifyChallengeTx(
+        parsed.transaction,
+        SEP10_SERVER_KEYPAIR.publicKey(),
+        cfg.networkPassphrase,
+        SEP10_HOME_DOMAIN,
+        SEP10_WEB_AUTH_DOMAIN,
+      );
+    } catch (err: unknown) {
+      res.status(401).json({ error: `Invalid challenge transaction: ${(err as Error).message}` });
       return;
     }
 
-    // Create authenticated session
-    const token = createSession(parsed.publicKey);
-    res.json({ token, publicKey: parsed.publicKey });
+    // Issue a 24-hour JWT session token bound to the verified client key.
+    const token = createSession(clientPublicKey);
+    res.json({ token, publicKey: clientPublicKey });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(400).json({ error: (err as Error).message });
@@ -515,7 +896,7 @@ function optionalAuthMiddleware(req: Request, res: Response, next: NextFunction)
   if (!token) {
     res.status(401).json({
       error:
-        "Authentication required. Use /api/auth/challenge and /api/auth/verify to authenticate.",
+        "Authentication required. Use /api/auth/challenge and /api/auth/token to authenticate.",
     });
     return;
   }
@@ -571,10 +952,10 @@ const HORIZON_URL =
     ? "https://horizon.stellar.org"
     : "https://horizon-testnet.stellar.org");
 
-/** Get XLM balance from Horizon */
-async function getXlmBalance(pubkey: string): Promise<string> {
+/** Get XLM balance from Horizon (optionally for a specific network) */
+async function getXlmBalance(pubkey: string, horizonUrl: string = HORIZON_URL): Promise<string> {
   try {
-    const resp = await fetch(`${HORIZON_URL}/accounts/${pubkey}`);
+    const resp = await fetch(`${horizonUrl}/accounts/${pubkey}`);
     if (!resp.ok) return "0";
     const data = (await resp.json()) as {
       balances: Array<{ asset_type: string; balance: string }>;
@@ -587,18 +968,22 @@ async function getXlmBalance(pubkey: string): Promise<string> {
 }
 
 /** Simulate a read-only contract call with no arguments and return its native value */
-async function simulateReadCall(contract: Contract, method: string): Promise<unknown> {
+async function simulateReadCall(
+  contract: Contract,
+  method: string,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<unknown> {
   const op = contract.call(method);
   const ephemeral = Keypair.random();
   const dummy = new Account(ephemeral.publicKey(), "0");
   const tx = new TransactionBuilder(dummy, {
     fee: BASE_FEE,
-    networkPassphrase: cfg.networkPassphrase,
+    networkPassphrase: preset.networkPassphrase,
   })
     .addOperation(op)
     .setTimeout(30)
     .build();
-  const sim = await withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx));
+  const sim = await withNetworkRpc(preset, (rpcServer) => rpcServer.simulateTransaction(tx));
   if (rpc.Api.isSimulationError(sim)) return null;
   const result = (sim as rpc.Api.SimulateTransactionSuccessResponse).result;
   if (!result) return null;
@@ -608,13 +993,19 @@ async function simulateReadCall(contract: Contract, method: string): Promise<unk
 const tokenDecimalsCache = new Map<string, number>();
 
 /** Query and cache a SAC token's `decimals()` value, defaulting to 7 on failure */
-async function getTokenDecimals(tokenAddress: string): Promise<number> {
-  const cached = tokenDecimalsCache.get(tokenAddress);
+async function getTokenDecimals(
+  tokenAddress: string,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<number> {
+  const cacheKey = `${preset.id}:${tokenAddress}`;
+  const cached = tokenDecimalsCache.get(cacheKey);
   if (cached !== undefined) return cached;
   try {
-    const decimals = Number(await simulateReadCall(new Contract(tokenAddress), "decimals"));
+    const decimals = Number(
+      await simulateReadCall(new Contract(tokenAddress), "decimals", preset),
+    );
     if (!Number.isFinite(decimals)) return 7;
-    tokenDecimalsCache.set(tokenAddress, decimals);
+    tokenDecimalsCache.set(cacheKey, decimals);
     return decimals;
   } catch {
     return 7;
@@ -622,26 +1013,29 @@ async function getTokenDecimals(tokenAddress: string): Promise<number> {
 }
 
 /** Get MUSD (SAC) balance via Soroban simulate */
-async function getTokenBalance(pubkey: string): Promise<string> {
+async function getTokenBalance(
+  pubkey: string,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<string> {
   try {
-    const contract = new Contract(cfg.usdcToken);
+    const contract = new Contract(preset.usdcToken);
     const op = contract.call("balance", new Address(pubkey).toScVal());
     const ephemeral = Keypair.random();
     const dummy = new Account(ephemeral.publicKey(), "0");
     const tx = new TransactionBuilder(dummy, {
       fee: BASE_FEE,
-      networkPassphrase: cfg.networkPassphrase,
+      networkPassphrase: preset.networkPassphrase,
     })
       .addOperation(op)
       .setTimeout(30)
       .build();
-    const sim = await withRpcFallback((rpcServer) => rpcServer.simulateTransaction(tx));
+    const sim = await withNetworkRpc(preset, (rpcServer) => rpcServer.simulateTransaction(tx));
     if (rpc.Api.isSimulationError(sim)) return "0";
     const result = (sim as rpc.Api.SimulateTransactionSuccessResponse).result;
     if (!result) return "0";
     const raw = scValToNative(result.retval);
     const val = BigInt(raw);
-    const decimals = await getTokenDecimals(cfg.usdcToken);
+    const decimals = await getTokenDecimals(preset.usdcToken, preset);
     if (decimals === 0) return val.toString();
     const divisor = 10n ** BigInt(decimals);
     const whole = val / divisor;
@@ -665,6 +1059,18 @@ app.get("/api/demo-mode", (_req, res) => {
   });
 });
 
+// GET /api/network — active network + available presets for the switcher (#761).
+// The active network is resolved from the `x-bear-network` header so the client
+// can confirm which preset its requests are being served against.
+app.get("/api/network", (req, res) => {
+  const active = getRequestNetwork(req);
+  res.json({
+    active: publicNetworkInfo(active),
+    defaultNetwork: DEFAULT_NETWORK_ID,
+    presets: Object.values(NETWORK_PRESETS).map(publicNetworkInfo),
+  });
+});
+
 let statsCache: { ts: number; payload: unknown } | null = null;
 const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS ?? 5_000);
 
@@ -676,7 +1082,11 @@ app.get("/api/stats", async (req, res) => {
       res.json(statsCache.payload);
       return;
     }
-    const [agents, jobs, feeBps] = await Promise.all([getAllAgents(), getAllJobs(), getFeeBps()]);
+    const [agents, jobs, feeBps] = await Promise.all([
+      tracedDb("getAllAgents", () => getAllAgents()),
+      tracedDb("getAllJobs", () => getAllJobs()),
+      tracedDb("getFeeBps", () => getFeeBps()),
+    ]);
     const activeJobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted").length;
     const payload = {
       totalAgents: agents.length,
@@ -691,8 +1101,305 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
+// GET /api/stats/historical — 30-day protocol analytics for the dashboard charts.
+// Aggregates daily volume, job counts, active jobs and settlement times from the
+// cached discovery helpers, plus top-earning agents and month-over-month deltas.
+const HISTORICAL_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+type HistoricalJob = {
+  id?: unknown;
+  status?: unknown;
+  budget?: unknown;
+  createdAt?: unknown;
+  completedAt?: unknown;
+  provider?: unknown;
+  seller?: unknown;
+};
+
+function toMs(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "string") {
+    const asNum = Number(value);
+    if (Number.isFinite(asNum) && /^[0-9]+$/.test(value)) {
+      // Heuristic: treat large integers as unix seconds/ms, otherwise parse as date.
+      if (asNum > 1e12) return asNum;
+      if (asNum > 1e9) return asNum * 1000;
+    }
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function toBigIntSafe(value: unknown): bigint {
+  if (value === null || value === undefined) return 0n;
+  try {
+    return BigInt(value as string | number | bigint);
+  } catch {
+    return 0n;
+  }
+}
+
+function dayKey(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+app.get("/api/stats/historical", async (_req, res) => {
+  try {
+    const [agents, jobs] = await Promise.all([getAllAgents(), getAllJobs()]);
+    const now = Date.now();
+    const windowStart = now - HISTORICAL_DAYS * DAY_MS;
+    const prevWindowStart = windowStart - HISTORICAL_DAYS * DAY_MS;
+
+    // Pre-build the ordered list of day buckets (oldest → newest).
+    const buckets = new Map<
+      string,
+      { date: string; volume: bigint; jobCount: number; activeJobs: number; settlementSum: number; settlementCount: number }
+    >();
+    for (let i = HISTORICAL_DAYS - 1; i >= 0; i--) {
+      const key = dayKey(now - i * DAY_MS);
+      buckets.set(key, {
+        date: key,
+        volume: 0n,
+        jobCount: 0,
+        activeJobs: 0,
+        settlementSum: 0,
+        settlementCount: 0,
+      });
+    }
+
+    const earningsByProvider = new Map<string, bigint>();
+    let currentVolume = 0n;
+    let currentJobs = 0;
+    let currentSettlementSum = 0;
+    let currentSettlementCount = 0;
+    let prevVolume = 0n;
+    let prevJobs = 0;
+    let prevSettlementSum = 0;
+    let prevSettlementCount = 0;
+
+    for (const raw of jobs as HistoricalJob[]) {
+      const createdMs = toMs(raw.createdAt);
+      const completedMs = toMs(raw.completedAt);
+      const status = typeof raw.status === "string" ? raw.status : "";
+      const budget = toBigIntSafe(raw.budget);
+      const isActive = status === "Funded" || status === "Submitted" || status === "Active";
+
+      // Daily buckets only cover the current 30-day window.
+      if (createdMs !== null && createdMs >= windowStart && createdMs <= now) {
+        const bucket = buckets.get(dayKey(createdMs));
+        if (bucket) {
+          bucket.jobCount += 1;
+          bucket.volume += budget;
+          if (isActive) bucket.activeJobs += 1;
+        }
+      }
+
+      // Settlement time measured from creation to completion.
+      const settlementMs =
+        createdMs !== null && completedMs !== null && completedMs >= createdMs
+          ? completedMs - createdMs
+          : null;
+      if (settlementMs !== null && completedMs !== null) {
+        if (completedMs >= windowStart && completedMs <= now) {
+          const bucket = buckets.get(dayKey(completedMs));
+          if (bucket) {
+            bucket.settlementSum += settlementMs;
+            bucket.settlementCount += 1;
+          }
+          currentSettlementSum += settlementMs;
+          currentSettlementCount += 1;
+        } else if (completedMs >= prevWindowStart && completedMs < windowStart) {
+          prevSettlementSum += settlementMs;
+          prevSettlementCount += 1;
+        }
+      }
+
+      // Aggregate volume/jobs for current vs previous window (by creation date).
+      if (createdMs !== null) {
+        if (createdMs >= windowStart && createdMs <= now) {
+          currentVolume += budget;
+          currentJobs += 1;
+        } else if (createdMs >= prevWindowStart && createdMs < windowStart) {
+          prevVolume += budget;
+          prevJobs += 1;
+        }
+      }
+
+      // Top-earning agents: completed jobs credited to the provider.
+      if (status === "Completed" && completedMs !== null && completedMs >= windowStart) {
+        const provider = String(raw.provider ?? raw.seller ?? "");
+        if (provider) {
+          earningsByProvider.set(provider, (earningsByProvider.get(provider) ?? 0n) + budget);
+        }
+      }
+    }
+
+    const days = Array.from(buckets.values()).map((b) => ({
+      date: b.date,
+      volume: b.volume.toString(),
+      jobCount: b.jobCount,
+      activeJobs: b.activeJobs,
+      avgSettlementMs: b.settlementCount > 0 ? Math.round(b.settlementSum / b.settlementCount) : 0,
+    }));
+
+    const agentById = new Map<string, unknown>();
+    for (const agent of agents as Array<Record<string, unknown>>) {
+      const owner = String(agent.owner ?? agent.address ?? agent.publicKey ?? "");
+      if (owner) agentById.set(owner, agent.id ?? null);
+    }
+
+    const topAgents = Array.from(earningsByProvider.entries())
+      .map(([owner, earnings]) => ({
+        id: agentById.get(owner) ?? null,
+        owner,
+        earnings: earnings.toString(),
+      }))
+      .sort((a, b) => (BigInt(b.earnings) > BigInt(a.earnings) ? 1 : -1))
+      .slice(0, 10);
+
+    const currentAvgSettlementMs =
+      currentSettlementCount > 0 ? Math.round(currentSettlementSum / currentSettlementCount) : 0;
+    const prevAvgSettlementMs =
+      prevSettlementCount > 0 ? Math.round(prevSettlementSum / prevSettlementCount) : 0;
+
+    const pctDelta = (current: number, previous: number): number | null => {
+      if (previous === 0) return current === 0 ? 0 : null;
+      return Math.round(((current - previous) / previous) * 1000) / 10;
+    };
+
+    res.json({
+      days,
+      topAgents,
+      totals: {
+        volume: currentVolume.toString(),
+        jobs: currentJobs,
+        avgSettlementMs: currentAvgSettlementMs,
+      },
+      deltas: {
+        volumePct: pctDelta(Number(currentVolume), Number(prevVolume)),
+        jobsPct: pctDelta(currentJobs, prevJobs),
+        avgSettlementPct: pctDelta(currentAvgSettlementMs, prevAvgSettlementMs),
+      },
+    });
+  } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 app.get("/api/audit-trail", requireAuth, (_req, res) => {
   res.json(auditTrail.slice().reverse());
+});
+
+// ── #719: GET /api/events/stream — SSE stream of newly indexed events ────────
+// Supports filtering by contract, event_type, and address topic. Clients may
+// resume after a reconnect by sending Last-Event-ID; buffered events newer than
+// that id are replayed before live streaming resumes.
+app.get("/api/events/stream", (req, res) => {
+  const filter = parseEventFilter(req.query as Record<string, unknown>);
+  const lastEventId = req.header("last-event-id") ?? (req.query.lastEventId as string | undefined);
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const send = (event: string, data: unknown, id?: string) => {
+    try {
+      if (id) res.write(`id: ${id}\n`);
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Client disconnected mid-write; cleanup happens on 'close'.
+    }
+  };
+
+  send("hello", { message: "connected", filter });
+
+  // Replay any buffered events the client missed (Last-Event-ID resume).
+  if (lastEventId) {
+    for (const buffered of eventHub.getBufferedEvents(lastEventId)) {
+      if (eventMatchesFilter(buffered, filter)) {
+        send("event", buffered, buffered.id);
+      }
+    }
+  }
+
+  const onEvent = (event: SorobanEvent) => {
+    if (eventMatchesFilter(event, filter)) {
+      send("event", event, event.id);
+    }
+  };
+
+  eventHub.on("event", onEvent);
+
+  const heartbeat = setInterval(() => {
+    send("ping", { t: Date.now(), retryAfterMs: 25_000 });
+  }, SSE_HEARTBEAT_MS);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+});
+
+// ── #719: GET /api/events — read indexed events from the read-only handle ────
+// Uses the dedicated read-only connection (#718) so dashboard queries never
+// contend with the indexer's write lock.
+app.get("/api/events", async (req, res) => {
+  try {
+    const filter = parseEventFilter(req.query as Record<string, unknown>);
+    const limit = Math.min(Number(req.query.limit ?? 100) || 100, 1000);
+
+    if (readOnlyDb) {
+      const clauses: string[] = [];
+      const params: unknown[] = [];
+      if (filter.contract) {
+        clauses.push("contract_id = ?");
+        params.push(filter.contract);
+      }
+      if (filter.eventType) {
+        clauses.push("event_type = ?");
+        params.push(filter.eventType);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = readOnlyDb
+        .prepare(
+          `SELECT id, contract_id, event_type, topics, data, ledger, tx_hash, timestamp
+           FROM events ${where} ORDER BY id DESC LIMIT ?`,
+        )
+        .all(...params, limit) as Array<Record<string, unknown>>;
+      const items = rows
+        .map((row) => ({
+          id: String(row.id),
+          contractId: row.contract_id,
+          eventType: row.event_type,
+          topics: typeof row.topics === "string" ? JSON.parse(row.topics) : row.topics,
+          data: typeof row.data === "string" ? JSON.parse(row.data) : row.data,
+          ledger: row.ledger,
+          txHash: row.tx_hash,
+          timestamp: row.timestamp,
+        }))
+        .filter((event) => eventMatchesFilter(event as unknown as SorobanEvent, filter));
+      res.json({ items, source: "read-only" });
+      return;
+    }
+
+    // Fallback: use the discovery event cache when the indexer DB is absent.
+    const allEvents = (await events.getEvents()) as unknown as SorobanEvent[];
+    const items = allEvents
+      .filter((event) => eventMatchesFilter(event, filter))
+      .slice(-limit)
+      .reverse();
+    res.json({ items, source: "cache" });
+  } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
 });
 
 // Server-Sent Events: simple real-time stream for dashboard clients
@@ -734,15 +1441,16 @@ app.get("/api/stream", (req, res) => {
 });
 
 // GET /api/wallets
-app.get("/api/wallets", async (_req, res) => {
+app.get("/api/wallets", async (req, res) => {
   try {
+    const preset = getRequestNetwork(req);
     const buyerPub = buyerKeypair.publicKey();
     const sellerPub = sellerKeypair.publicKey();
     const [buyerXlm, sellerXlm, buyerMusd, sellerMusd] = await Promise.all([
-      getXlmBalance(buyerPub),
-      getXlmBalance(sellerPub),
-      getTokenBalance(buyerPub),
-      getTokenBalance(sellerPub),
+      getXlmBalance(buyerPub, preset.horizonUrl),
+      getXlmBalance(sellerPub, preset.horizonUrl),
+      getTokenBalance(buyerPub, preset),
+      getTokenBalance(sellerPub, preset),
     ]);
     res.json({
       buyer: { address: buyerPub, xlm: buyerXlm, musd: buyerMusd },
@@ -757,14 +1465,34 @@ app.get("/api/wallets", async (_req, res) => {
 app.get("/api/agents", async (req, res) => {
   try {
     if (!("page" in req.query) && !("pageSize" in req.query)) {
-      const agents = await getAllAgents();
+      const agents = await tracedDb("getAllAgents", () => getAllAgents());
       res.json(serialize(agents));
       return;
     }
     const parsed = agentsQuerySchema.parse(req.query);
-    const agents = await getAgentsPage(parsed.page, parsed.pageSize);
+    const agents = await tracedDb("getAgentsPage", () => getAgentsPage(parsed.page, parsed.pageSize));
     res.json({ ...agents, items: serialize(agents.items) });
   } catch (err: unknown) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/agents/match — semantic agent discovery (#736)
+app.post("/api/agents/match", async (req, res) => {
+  try {
+    const parsed = agentMatchSchema.parse(req.body);
+    const started = process.hrtime.bigint();
+    const results = await matchmaking.match(parsed.query, parsed.topK);
+    const latencyMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+    res.json({
+      query: parsed.query,
+      topK: parsed.topK,
+      mode: matchmaking.mode,
+      latencyMs: Number(latencyMs.toFixed(2)),
+      results,
+    });
+  } catch (err: unknown) {
+    if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
   }
 });
@@ -791,6 +1519,12 @@ app.post(
       const kp = getKeypair(parsed.wallet);
       const agentId = await identity.register(kp, parsed.uri || "ipfs://dashboard-agent");
       invalidateAgents();
+      // Index the newly registered agent for semantic discovery.
+      await indexAgent({
+        id: agentId.toString(),
+        owner: kp.publicKey(),
+        uri: parsed.uri || "ipfs://dashboard-agent",
+      }).catch((err) => console.warn("[matchmaking] index failed:", (err as Error).message));
       res.json({ agentId: agentId.toString() });
     } catch (err: unknown) {
       handleRouteError(err, res);
@@ -802,7 +1536,7 @@ app.post(
 app.get("/api/jobs", async (req, res) => {
   try {
     const parsed = jobsQuerySchema.parse(req.query);
-    let jobs = await getAllJobs();
+    let jobs = await tracedDb("getAllJobs", () => getAllJobs());
     if (parsed.status === "Active") {
       jobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted");
     } else if (parsed.status) {
@@ -1015,16 +1749,20 @@ app.post("/api/claim-refund", optionalAuthMiddleware, requireDashboardWallet, as
 const pendingTxHashes = new Set<string>();
 
 /** Build an unsigned, simulated transaction and return its XDR */
-async function buildTxXdr(publicKey: string, op: xdr.Operation): Promise<string> {
-  const account = await withRpcFallback((rpcServer) => rpcServer.getAccount(publicKey));
+async function buildTxXdr(
+  publicKey: string,
+  op: xdr.Operation,
+  preset: NetworkPreset = NETWORK_PRESETS[DEFAULT_NETWORK_ID],
+): Promise<string> {
+  const account = await withNetworkRpc(preset, (rpcServer) => rpcServer.getAccount(publicKey));
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
-    networkPassphrase: cfg.networkPassphrase,
+    networkPassphrase: preset.networkPassphrase,
   })
     .addOperation(op)
     .setTimeout(30)
     .build();
-  const prepared = await withRpcFallback((rpcServer) => rpcServer.prepareTransaction(tx));
+  const prepared = await withNetworkRpc(preset, (rpcServer) => rpcServer.prepareTransaction(tx));
   const hash = prepared.hash().toString("hex");
   pendingTxHashes.add(hash);
   return prepared.toXDR();
@@ -1173,8 +1911,9 @@ app.post("/api/build/cancel", rateLimitMutating, optionalAuthMiddleware, require
 // POST /api/submit — submit a Freighter-signed transaction
 app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, res) => {
   try {
+    const preset = getRequestNetwork(req);
     const parsed = submitXdrSchema.parse(req.body);
-    const tx = TransactionBuilder.fromXDR(parsed.signedXdr, cfg.networkPassphrase);
+    const tx = TransactionBuilder.fromXDR(parsed.signedXdr, preset.networkPassphrase);
     const submitHash = tx.hash().toString("hex");
     if (!pendingTxHashes.has(submitHash)) {
       res.status(400).json({ error: "Transaction XDR was not generated by this server" });
@@ -1182,14 +1921,14 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
     }
     pendingTxHashes.delete(submitHash);
 
-    const sent = await withRpcFallback((rpcServer) => rpcServer.sendTransaction(tx));
+    const sent = await withNetworkRpc(preset, (rpcServer) => rpcServer.sendTransaction(tx));
     if (sent.status === "ERROR") {
       throw new Error(`submit failed: ${sent.errorResult}`);
     }
-    let getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+    let getResp = await withNetworkRpc(preset, (rpcServer) => rpcServer.getTransaction(sent.hash));
     while (getResp.status === "NOT_FOUND") {
       await new Promise((r) => setTimeout(r, 1000));
-      getResp = await withRpcFallback((rpcServer) => rpcServer.getTransaction(sent.hash));
+      getResp = await withNetworkRpc(preset, (rpcServer) => rpcServer.getTransaction(sent.hash));
     }
     if (getResp.status !== "SUCCESS") {
       throw new Error(`tx failed: ${getResp.status}`);
@@ -1212,175 +1951,250 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
   }
 });
 
-// --- IPFS pinning (agent metadata uploader + dispute evidence bundles) ---
+// --- #738: Revenue analytics & transaction accounting export ---
 
-const IPFS_PIN_ENDPOINT = process.env.IPFS_PIN_ENDPOINT ?? "https://api.pinata.cloud/pinning/pinJSONToIPFS";
-const IPFS_PIN_TOKEN = process.env.IPFS_PIN_TOKEN ?? process.env.PINATA_JWT ?? "";
-const IPFS_GATEWAY = process.env.IPFS_GATEWAY ?? "https://ipfs.io/ipfs";
-const MAX_IPFS_PAYLOAD_BYTES = Number(process.env.MAX_IPFS_PAYLOAD_BYTES ?? 512 * 1024);
-
-const ipfsPinSchema = z
-  .object({
-    kind: z.enum(["agent-metadata", "dispute-evidence"]).default("agent-metadata"),
-    metadata: z.record(z.string(), z.unknown()).optional(),
-    evidence: z
-      .object({
-        reason: z.string().min(1).max(200),
-        notes: z.string().max(10_000).optional(),
-        links: z.array(z.string().url()).max(20).optional(),
-        files: z
-          .array(
-            z.object({
-              name: z.string().min(1).max(255),
-              contentType: z.string().min(1).max(128).optional(),
-              data: z.string().min(1),
-            }),
-          )
-          .max(10)
-          .optional(),
-      })
-      .optional(),
-    image: z
-      .object({
-        name: z.string().min(1).max(255),
-        contentType: z.string().min(1).max(128).optional(),
-        data: z.string().min(1),
-      })
-      .optional(),
-    name: z.string().min(1).max(200).optional(),
-  })
-  .refine((data) => data.metadata || data.evidence, {
-    message: "Provide either a metadata document or an evidence bundle",
-  });
-
-type IpfsPinResult = { cid: string; uri: string; gatewayUrl: string; size: number };
-
-/** Pin a JSON document to IPFS and return its ipfs:// URI. */
-async function pinJsonToIpfs(document: unknown, name: string): Promise<IpfsPinResult> {
-  const body = JSON.stringify(document);
-  const size = Buffer.byteLength(body, "utf8");
-  if (size > MAX_IPFS_PAYLOAD_BYTES) {
-    throw new Error(`IPFS payload too large (${size} bytes, max ${MAX_IPFS_PAYLOAD_BYTES})`);
-  }
-
-  if (!IPFS_PIN_TOKEN) {
-    // No pinning credentials configured: derive a deterministic content address
-    // so the dashboard flow still works in local/demo environments.
-    const cid = `local-${crypto.createHash("sha256").update(body).digest("hex").slice(0, 46)}`;
-    return { cid, uri: `ipfs://${cid}`, gatewayUrl: `${IPFS_GATEWAY}/${cid}`, size };
-  }
-
-  const resp = await fetch(IPFS_PIN_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${IPFS_PIN_TOKEN}`,
-    },
-    body: JSON.stringify({
-      pinataContent: document,
-      pinataMetadata: { name },
-    }),
-  });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`IPFS pin failed (${resp.status}): ${text.slice(0, 300)}`);
-  }
-  const data = (await resp.json()) as { IpfsHash?: string };
-  const cid = data.IpfsHash;
-  if (!cid) throw new Error("IPFS pin response missing IpfsHash");
-  return { cid, uri: `ipfs://${cid}`, gatewayUrl: `${IPFS_GATEWAY}/${cid}`, size };
-}
-
-// POST /api/ipfs/pin — pin agent metadata and/or a dispute evidence bundle
-app.post(
-  "/api/ipfs/pin",
-  rateLimitMutating,
-  optionalAuthMiddleware,
-  async (req, res) => {
-    try {
-      const parsed = ipfsPinSchema.parse(req.body);
-      const document: Record<string, unknown> = {
-        kind: parsed.kind,
-        createdAt: new Date().toISOString(),
-      };
-      if (parsed.metadata) document.metadata = parsed.metadata;
-      if (parsed.evidence) document.evidence = parsed.evidence;
-      if (parsed.image) document.image = parsed.image;
-
-      const label = parsed.name ?? `${parsed.kind}-${Date.now()}`;
-      const pinned = await pinJsonToIpfs(document, label);
-      res.json({ ...pinned, kind: parsed.kind });
-    } catch (err: unknown) {
-      if (respondWithValidationError(err, res)) return;
-      res.status(502).json({ error: (err as Error).message });
-    }
-  },
-);
-
-// --- x402 playground proxy (avoids browser CORS restrictions) ---
-
-const x402ProbeSchema = z.object({
-  url: z.string().url(),
-  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
-  headers: z.record(z.string(), z.string()).optional(),
-  body: z.string().max(256 * 1024).optional(),
+const revenueReportQuerySchema = z.object({
+  wallet: stellarAddressSchema,
+  from: z.coerce.number().int().nonnegative().optional(),
+  to: z.coerce.number().int().nonnegative().optional(),
+  format: z.enum(["csv", "json"]).default("json"),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(1000).default(100),
 });
 
-const X402_PROBE_TIMEOUT_MS = Number(process.env.X402_PROBE_TIMEOUT_MS ?? 15_000);
+type RevenueRow = {
+  timestamp: number;
+  transactionHash: string;
+  ledger: number;
+  jobId: string;
+  role: "provider" | "client";
+  token: string;
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+};
 
-// POST /api/x402/probe — forward a playground request and return raw status,
-// headers and body so the client can decode X-Payment-Requirements.
-app.post("/api/x402/probe", rateLimitMutating, async (req, res) => {
+type RevenueAggregate = {
+  period: string;
+  grossAmount: string;
+  feeAmount: string;
+  netAmount: string;
+  count: number;
+};
+
+/** Escape a single CSV field per RFC 4180 (quote if it contains , " \r or \n). */
+function csvEscape(value: unknown): string {
+  const str = value === null || value === undefined ? "" : String(value);
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+/** Serialize rows to RFC 4180 CSV with CRLF line endings. */
+function toCsv(headers: string[], rows: Array<Array<unknown>>): string {
+  const lines = [headers.map(csvEscape).join(",")];
+  for (const row of rows) {
+    lines.push(row.map(csvEscape).join(","));
+  }
+  return lines.join("\r\n") + "\r\n";
+}
+
+/** Format a Unix timestamp (seconds) as an ISO-8601 UTC date-time string. */
+function formatTimestamp(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function dayKey(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 10);
+}
+
+function monthKey(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 7);
+}
+
+function aggregateRevenue(rows: RevenueRow[], keyFn: (ts: number) => string): RevenueAggregate[] {
+  const buckets = new Map<string, { gross: bigint; fee: bigint; net: bigint; count: number }>();
+  for (const row of rows) {
+    const key = keyFn(row.timestamp);
+    const bucket = buckets.get(key) ?? { gross: 0n, fee: 0n, net: 0n, count: 0 };
+    bucket.gross += BigInt(row.grossAmount);
+    bucket.fee += BigInt(row.feeAmount);
+    bucket.net += BigInt(row.netAmount);
+    bucket.count += 1;
+    buckets.set(key, bucket);
+  }
+  return Array.from(buckets.entries())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([period, b]) => ({
+      period,
+      grossAmount: b.gross.toString(),
+      feeAmount: b.fee.toString(),
+      netAmount: b.net.toString(),
+      count: b.count,
+    }));
+}
+
+/**
+ * Extract accounting rows from a JobCompleted event payload. The event data is
+ * expected to carry the job id, provider, client, token, gross budget and fee.
+ * Amounts are normalized to raw token units (strings) so gross - fee = net
+ * reconciles exactly with on-chain transfers.
+ */
+function extractRevenueRow(
+  event: any,
+  wallet: string,
+): RevenueRow | null {
+  const data = event?.data ?? event?.value ?? event ?? {};
+  const jobId = data.jobId ?? data.job_id ?? event?.jobId ?? event?.job_id;
+  const provider = data.provider ?? event?.provider;
+  const client = data.client ?? data.buyer ?? event?.client ?? event?.buyer;
+  const token = data.token ?? event?.token ?? cfg.usdcToken;
+  const grossRaw = data.budget ?? data.grossAmount ?? data.gross_amount ?? event?.budget;
+  const feeRaw = data.fee ?? data.feeAmount ?? data.fee_amount ?? 0;
+
+  if (jobId === undefined || jobId === null) return null;
+  if (grossRaw === undefined || grossRaw === null) return null;
+
+  let role: "provider" | "client" | null = null;
+  if (provider === wallet) role = "provider";
+  else if (client === wallet) role = "client";
+  if (!role) return null;
+
+  const gross = BigInt(grossRaw);
+  const fee = BigInt(feeRaw);
+  const net = gross - fee;
+
+  const ledger = Number(event?.ledger ?? event?.ledgerSequence ?? 0);
+  const txHash = String(event?.txHash ?? event?.transactionHash ?? event?.tx_hash ?? "");
+  const ts = Number(event?.timestamp ?? event?.closedAt ?? event?.ledgerClosedAt ?? 0);
+  const timestamp = Number.isFinite(ts) && ts > 0 ? ts : Math.floor(Date.now() / 1000);
+
+  return {
+    timestamp,
+    transactionHash: txHash,
+    ledger,
+    jobId: String(jobId),
+    role,
+    token: String(token),
+    grossAmount: gross.toString(),
+    feeAmount: fee.toString(),
+    netAmount: net.toString(),
+  };
+}
+
+// GET /api/reports/revenue — export revenue ledger as CSV or JSON
+app.get("/api/reports/revenue", async (req, res) => {
   try {
-    const parsed = x402ProbeSchema.parse(req.body);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), X402_PROBE_TIMEOUT_MS);
-    const startedAt = Date.now();
-    try {
-      const upstream = await fetch(parsed.url, {
-        method: parsed.method,
-        headers: {
-          Accept: "application/json",
-          ...(parsed.body ? { "Content-Type": "application/json" } : {}),
-          ...(parsed.headers ?? {}),
-        },
-        body: parsed.method === "GET" || parsed.method === "HEAD" ? undefined : parsed.body,
-        signal: controller.signal,
-        redirect: "manual",
-      });
-      const bodyText = await upstream.text();
-      const headers: Record<string, string> = {};
-      upstream.headers.forEach((value, key) => {
-        headers[key] = value;
-      });
-      res.json({
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers,
-        body: bodyText,
-        durationMs: Date.now() - startedAt,
-        request: { url: parsed.url, method: parsed.method },
-      });
-    } finally {
-      clearTimeout(timer);
+    const parsed = revenueReportQuerySchema.parse(req.query);
+    if (parsed.from !== undefined && parsed.to !== undefined && parsed.from > parsed.to) {
+      res.status(400).json({ error: "'from' must be less than or equal to 'to'" });
+      return;
     }
+
+    const allEvents = await events.getEvents();
+    const rows: RevenueRow[] = [];
+    for (const ev of allEvents as any[]) {
+      const name = ev?.type ?? ev?.name ?? ev?.topic?.[0];
+      if (name !== "JobCompleted" && name !== "job_completed") continue;
+      const row = extractRevenueRow(ev, parsed.wallet);
+      if (!row) continue;
+      if (parsed.from !== undefined && row.timestamp < parsed.from) continue;
+      if (parsed.to !== undefined && row.timestamp > parsed.to) continue;
+      rows.push(row);
+    }
+
+    rows.sort((a, b) => a.timestamp - b.timestamp);
+
+    const daily = aggregateRevenue(rows, dayKey);
+    const monthly = aggregateRevenue(rows, monthKey);
+
+    const totalGross = rows.reduce((acc, r) => acc + BigInt(r.grossAmount), 0n);
+    const totalFee = rows.reduce((acc, r) => acc + BigInt(r.feeAmount), 0n);
+    const totalNet = rows.reduce((acc, r) => acc + BigInt(r.netAmount), 0n);
+
+    const total = rows.length;
+    const offset = (parsed.page - 1) * parsed.pageSize;
+    const pageRows = rows.slice(offset, offset + parsed.pageSize);
+
+    const headers = [
+      "Timestamp",
+      "TransactionHash",
+      "Ledger",
+      "JobId",
+      "Role",
+      "Token",
+      "GrossAmount",
+      "FeeAmount",
+      "NetAmount",
+    ];
+
+    const filename = `revenue-report-${parsed.wallet.slice(0, 8)}-${Date.now()}`;
+
+    if (parsed.format === "csv") {
+      const csvRows = pageRows.map((r) => [
+        formatTimestamp(r.timestamp),
+        r.transactionHash,
+        r.ledger,
+        r.jobId,
+        r.role,
+        r.token,
+        r.grossAmount,
+        r.feeAmount,
+        r.netAmount,
+      ]);
+      const csv = toCsv(headers, csvRows);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}.csv"`);
+      res.send(csv);
+      return;
+    }
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}.json"`);
+    res.json({
+      wallet: parsed.wallet,
+      from: parsed.from ?? null,
+      to: parsed.to ?? null,
+      pagination: {
+        page: parsed.page,
+        pageSize: parsed.pageSize,
+        total,
+        hasNext: offset + parsed.pageSize < total,
+      },
+      totals: {
+        grossAmount: totalGross.toString(),
+        feeAmount: totalFee.toString(),
+        netAmount: totalNet.toString(),
+        count: total,
+      },
+      daily,
+      monthly,
+      rows: pageRows.map((r) => ({
+        Timestamp: formatTimestamp(r.timestamp),
+        TransactionHash: r.transactionHash,
+        Ledger: r.ledger,
+        JobId: r.jobId,
+        Role: r.role,
+        Token: r.token,
+        GrossAmount: r.grossAmount,
+        FeeAmount: r.feeAmount,
+        NetAmount: r.netAmount,
+      })),
+    });
   } catch (err: unknown) {
-    if (respondWithValidationError(err, res)) return;
-    const message =
-      err instanceof Error && err.name === "AbortError"
-        ? `Upstream request timed out after ${X402_PROBE_TIMEOUT_MS}ms`
-        : (err as Error).message;
-    res.status(502).json({ error: message });
+    handleRouteError(err, res);
   }
 });
 
 // GET /api/balance/:pubkey — get XLM + MUSD balance for any public key
 app.get("/api/balance/:pubkey", async (req, res) => {
   try {
+    const preset = getRequestNetwork(req);
     const params = z.object({ pubkey: stellarAddressSchema }).parse(req.params);
     const [xlm, musd] = await Promise.all([
-      getXlmBalance(params.pubkey),
-      getTokenBalance(params.pubkey),
+      getXlmBalance(params.pubkey, preset.horizonUrl),
+      getTokenBalance(params.pubkey, preset),
     ]);
     res.json({ address: params.pubkey, xlm, musd });
   } catch (err: unknown) {
@@ -1408,8 +2222,74 @@ function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFun
 app.use(errorHandler);
 
 const PORT = Number(process.env.PORT ?? process.env.DASHBOARD_PORT ?? 3000);
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`Bear Dashboard → http://localhost:${PORT}`);
   console.log(`  Buyer:  ${buyerKeypair.publicKey()}`);
   console.log(`  Seller: ${sellerKeypair.publicKey()}`);
+  void warmMatchmakingIndex();
 });
+
+// ── #719: WebSocket endpoint /events — bi-directional subscription management ─
+// Clients send { action: "subscribe", contract?, eventType?, address? } to set
+// their filter and { action: "unsubscribe" } to clear it. Newly indexed events
+// matching the active filter are pushed as { type: "event", event }. A heartbeat
+// ping is sent every 30 seconds to keep intermediaries from closing the socket.
+const wss = new WebSocketServer({ server: httpServer, path: "/events" });
+
+wss.on("connection", (socket: WebSocket) => {
+  let filter: EventFilter = {};
+
+  const sendJson = (payload: unknown) => {
+    if (socket.readyState === socket.OPEN) {
+      socket.send(JSON.stringify(payload));
+    }
+  };
+
+  const onEvent = (event: SorobanEvent) => {
+    if (eventMatchesFilter(event, filter)) {
+      sendJson({ type: "event", event });
+    }
+  };
+
+  eventHub.on("event", onEvent);
+
+  const heartbeat = setInterval(() => {
+    sendJson({ type: "ping", t: Date.now() });
+  }, WS_HEARTBEAT_MS);
+
+  socket.on("message", (raw) => {
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      sendJson({ type: "error", error: "invalid JSON" });
+      return;
+    }
+    const action = message.action ?? message.type;
+    if (action === "subscribe") {
+      filter = parseEventFilter(message);
+      sendJson({ type: "subscribed", filter });
+    } else if (action === "unsubscribe") {
+      filter = {};
+      sendJson({ type: "unsubscribed" });
+    } else if (action === "ping") {
+      sendJson({ type: "pong", t: Date.now() });
+    } else {
+      sendJson({ type: "error", error: `unknown action: ${String(action)}` });
+    }
+  });
+
+  socket.on("close", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+
+  socket.on("error", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+
+  sendJson({ type: "hello", message: "connected" });
+});
+
+export { app, matchmaking, httpServer, wss, readOnlyDb };

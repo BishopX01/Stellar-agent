@@ -3,6 +3,10 @@ import test from "node:test";
 import {
   makeSellerResponse,
   retryWithBackoff,
+  withRetry,
+  isRetryableError,
+  computeBackoffDelay,
+  sendToDeadLetterQueue,
   validateEnv,
   validatePrompt,
   MAX_PROMPT_LENGTH,
@@ -11,6 +15,7 @@ import {
   AgentConfigSchema,
   validateAgentConfig,
   autoRegister,
+  registerGracefulShutdown,
 } from "./shared.js";
 
 test("makeSellerResponse - returns standard response format with success true and execution_time_ms >= 0", () => {
@@ -236,6 +241,262 @@ test("retryWithBackoff - throws error after exhausting all maxAttempts", async (
   }
 });
 
+test("withRetry - resolves immediately on first try if successful", async () => {
+  let attempts = 0;
+  const result = await withRetry(async () => {
+    attempts++;
+    return "ok";
+  }, { maxRetries: 3, initialDelayMs: 1, factor: 2 });
+
+  assert.equal(result, "ok");
+  assert.equal(attempts, 1);
+});
+
+test("withRetry - retries retryable errors and recovers after transient failure", async () => {
+  let attempts = 0;
+  const originalError = console.error;
+  console.error = () => {};
+
+  try {
+    const result = await withRetry(async () => {
+      attempts++;
+      if (attempts < 3) {
+        const err = new Error("socket hang up") as Error & { code?: string };
+        err.code = "ECONNRESET";
+        throw err;
+      }
+      return "recovered";
+    }, { maxRetries: 5, initialDelayMs: 1, factor: 2 });
+
+    assert.equal(result, "recovered");
+    assert.equal(attempts, 3);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("withRetry - exhausts maxRetries and rethrows the last error", async () => {
+  let attempts = 0;
+  const originalError = console.error;
+  console.error = () => {};
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withRetry(async () => {
+          attempts++;
+          const err = new Error("upstream 503") as Error & { status?: number };
+          err.status = 503;
+          throw err;
+        }, { maxRetries: 4, initialDelayMs: 1, factor: 2, label: "test" });
+      },
+      /upstream 503/,
+    );
+
+    // 1 initial attempt + 4 retries
+    assert.equal(attempts, 5);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("withRetry - does not retry non-retryable errors", async () => {
+  let attempts = 0;
+  const originalError = console.error;
+  console.error = () => {};
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withRetry(async () => {
+          attempts++;
+          throw new Error("validation failed: bad prompt");
+        }, { maxRetries: 5, initialDelayMs: 1, factor: 2 });
+      },
+      /validation failed/,
+    );
+
+    assert.equal(attempts, 1);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("isRetryableError - classifies network and rate-limit errors as retryable", () => {
+  const econnreset = new Error("reset") as Error & { code?: string };
+  econnreset.code = "ECONNRESET";
+  assert.equal(isRetryableError(econnreset), true);
+
+  const etimedout = new Error("timeout") as Error & { code?: string };
+  etimedout.code = "ETIMEDOUT";
+  assert.equal(isRetryableError(etimedout), true);
+
+  const rateLimited = new Error("too many requests") as Error & { status?: number };
+  rateLimited.status = 429;
+  assert.equal(isRetryableError(rateLimited), true);
+
+  const unavailable = new Error("service unavailable") as Error & { status?: number };
+  unavailable.status = 503;
+  assert.equal(isRetryableError(unavailable), true);
+
+  const badRequest = new Error("bad request") as Error & { status?: number };
+  badRequest.status = 400;
+  assert.equal(isRetryableError(badRequest), false);
+
+  assert.equal(isRetryableError(new Error("plain failure")), false);
+});
+
+test("computeBackoffDelay - grows exponentially and stays within jitter bounds", () => {
+  const opts = { initialDelayMs: 1000, factor: 2, jitter: 0.2 };
+
+  // attempt 0 -> base 1000, attempt 1 -> 2000, attempt 2 -> 4000
+  const d0 = computeBackoffDelay(0, opts);
+  const d1 = computeBackoffDelay(1, opts);
+  const d2 = computeBackoffDelay(2, opts);
+
+  assert.ok(d0 >= 800 && d0 <= 1200, `d0=${d0} out of jitter bounds`);
+  assert.ok(d1 >= 1600 && d1 <= 2400, `d1=${d1} out of jitter bounds`);
+  assert.ok(d2 >= 3200 && d2 <= 4800, `d2=${d2} out of jitter bounds`);
+
+  // Exponential growth: midpoints should roughly double.
+  assert.ok(d1 > d0);
+  assert.ok(d2 > d1);
+});
+
+test("computeBackoffDelay - jitter produces varied delays across calls", () => {
+  const opts = { initialDelayMs: 1000, factor: 2, jitter: 0.5 };
+  const samples = new Set<number>();
+  for (let i = 0; i < 20; i++) {
+    samples.add(computeBackoffDelay(0, opts));
+  }
+  // With jitter, we expect more than one distinct value across 20 samples.
+  assert.ok(samples.size > 1);
+});
+
+test("computeBackoffDelay - respects maxDelayMs cap", () => {
+  const opts = { initialDelayMs: 1000, factor: 2, jitter: 0, maxDelayMs: 3000 };
+  const d5 = computeBackoffDelay(5, opts);
+  assert.ok(d5 <= 3000, `d5=${d5} exceeded maxDelayMs`);
+});
+
+test("sendToDeadLetterQueue - persists job payload, error diagnostics and context", async () => {
+  const inserted: Array<Record<string, unknown>> = [];
+  const store = {
+    async insert(row: Record<string, unknown>) {
+      inserted.push(row);
+      return { id: inserted.length };
+    },
+  };
+
+  const error = new Error("LLM API timeout");
+  error.stack = "Error: LLM API timeout\n    at handler (agents/seller-x/src/index.ts:42:7)";
+
+  const jobPayload = { jobId: "job-123", deliverable: "landing-page" };
+  const context = { agent: "seller-copywriter", attempt: 5, escrowId: "esc-9" };
+
+  const result = await sendToDeadLetterQueue(store, {
+    jobPayload,
+    error,
+    context,
+  });
+
+  assert.equal(inserted.length, 1);
+  const row = inserted[0];
+  assert.deepEqual(row.job_payload, jobPayload);
+  assert.equal(row.error_message, "LLM API timeout");
+  assert.ok(typeof row.error_stack === "string");
+  assert.ok((row.error_stack as string).includes("agents/seller-x/src/index.ts:42:7"));
+  assert.deepEqual(row.context, context);
+  assert.ok(row.created_at instanceof Date || typeof row.created_at === "string");
+  assert.ok(result && typeof result.id === "number");
+});
+
+test("withRetry - routes exhausted job to dead-letter queue with diagnostics", async () => {
+  const inserted: Array<Record<string, unknown>> = [];
+  const store = {
+    async insert(row: Record<string, unknown>) {
+      inserted.push(row);
+      return { id: inserted.length };
+    },
+  };
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  let attempts = 0;
+  const jobPayload = { jobId: "job-dlq-1", deliverable: "seo-audit" };
+  const context = { agent: "seller-seo", escrowId: "esc-1" };
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withRetry(async () => {
+          attempts++;
+          const err = new Error("persistent 503") as Error & { status?: number };
+          err.status = 503;
+          throw err;
+        }, {
+          maxRetries: 2,
+          initialDelayMs: 1,
+          factor: 2,
+          deadLetterStore: store,
+          jobPayload,
+          context,
+        });
+      },
+      /persistent 503/,
+    );
+
+    assert.equal(attempts, 3);
+    assert.equal(inserted.length, 1);
+    const row = inserted[0];
+    assert.deepEqual(row.job_payload, jobPayload);
+    assert.equal(row.error_message, "persistent 503");
+    assert.ok(typeof row.error_stack === "string");
+    assert.deepEqual(row.context, context);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("withRetry - does not write to DLQ when job eventually succeeds", async () => {
+  const inserted: Array<Record<string, unknown>> = [];
+  const store = {
+    async insert(row: Record<string, unknown>) {
+      inserted.push(row);
+      return { id: inserted.length };
+    },
+  };
+
+  const originalError = console.error;
+  console.error = () => {};
+
+  let attempts = 0;
+  try {
+    const result = await withRetry(async () => {
+      attempts++;
+      if (attempts < 2) {
+        const err = new Error("transient 429") as Error & { status?: number };
+        err.status = 429;
+        throw err;
+      }
+      return "done";
+    }, {
+      maxRetries: 3,
+      initialDelayMs: 1,
+      factor: 2,
+      deadLetterStore: store,
+      jobPayload: { jobId: "job-ok" },
+      context: { agent: "seller-x" },
+    });
+
+    assert.equal(result, "done");
+    assert.equal(inserted.length, 0);
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test("validatePrompt - accepts valid non-empty string under 8000 characters", () => {
   const result = validatePrompt("Build a modern landing page for an AI product");
   assert.equal(result.valid, true);
@@ -385,4 +646,202 @@ test("autoRegister - throws on invalid config", async () => {
     },
     /Invalid agent config/,
   );
+});
+
+function makeFakeServer() {
+  let closeCalls = 0;
+  const server = {
+    close(cb?: (err?: Error) => void) {
+      closeCalls++;
+      if (cb) cb();
+    },
+  };
+  return { server, getCloseCalls: () => closeCalls };
+}
+
+function makeFakeTracker() {
+  let active = 0;
+  let waitCalls = 0;
+  return {
+    tracker: {
+      get activeCount() {
+        return active;
+      },
+      async waitForIdle() {
+        waitCalls++;
+        while (active > 0) {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+      },
+    },
+    setActive: (n: number) => {
+      active = n;
+    },
+    getWaitCalls: () => waitCalls,
+  };
+}
+
+function makeFakeDb() {
+  let closeCalls = 0;
+  return {
+    db: {
+      close() {
+        closeCalls++;
+      },
+    },
+    getCloseCalls: () => closeCalls,
+  };
+}
+
+test("registerGracefulShutdown - SIGTERM waits for in-flight task, closes server and db, exits 0", async () => {
+  const originalExit = process.exit;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  let exitCode: number | undefined;
+  // @ts-ignore
+  process.exit = (code?: number) => {
+    exitCode = code;
+    throw new Error(`process.exit called with ${code}`);
+  };
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server, getCloseCalls } = makeFakeServer();
+  const { tracker, setActive, getWaitCalls } = makeFakeTracker();
+  const { db, getCloseCalls: getDbCloseCalls } = makeFakeDb();
+
+  let taskCompleted = false;
+  setActive(1);
+  const task = (async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    taskCompleted = true;
+    setActive(0);
+  })();
+
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 5000,
+  });
+
+  try {
+    process.emit("SIGTERM");
+    // Allow the async shutdown handler to run to completion.
+    await new Promise((r) => setTimeout(r, 100));
+    await task;
+
+    assert.equal(taskCompleted, true);
+    assert.ok(getWaitCalls() >= 1);
+    assert.equal(getCloseCalls(), 1);
+    assert.equal(getDbCloseCalls(), 1);
+    assert.equal(exitCode, 0);
+  } finally {
+    unregister();
+    process.exit = originalExit;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("registerGracefulShutdown - SIGINT triggers graceful shutdown and exits 0", async () => {
+  const originalExit = process.exit;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  let exitCode: number | undefined;
+  // @ts-ignore
+  process.exit = (code?: number) => {
+    exitCode = code;
+    throw new Error(`process.exit called with ${code}`);
+  };
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server, getCloseCalls } = makeFakeServer();
+  const { tracker } = makeFakeTracker();
+  const { db, getCloseCalls: getDbCloseCalls } = makeFakeDb();
+
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 5000,
+  });
+
+  try {
+    process.emit("SIGINT");
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(getCloseCalls(), 1);
+    assert.equal(getDbCloseCalls(), 1);
+    assert.equal(exitCode, 0);
+  } finally {
+    unregister();
+    process.exit = originalExit;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("registerGracefulShutdown - exits non-zero when in-flight task exceeds timeout", async () => {
+  const originalExit = process.exit;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  let exitCode: number | undefined;
+  // @ts-ignore
+  process.exit = (code?: number) => {
+    exitCode = code;
+    throw new Error(`process.exit called with ${code}`);
+  };
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server, getCloseCalls } = makeFakeServer();
+  const { tracker, setActive } = makeFakeTracker();
+  const { db, getCloseCalls: getDbCloseCalls } = makeFakeDb();
+
+  // Simulate a task that never finishes within the timeout window.
+  setActive(1);
+
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 50,
+  });
+
+  try {
+    process.emit("SIGTERM");
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.equal(getCloseCalls(), 1);
+    assert.equal(getDbCloseCalls(), 1);
+    assert.notEqual(exitCode, 0);
+    assert.equal(typeof exitCode, "number");
+  } finally {
+    setActive(0);
+    unregister();
+    process.exit = originalExit;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("registerGracefulShutdown - unregister removes signal listeners", async () => {
+  const originalError = console.error;
+  const originalLog = console.log;
+  console.error = () => {};
+  console.log = () => {};
+
+  const { server } = makeFakeServer();
+  const { tracker } = makeFakeTracker();
+  const { db } = makeFakeDb();
+
+  const before = process.listenerCount("SIGTERM");
+  const unregister = registerGracefulShutdown(server, tracker, db, {
+    timeoutMs: 5000,
+  });
+  assert.equal(process.listenerCount("SIGTERM"), before + 1);
+
+  try {
+    unregister();
+    assert.equal(process.listenerCount("SIGTERM"), before);
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+  }
 });

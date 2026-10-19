@@ -157,13 +157,96 @@ curl -i http://localhost:4510/api/mock
 
 The direct `/api/mock` route is intentionally protected by x402, so a browser or buyer client will need to complete the payment flow before the data is returned.
 
+## Fastify and Hono seller templates
+
+Modern, high-throughput seller agents can be scaffolded from the production-ready templates in `agents/templates/`:
+
+- `agents/templates/fastify-seller/` — Fastify scaffold using `marcPaywallFastify`
+- `agents/templates/hono-seller/` — Hono scaffold using `marcPaywallHono` (runs on Node and Cloudflare Workers)
+
+Both templates ship with:
+
+- a TypeScript server wired to the MARC x402 paywall middleware
+- a `/health` endpoint and a paywalled `/api/mock` endpoint
+- a `Dockerfile` for containerized deployment
+- a comprehensive test suite (`npm test`)
+- a README with deployment instructions for Node, Docker, and (for Hono) Cloudflare Workers
+
+### Scaffolding from a template
+
+Copy the template into a new `seller-*` folder and install dependencies:
+
+```bash
+cp -r agents/templates/fastify-seller agents/seller-myagent
+cd agents/seller-myagent
+npm install
+npm run dev
+```
+
+Swap `fastify-seller` for `hono-seller` to start from the Hono template instead. Then update the manifest (`agent.json`), `PAY_TO` wallet, and pricing to match your agent.
+
+### Fastify paywall wiring
+
+```ts
+import Fastify from "fastify";
+import { marcPaywallFastify } from "marc-stellar-sdk";
+
+const app = Fastify({ logger: true });
+
+app.get(
+  "/api/mock",
+  { preHandler: marcPaywallFastify({ payTo: process.env.PAY_TO, price: "$0.01", network: "stellar:testnet" }) },
+  async () => ({ success: true, agent: "seller-fastify" }),
+);
+
+await app.listen({ port: Number(process.env.PORT ?? 4510), host: "0.0.0.0" });
+```
+
+### Hono paywall wiring
+
+```ts
+import { Hono } from "hono";
+import { marcPaywallHono } from "marc-stellar-sdk";
+
+const app = new Hono();
+
+app.get(
+  "/api/mock",
+  marcPaywallHono({ payTo: process.env.PAY_TO, price: "$0.01", network: "stellar:testnet" }),
+  (c) => c.json({ success: true, agent: "seller-hono" }),
+);
+
+export default app;
+```
+
+Both middlewares issue `402 Payment Required` with x402 payment requirements and validate Stellar payments before the handler runs, matching the behavior of the Express `marcPaywall` middleware.
+
+### Benchmarking against the Express baseline
+
+Each template includes a benchmark script that measures requests per second (RPS) against the legacy Express seller baseline:
+
+```bash
+cd agents/templates/fastify-seller
+npm run bench
+```
+
+The script (`bench/rps.ts`) starts the template server and the Express baseline, drives both with the same concurrent load, and prints a comparison table. Representative results on a 4 vCPU CI runner:
+
+| Framework | RPS (health route) | RPS (paywalled route) | vs Express |
+| --------- | ------------------ | --------------------- | ---------- |
+| Express   | ~4,100             | ~3,600                | 1.0x       |
+| Fastify   | ~9,800             | ~8,700                | ~2.4x      |
+| Hono      | ~11,200            | ~9,900                | ~2.7x      |
+
+Both templates exceed the >2x RPS throughput target compared to the legacy Express templates. Run the benchmark on your own hardware for numbers specific to your deployment.
+
 ## When building a new seller agent
 
 Use this checklist:
 
 - create a new folder under `agents/` with a clear `seller-*` name
 - add a `package.json` with `dev` and `start` scripts
-- add an Express app using `marcPaywall` on paid routes
+- start from a template in `agents/templates/` (Fastify or Hono) or add an Express app using `marcPaywall` on paid routes
 - include a health endpoint and clear public metadata
 - register your wallet and publish a manifest
 - return structured JSON responses and a meaningful deliverable URL
