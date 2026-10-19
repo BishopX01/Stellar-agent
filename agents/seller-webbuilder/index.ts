@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import rateLimit from "express-rate-limit";
 import Groq from "groq-sdk";
 import { CommerceClient } from "marc-stellar-sdk";
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import {
   createSellerAgent,
   makeSellerResponse,
@@ -13,9 +14,11 @@ import {
   isMockLlm,
   MOCK_DELIVERABLES,
   callLlmWithRetry,
+  registerGracefulShutdown,
 } from "../shared.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
+=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4501);
@@ -30,10 +33,58 @@ const { app, seller, cfg } = await createSellerAgent({
   agentDir: AGENT_DIR,
 });
 
+const tracer = initTracing(AGENT_ID).getTracer(AGENT_ID);
+
+app.use((req, res, next) => {
+  const span = tracer.startSpan(`${req.method} ${req.path}`, {
+    attributes: {
+      "http.method": req.method,
+      "http.route": req.path,
+      "http.target": req.originalUrl,
+      "http.user_agent": req.headers["user-agent"] ?? "",
+      "agent.id": AGENT_ID,
+    },
+  });
+  res.on("finish", () => {
+    span.setAttribute("http.status_code", res.statusCode);
+    if (res.statusCode >= 500) span.setStatus({ code: SpanStatusCode.ERROR });
+    span.end();
+  });
+  next();
+});
+
 const startTime = Date.now();
 let jobsActive = 0;
 let jobsCompleted = 0;
 let jobsFailed = 0;
+
+// Tracks in-flight /job processing so graceful shutdown can wait for them.
+const activeTasks = new Set<Promise<void>>();
+const activeTaskTracker = {
+  get size() {
+    return activeTasks.size;
+  },
+  track<T>(task: Promise<T>): Promise<T> {
+    const tracked = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    activeTasks.add(tracked);
+    void tracked.finally(() => activeTasks.delete(tracked));
+    return task;
+  },
+  async drain(timeoutMs: number): Promise<boolean> {
+    if (activeTasks.size === 0) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+    const drained = Promise.all([...activeTasks]).then(() => true as const);
+    const result = await Promise.race([drained, timeout]);
+    if (timer) clearTimeout(timer);
+    return result;
+  },
+};
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -74,17 +125,28 @@ async function generate(prompt: string): Promise<string> {
   if (isMockLlm()) {
     return MOCK_DELIVERABLES.webbuilder;
   }
-  const res = await callLlmWithRetry(
-    () =>
-      groq!.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.7,
-      }),
-    3,
-    AGENT_ID,
-  );
-  return res.choices[0].message.content ?? "";
+  return tracer.startActiveSpan("llm.generate", async (span: Span) => {
+    span.setAttribute("llm.model", GROQ_MODEL);
+    span.setAttribute("llm.provider", "groq");
+    try {
+      const res = await callLlmWithRetry(
+        () =>
+          groq!.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+          }),
+        3,
+        AGENT_ID,
+      );
+      return res.choices[0].message.content ?? "";
+    } catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
 interface BuildSpec {
@@ -161,52 +223,49 @@ app.post("/job", limiter, async (req, res) => {
   res.json(response);
 
   jobsActive++;
-  try {
-    console.log(`[${AGENT_ID}] Calling Groq...`);
-    const html = await generate(buildPrompt(task, buildSpec));
+  const jobWork = (async () => {
+    try {
+      console.log(`[${AGENT_ID}] Calling Groq...`);
+      const html = await generate(buildPrompt(task, buildSpec));
 
-    const stripped = html
-      .replace(/```html\s*/gi, "")
-      .replace(/```/g, "")
-      .trim();
-    if (stripped.length < 50 || !/<!DOCTYPE html|<html/i.test(stripped)) {
-      throw new Error(
-        `Generated content is not valid HTML (${stripped.length} chars, no doctype/html tag)`,
-      );
-    }
-
-    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-    const filename = `job-${jobId}.html`;
-    fs.writeFileSync(path.join(OUTPUT_DIR, filename), stripped);
-    const deliverable = `${publicUrl}/${OUTPUT_URL}/${filename}`;
-    console.log(`[${AGENT_ID}] Website built (${stripped.length} chars) → ${deliverable}`);
-
-    const commerce = new CommerceClient(cfg);
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      try {
-        await commerce.submit(seller, BigInt(jobId), deliverable);
-        console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
-        break;
-      } catch (e) {
-        if (attempt === 5) throw e;
-        console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
-        await new Promise((r) => setTimeout(r, 4000));
+      const stripped = html
+        .replace(/```html\s*/gi, "")
+        .replace(/```/g, "")
+        .trim();
+      if (stripped.length < 50 || !/<!DOCTYPE html|<html/i.test(stripped)) {
+        throw new Error(
+          `Generated content is not valid HTML (${stripped.length} chars, no doctype/html tag)`,
+        );
       }
+
+      fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+      const filename = `job-${jobId}.html`;
+      fs.writeFileSync(path.join(OUTPUT_DIR, filename), stripped);
+      const deliverable = `${publicUrl}/${OUTPUT_URL}/${filename}`;
+      console.log(`[${AGENT_ID}] Website built (${stripped.length} chars) → ${deliverable}`);
+
+      const commerce = new CommerceClient(cfg);
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await commerce.submit(seller, BigInt(jobId), deliverable);
+          console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
+          break;
+        } catch (e) {
+          if (attempt === 5) throw e;
+          console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
+          await new Promise((r) => setTimeout(r, 4000));
+        }
+      }
+      jobsCompleted++;
+    } catch (err) {
+      jobsFailed++;
+      console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
+    } finally {
+      jobsActive--;
     }
-    jobsCompleted++;
-  } catch (err) {
-    jobsFailed++;
-    console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
-  } finally {
-    jobsActive--;
-  }
+  })();
+  activeTaskTracker.track(jobWork);
 });
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+registerGracefulShutdown(server, activeTaskTracker, null, { agentId: AGENT_ID });

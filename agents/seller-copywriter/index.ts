@@ -13,9 +13,21 @@ import {
   isMockLlm,
   MOCK_DELIVERABLES,
   callLlmWithRetry,
+  registerGracefulShutdown,
 } from "../shared.js";
+import {
+  initTracing,
+  startServerSpan,
+  withSpan,
+  setSpanAttributes,
+  recordSpanError,
+  shutdownTracing,
+} from "../tracing.js";
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
+
+await initTracing("seller-copywriter");
+=======
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.SELLER_PORT ?? 4502);
@@ -75,19 +87,31 @@ async function generate(prompt: string): Promise<string> {
   if (isMockLlm()) {
     return MOCK_DELIVERABLES.copywriter;
   }
-  callCount++;
-  const res = await callLlmWithRetry(
-    () =>
-      groq!.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.9,
-        seed: callCount + Date.now(),
-      }),
-    3,
-    AGENT_ID,
+  return withSpan(
+    "llm.generate",
+    {
+      "llm.provider": "groq",
+      "llm.model": GROQ_MODEL,
+      "llm.prompt_length": prompt.length,
+    },
+    async (span) => {
+      callCount++;
+      const res = await callLlmWithRetry(
+        () =>
+          groq!.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.9,
+            seed: callCount + Date.now(),
+          }),
+        3,
+        AGENT_ID,
+      );
+      const content = res.choices[0].message.content ?? "";
+      setSpanAttributes(span, { "llm.response_length": content.length });
+      return content;
+    },
   );
-  return res.choices[0].message.content ?? "";
 }
 
 const limiter = rateLimit({
@@ -101,6 +125,14 @@ const limiter = rateLimit({
 app.post("/job", limiter, async (req, res) => {
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const startedAt = Date.now();
+  const span = startServerSpan(req, "POST /job", {
+    "agent.id": AGENT_ID,
+    "agent.request_id": requestId,
+  });
+  res.on("finish", () => {
+    setSpanAttributes(span, { "http.status_code": res.statusCode });
+    span.end();
+  });
   const {
     jobId,
     task,
@@ -161,6 +193,8 @@ app.post("/job", limiter, async (req, res) => {
   );
   res.json(makeSellerResponse({ status: "accepted", jobId }, startedAt));
 
+  const taskKey = `job-${jobId}-${requestId}`;
+  activeTaskTracker.track(taskKey);
   jobsActive++;
   try {
     console.log(`[${AGENT_ID}] Calling Groq...`);
@@ -187,31 +221,34 @@ app.post("/job", limiter, async (req, res) => {
     console.log(`[${AGENT_ID}] Copy written (${copy.length} chars) → ${deliverable}`);
 
     const commerce = new CommerceClient(cfg);
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      try {
-        await commerce.submit(seller, BigInt(jobId), deliverable);
-        console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
-        break;
-      } catch (e: any) {
-        if (attempt === 5) throw e;
-        console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
-        await new Promise((r) => setTimeout(r, 4000));
-      }
-    }
+    await withSpan(
+      "stellar.commerce.submit",
+      { "stellar.job_id": String(jobId), "stellar.deliverable": deliverable },
+      async () => {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          try {
+            await commerce.submit(seller, BigInt(jobId), deliverable);
+            console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted → ${deliverable}`);
+            break;
+          } catch (e: any) {
+            if (attempt === 5) throw e;
+            console.log(`[${AGENT_ID}] submit attempt ${attempt} failed, retrying...`);
+            await new Promise((r) => setTimeout(r, 4000));
+          }
+        }
+      },
+    );
     jobsCompleted++;
   } catch (err) {
     jobsFailed++;
+    recordSpanError(span, err as Error);
     console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
   } finally {
     jobsActive--;
+    activeTaskTracker.untrack(taskKey);
   }
 });
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+
+registerGracefulShutdown(server, activeTaskTracker, undefined);

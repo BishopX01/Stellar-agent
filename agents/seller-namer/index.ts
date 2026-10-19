@@ -13,7 +13,10 @@ import {
   validatePrompt,
   isMockLlm,
   MOCK_DELIVERABLES,
+  registerGracefulShutdown,
 } from "../shared.js";
+
+initTracing("seller-namer");
 
 validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
 
@@ -34,6 +37,13 @@ const startTime = Date.now();
 let jobsActive = 0;
 let jobsCompleted = 0;
 let jobsFailed = 0;
+
+// Tracks in-flight /job processing so graceful shutdown can wait for them.
+const activeTaskTracker = {
+  get active() {
+    return jobsActive;
+  },
+};
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -74,11 +84,13 @@ async function generate(prompt: string): Promise<string> {
   if (isMockLlm()) {
     return MOCK_DELIVERABLES.namer;
   }
-  const res = await groq!.chat.completions.create({
-    model: GROQ_MODEL,
-    messages: [{ role: "user", content: prompt }],
+  return withSpan("llm.generate", { "llm.model": GROQ_MODEL }, async () => {
+    const res = await groq!.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [{ role: "user", content: prompt }],
+    });
+    return res.choices[0].message.content ?? "";
   });
-  return res.choices[0].message.content ?? "";
 }
 
 const limiter = rateLimit({
@@ -93,6 +105,16 @@ app.post("/job", limiter, async (req, res) => {
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const startedAt = Date.now();
   const { jobId, task } = req.body;
+
+  return withSpan(
+    "http.server.job",
+    {
+      "http.method": "POST",
+      "http.route": "/job",
+      "agent.id": AGENT_ID,
+      "request.id": requestId,
+    },
+    async () => {
 
   console.log(
     `[${AGENT_ID}] [req:${requestId}] Incoming POST /job — headers: ${JSON.stringify({
@@ -141,9 +163,14 @@ app.post("/job", limiter, async (req, res) => {
     console.log(`[${AGENT_ID}] Names generated (${names.length} chars)`);
 
     const commerce = new CommerceClient(cfg);
-    await retryWithBackoff(
-      () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
-      { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+    await withSpan(
+      "x402.commerce.submit",
+      { "x402.job_id": String(jobId), "agent.id": AGENT_ID },
+      () =>
+        retryWithBackoff(
+          () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
+          { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+        ),
     );
     console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted`);
     jobsCompleted++;
@@ -153,13 +180,9 @@ app.post("/job", limiter, async (req, res) => {
   } finally {
     jobsActive--;
   }
+    },
+  );
 });
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+registerGracefulShutdown(server, activeTaskTracker, null, { agentId: AGENT_ID });

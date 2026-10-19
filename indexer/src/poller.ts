@@ -1,17 +1,36 @@
 import { rpc as StellarRpc } from "@stellar/stellar-sdk";
-import type { DatabaseAdapter, InsertEventParams } from "./db.js";
-import {
-  stellarEventsIngestedTotal,
-  stellarRpcRequestDurationSeconds,
-  activeEscrowJobsGauge,
-} from "./metrics.js";
-import type { WebhookDispatcher } from "./webhooks.js";
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
+import { EventStore, type InsertEventParams } from "./db.js";
+import { ReputationEngine } from "./reputation.js";
+import { EventHub } from "./events.js";
+
+const tracer = trace.getTracer("bear-indexer-poller");
 
 export type SorobanRpcClient = {
   getEvents(
     params: StellarRpc.Server.GetEventsRequest,
   ): Promise<StellarRpc.Api.GetEventsResponse>;
   getLatestLedger(): Promise<StellarRpc.Api.GetLatestLedgerResponse>;
+  /**
+   * Optional: fetch a single ledger header. Used for reorg detection to
+   * verify the `previous_ledger_hash` chain. When unavailable the poller
+   * falls back to the `previousLedgerHash` field on getEvents responses.
+   */
+  getLedger?(
+    ledger: number,
+  ): Promise<{ sequence: number; hash: string; previousLedgerHash?: string }>;
+};
+
+/** Structured log record emitted for every detected chain reorganization. */
+export type ReorgLogRecord = {
+  event: "chain_reorg";
+  detectedAt: string;
+  forkLedger: number;
+  rewoundTo: number;
+  purgedEvents: number;
+  previousHash: string | null;
+  expectedHash: string | null;
+  actualHash: string | null;
 };
 
 // Known Bear Protocol event topic names
@@ -81,21 +100,36 @@ export type PollerOptions = {
   batchSize?: number;
   /** Emit debug logs. Default: false */
   debug?: boolean;
-  /** Optional webhook dispatcher invoked on JobCreated events. */
-  webhooks?: WebhookDispatcher;
+  /** Optional reputation engine used to recalculate scores on settlement. */
+  reputation?: ReputationEngine;
+  /** Optional event hub used to broadcast newly indexed events. */
+  eventHub?: EventHub;
+  /** Max number of ledgers to walk back when resolving a reorg. Default: 64 */
+  maxReorgDepth?: number;
 };
 
-/** Wraps an RPC call, observing its latency in the Prometheus histogram. */
-async function observeRpc<T>(
-  method: "getEvents" | "getLatestLedger",
-  fn: () => Promise<T>,
-): Promise<T> {
-  const end = stellarRpcRequestDurationSeconds.startTimer({ method });
-  try {
-    return await fn();
-  } finally {
-    end();
+/** Event types that affect an agent's reputation score. */
+const REPUTATION_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "JobCompleted",
+  "JobDisputed",
+]);
+
+/**
+ * Best-effort extraction of the agent address from a raw Soroban event.
+ * Job events carry the provider agent as one of their topics; we scan the
+ * topics for the first string-like value that is not the event name.
+ */
+function extractAgentId(event: StellarRpc.Api.EventResponse): string | null {
+  const topics = event.topic ?? [];
+  for (let i = 1; i < topics.length; i++) {
+    const topic = topics[i] as unknown;
+    if (typeof topic === "string") return topic;
+    if (topic && typeof topic === "object") {
+      const value = (topic as Record<string, unknown>).value;
+      if (typeof value === "string") return value;
+    }
   }
+  return null;
 }
 
 /**
@@ -110,10 +144,13 @@ export class SorobanEventPoller {
   private readonly intervalMs: number;
   private readonly batchSize: number;
   private readonly debug: boolean;
-  private readonly webhooks?: WebhookDispatcher;
+  private readonly reputation: ReputationEngine | null;
+  private readonly eventHub: EventHub | null;
+  private readonly maxReorgDepth: number;
 
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private reorgCount = 0;
 
   constructor(
     rpc: SorobanRpcClient,
@@ -129,11 +166,108 @@ export class SorobanEventPoller {
     this.intervalMs = opts.intervalMs ?? 5_000;
     this.batchSize = opts.batchSize ?? 100;
     this.debug = opts.debug ?? false;
-    this.webhooks = opts.webhooks;
+    this.reputation = opts.reputation ?? null;
+    this.eventHub = opts.eventHub ?? null;
+    this.maxReorgDepth = opts.maxReorgDepth ?? 64;
   }
 
   private log(msg: string): void {
     if (this.debug) console.log(`[indexer] ${msg}`);
+  }
+
+  /** Number of chain reorganizations detected since construction. */
+  getReorgCount(): number {
+    return this.reorgCount;
+  }
+
+  /**
+   * Fetch the hash of a ledger. Prefers `rpc.getLedger` when available and
+   * falls back to the `previousLedgerHash` reported on getEvents responses.
+   */
+  private async fetchLedgerHash(
+    ledger: number,
+  ): Promise<{ hash: string | null; previousLedgerHash: string | null }> {
+    if (this.rpc.getLedger) {
+      try {
+        const header = await this.rpc.getLedger(ledger);
+        return {
+          hash: header.hash ?? null,
+          previousLedgerHash: header.previousLedgerHash ?? null,
+        };
+      } catch (err) {
+        this.log(
+          `Failed to fetch ledger ${ledger} header: ${(err as Error).message}`,
+        );
+      }
+    }
+    return { hash: null, previousLedgerHash: null };
+  }
+
+  /**
+   * Verify that the chain has not reorganized since the last indexed ledger.
+   * Returns the ledger to resume from. On mismatch, purges orphaned events,
+   * rewinds the watermark to the last verified ancestor and returns that
+   * ancestor so the next poll re-ingests from the common fork point.
+   */
+  private async detectAndRecoverReorg(): Promise<number> {
+    const last = this.store.getLastIndexedLedger();
+    if (last === null) return this.startLedger;
+
+    const storedHash = this.store.getIndexedLedgerHash(last);
+    if (!storedHash) {
+      // No hash recorded yet (legacy state); nothing to verify against.
+      return last + 1;
+    }
+
+    // Fetch the header for the last indexed ledger and compare its hash.
+    const header = await this.fetchLedgerHash(last);
+    if (!header.hash) {
+      // Cannot verify; assume no reorg.
+      return last + 1;
+    }
+
+    if (header.hash === storedHash) {
+      return last + 1;
+    }
+
+    // Mismatch: walk back to the last verified ancestor.
+    let forkLedger = last;
+    let rewoundTo = last;
+    let expectedHash: string | null = storedHash;
+    let actualHash: string | null = header.hash;
+
+    for (let depth = 0; depth < this.maxReorgDepth; depth++) {
+      const candidate = forkLedger - 1;
+      if (candidate < this.startLedger) break;
+      const candidateHash = this.store.getIndexedLedgerHash(candidate);
+      if (!candidateHash) break;
+      const candidateHeader = await this.fetchLedgerHash(candidate);
+      if (candidateHeader.hash && candidateHeader.hash === candidateHash) {
+        rewoundTo = candidate;
+        break;
+      }
+      forkLedger = candidate;
+      expectedHash = candidateHash;
+      actualHash = candidateHeader.hash;
+    }
+
+    const purged = this.store.deleteEventsFromLedger(rewoundTo + 1);
+    this.store.setLastIndexedLedger(rewoundTo);
+    this.reorgCount += 1;
+
+    const record: ReorgLogRecord = {
+      event: "chain_reorg",
+      detectedAt: new Date().toISOString(),
+      forkLedger,
+      rewoundTo,
+      purgedEvents: purged,
+      previousHash: expectedHash,
+      expectedHash,
+      actualHash,
+    };
+    console.error(`[indexer] ${JSON.stringify(record)}`);
+
+    return rewoundTo + 1;
   }
 
   /** Returns the ledger to start polling from (resume or initial). */
@@ -143,75 +277,97 @@ export class SorobanEventPoller {
     return last !== null ? last + 1 : this.startLedger;
   }
 
-  /**
-   * Fires webhook notifications for JobCreated events without blocking the
-   * poll loop.  Any failure is logged and swallowed so the poller keeps running.
-   */
-  private dispatchJobCreatedWebhooks(inserts: InsertEventParams[]): void {
-    if (!this.webhooks) return;
+  /** Recalculate reputation for agents affected by settlement events. */
+  private updateReputation(events: StellarRpc.Api.EventResponse[]): void {
+    if (!this.reputation) return;
 
-    for (const insert of inserts) {
-      if (insert.event_type !== "JobCreated") continue;
+    const agents = new Set<string>();
+    for (const ev of events) {
+      const params = toInsertParams(ev, 0);
+      if (!REPUTATION_EVENT_TYPES.has(params.event_type)) continue;
+      const agentId = extractAgentId(ev);
+      if (agentId) agents.add(agentId);
+    }
 
-      const payload = insert.payload as Record<string, unknown>;
-      const value = payload?.value as Record<string, unknown> | undefined;
-      const provider =
-        (value?.provider as string | undefined) ??
-        (value?.seller as string | undefined);
-      if (!provider) continue;
-
-      const jobId =
-        (value?.job_id as string | undefined) ??
-        (value?.jobId as string | undefined) ??
-        insert.event_type;
-      const budget = value?.budget;
-      const client = value?.client;
-      const description = value?.description;
-
-      void Promise.resolve()
-        .then(() =>
-          this.webhooks!.dispatchJobCreated(provider, {
-            jobId: String(jobId),
-            budget,
-            client,
-            description,
-          }),
-        )
-        .catch((err) => {
-          console.error(
-            `[indexer] Webhook dispatch failed for provider ${provider}:`,
-            (err as Error).message,
-          );
-        });
+    for (const agentId of agents) {
+      try {
+        this.reputation.recalculate(agentId);
+        this.log(`Recalculated reputation for agent ${agentId}`);
+      } catch (err) {
+        console.error(
+          `[indexer] Failed to recalculate reputation for ${agentId}:`,
+          (err as Error).message,
+        );
+      }
     }
   }
 
   private async poll(): Promise<void> {
-    const fromLedger = this.getFromLedger();
+    let fromLedger: number;
+    try {
+      fromLedger = await this.detectAndRecoverReorg();
+    } catch (err) {
+      console.error(
+        "[indexer] Reorg detection failed:",
+        (err as Error).message,
+      );
+      fromLedger = this.getFromLedger();
+    }
 
     try {
-      const latest = await observeRpc("getLatestLedger", () =>
-        this.rpc.getLatestLedger(),
+      const latest = await tracer.startActiveSpan(
+        "soroban.getLatestLedger",
+        async (span: Span) => {
+          try {
+            const res = await this.rpc.getLatestLedger();
+            span.setAttribute("stellar.ledger.sequence", res.sequence);
+            return res;
+          } catch (err) {
+            span.recordException(err as Error);
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw err;
+          } finally {
+            span.end();
+          }
+        },
       );
       if (fromLedger > latest.sequence) {
         this.log(`Up to date at ledger ${latest.sequence}`);
         return;
       }
 
+      // Collect all events for this ledger across contracts before writing.
+      const allInserts: InsertEventParams[] = [];
+
       // Query each contract separately to stay within RPC limits
       for (const contractId of this.contracts) {
         try {
-          const response = await observeRpc("getEvents", () =>
-            this.rpc.getEvents({
-              startLedger: fromLedger,
-              filters: [
-                {
-                  type: "contract",
-                  contractIds: [contractId],
-                },
-              ],
-              limit: this.batchSize,
-            }),
+          const response = await tracer.startActiveSpan(
+            "soroban.getEvents",
+            async (span: Span) => {
+              span.setAttribute("stellar.contract.id", contractId);
+              span.setAttribute("stellar.ledger.start", fromLedger);
+              try {
+                const res = await this.rpc.getEvents({
+                  startLedger: fromLedger,
+                  filters: [
+                    {
+                      type: "contract",
+                      contractIds: [contractId],
+                    },
+                  ],
+                  limit: this.batchSize,
+                });
+                span.setAttribute("stellar.events.count", res.events?.length ?? 0);
+                return res;
+              } catch (err) {
+                span.recordException(err as Error);
+                span.setStatus({ code: SpanStatusCode.ERROR });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
           );
 
           if (!response.events || response.events.length === 0) continue;
@@ -230,13 +386,11 @@ export class SorobanEventPoller {
             return toInsertParams(ev as StellarRpc.Api.EventResponse, closeTime);
           });
 
-          this.store.insertMany(inserts);
-          for (const insert of inserts) {
-            stellarEventsIngestedTotal.inc({ event_type: insert.event_type });
-          }
-          this.dispatchJobCreatedWebhooks(inserts);
+          // Collect events across all contracts so the whole ledger batch is
+          // persisted atomically in a single IMMEDIATE transaction below.
+          allInserts.push(...inserts);
           this.log(
-            `Indexed ${inserts.length} events from contract ${contractId} (ledgers ${fromLedger}+)`,
+            `Fetched ${inserts.length} events from contract ${contractId} (ledgers ${fromLedger}+)`,
           );
         } catch (err) {
           console.error(
@@ -246,17 +400,23 @@ export class SorobanEventPoller {
         }
       }
 
-      // Advance the watermark to the latest ledger we queried up to
-      this.store.setLastIndexedLedger(latest.sequence);
+      // Persist the entire ledger batch (events + watermark) atomically.
+      // If anything fails, neither the events nor the watermark advance.
+      const latestHash = await this.fetchLedgerHash(latest.sequence);
+      this.store.insertEventsBatch(
+        allInserts,
+        latest.sequence,
+        latestHash.hash ?? undefined,
+      );
+      this.log(
+        `Indexed ${allInserts.length} events across ${this.contracts.length} contract(s) up to ledger ${latest.sequence}`,
+      );
 
-      // Refresh the gauge of currently active escrow jobs.
-      try {
-        const active = this.store.countActiveJobs?.();
-        if (typeof active === "number") {
-          activeEscrowJobsGauge.set(active);
+      // Broadcast newly indexed events to SSE/WebSocket subscribers.
+      if (this.eventHub && allInserts.length > 0) {
+        for (const insert of allInserts) {
+          this.eventHub.publish(insert);
         }
-      } catch (err) {
-        this.log(`Failed to update active jobs gauge: ${(err as Error).message}`);
       }
     } catch (err) {
       console.error("[indexer] Poll error:", (err as Error).message);
