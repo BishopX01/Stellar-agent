@@ -868,7 +868,11 @@ export class CommerceClient extends BaseClient {
         evaluator: native.evaluator,
         token: native.token,
         budget: BigInt(native.budget),
-        status: (Array.isArray(native.status) ? native.status[0] : native.status) as JobStatus,
+        status: (Array.isArray(native.status)
+          ? native.status[0]
+          : typeof native.status === "number"
+            ? JobStatusFromNumber[native.status] ?? native.status
+            : native.status) as JobStatus,
         description: native.description,
         deliverable: native.deliverable,
         funded_at: BigInt(native.funded_at ?? 0),

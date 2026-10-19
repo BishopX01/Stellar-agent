@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { CommerceClient } from "./commerce.js";
 import { TESTNET } from "./types.js";
 import {
@@ -480,6 +480,59 @@ test("complete encodes the optional deliverable hash assertion in the correct po
     Buffer.from(params[1].value()),
     Buffer.from(hash),
   );
+
+  client.disconnect();
+});
+
+// ---------------------------------------------------------------------------
+// #835 — getJob returns status as a plain JobStatus string
+// ---------------------------------------------------------------------------
+
+function jobScVal(status: xdr.ScVal): xdr.ScVal {
+  return nativeToScVal(
+    {
+      id: nativeToScVal(7n, { type: "u64" }),
+      client: nativeToScVal(Keypair.random().publicKey(), { type: "address" }),
+      provider: nativeToScVal(Keypair.random().publicKey(), { type: "address" }),
+      evaluator: nativeToScVal(Keypair.random().publicKey(), { type: "address" }),
+      token: nativeToScVal(TESTNET.usdcToken, { type: "address" }),
+      budget: nativeToScVal(1_000n, { type: "i128" }),
+      status,
+      description: nativeToScVal("test", { type: "string" }),
+      deliverable: nativeToScVal("", { type: "string" }),
+    },
+    { type: "map" },
+  );
+}
+
+test("getJob unwraps a Soroban enum variant status into a plain string", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  (client as any).simulateOption = async (_op: unknown, decode: (v: xdr.ScVal) => unknown) =>
+    decode(jobScVal(xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Funded")])));
+
+  const job = await client.getJob(7n);
+  assert.equal(job?.status, "Funded");
+  assert.equal(typeof job?.status, "string");
+  assert.ok(job?.status === "Funded");
+
+  client.disconnect();
+});
+
+test("getJob maps a numeric status to its JobStatus string", async () => {
+  const client = new CommerceClient({
+    ...TESTNET,
+    rpcUrl: "https://example.invalid",
+  });
+
+  (client as any).simulateOption = async (_op: unknown, decode: (v: xdr.ScVal) => unknown) =>
+    decode(jobScVal(nativeToScVal(2, { type: "u32" })));
+
+  const job = await client.getJob(7n);
+  assert.equal(job?.status, "Submitted");
 
   client.disconnect();
 });
