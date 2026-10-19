@@ -308,7 +308,8 @@ async function getUsdc(pubkey: string): Promise<string> {
 // ── TUI ───────────────────────────────────────────────────────────────────────
 
 const buyer = Keypair.fromSecret(process.env.BUYER_SECRET!);
-const REGISTRY = "http://localhost:4500/agents";
+const REGISTRY_BASE_URL = (process.env.REGISTRY_URL ?? "http://localhost:4500").replace(/\/+$/, "");
+const REGISTRY = `${REGISTRY_BASE_URL}/agents`;
 // Only online providers are considered: the registry filters out agents that
 // have been marked Offline by the heartbeat monitor (issue #721).
 const REGISTRY_ONLINE = `${REGISTRY}?status=Online`;
