@@ -194,7 +194,10 @@
     function tryExpand() {
       var row = document.getElementById("job-" + jobId);
       if (row) {
-        if (!row.classList.contains("expanded")) row.classList.add("expanded");
+        if (!row.classList.contains("expanded")) {
+          row.classList.add("expanded");
+          loadJobTimeline(jobId);
+        }
         try { row.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
         return;
       }
@@ -2272,6 +2275,12 @@
             : "") +
           evaluatorProgressHtml +
           deliverableHtml +
+          '<div class="detail-item" style="grid-column:1/-1">' +
+          '<div class="detail-label">Timeline</div>' +
+          '<div class="job-timeline" role="list" id="job-timeline-' +
+          escapeAttr(String(j.id)) +
+          '"><div class="job-timeline-empty" role="listitem">Loading events…</div></div>' +
+          "</div>" +
           "</div>" +
           '<div class="job-actions">' +
           actions +
@@ -2644,9 +2653,113 @@
 
   window.__copy = copyToClipboard;
 
+  // ── Job lifecycle timeline (#831) ──
+  var TIMELINE_LABELS = {
+    jobcreated: "Job created & funded",
+    jobsubmitted: "Deliverable submitted",
+    jobcompleted: "Job completed",
+    jobrejected: "Job rejected",
+    jobcancelled: "Job cancelled",
+    jobdisputed: "Dispute opened",
+    disputeresolved: "Dispute resolved",
+    jobresolved: "Dispute resolved",
+    jobrefunded: "Job refunded",
+    jobexpired: "Payment claimed after timeout",
+  };
+
+  function eventPayload(ev) {
+    var data = ev.data != null ? ev.data : ev.payload;
+    if (typeof data === "string") {
+      try { data = JSON.parse(data); } catch (e) { data = null; }
+    }
+    return data && typeof data === "object" ? data : {};
+  }
+
+  function eventJobId(data) {
+    var id = data.job_id != null ? data.job_id : data.jobId != null ? data.jobId : data.job;
+    return id == null ? null : String(id);
+  }
+
+  function eventUnixSeconds(ts) {
+    if (ts == null || ts === "") return null;
+    var n = Number(ts);
+    if (!Number.isFinite(n)) n = Date.parse(ts) / 1000;
+    else if (n > 1e12) n = n / 1000;
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function renderJobTimeline(items) {
+    if (items.length === 0) {
+      return '<div class="job-timeline-empty" role="listitem">No events recorded for this job yet.</div>';
+    }
+    return items
+      .map(function (item) {
+        var type = String(item.ev.eventType || item.ev.event_type || item.ev.type || "");
+        var key = type.toLowerCase().replace(/[_\s]/g, "");
+        var label = TIMELINE_LABELS[key] || type || "Event";
+        var data = item.data;
+        var time = item.ts
+          ? '<span class="job-timeline-time" title="' +
+            escapeAttr(new Date(item.ts * 1000).toISOString()) +
+            '">' +
+            escapeHtml(formatRelativeTime(item.ts)) +
+            "</span>"
+          : "";
+        var meta = "";
+        var provider = data.provider || data.provider_id;
+        if (provider) meta += '<span class="job-timeline-meta">Provider: ' + copyable(provider, "wallet public key") + "</span>";
+        if (data.evaluator) meta += '<span class="job-timeline-meta">Evaluator: ' + copyable(data.evaluator, "wallet public key") + "</span>";
+        var hash = data.deliverable_hash || data.deliverableHash;
+        if (hash) {
+          meta +=
+            '<span class="job-timeline-meta">Deliverable hash: ' +
+            copyable(hash, "deliverable hash", String(hash).slice(0, 10) + "…" + String(hash).slice(-6)) +
+            "</span>";
+        }
+        return (
+          '<div class="job-timeline-item" role="listitem">' +
+          '<span class="job-timeline-dot"></span>' +
+          '<div class="job-timeline-body">' +
+          '<div class="job-timeline-head"><span class="job-timeline-label">' +
+          escapeHtml(label) +
+          "</span>" +
+          time +
+          "</div>" +
+          meta +
+          "</div></div>"
+        );
+      })
+      .join("");
+  }
+
+  async function loadJobTimeline(id) {
+    var el = document.getElementById("job-timeline-" + id);
+    if (!el) return;
+    try {
+      var res = await api("/events?limit=1000", { _silent: true });
+      var items = (res.items || [])
+        .map(function (ev) {
+          var data = eventPayload(ev);
+          return { ev: ev, data: data, jobId: eventJobId(data), ts: eventUnixSeconds(ev.timestamp) };
+        })
+        .filter(function (item) {
+          return item.jobId === String(id);
+        })
+        .sort(function (a, b) {
+          return (a.ts || 0) - (b.ts || 0) || (Number(a.ev.ledger) || 0) - (Number(b.ev.ledger) || 0);
+        });
+      el.innerHTML = renderJobTimeline(items);
+    } catch (e) {
+      el.innerHTML = '<div class="job-timeline-empty" role="listitem">Could not load job events.</div>';
+    }
+  }
+
   window.__toggleJob = function (id) {
     const row = document.getElementById("job-" + id);
-    if (row) row.classList.toggle("expanded");
+    if (row) {
+      row.classList.toggle("expanded");
+      if (row.classList.contains("expanded")) loadJobTimeline(id);
+    }
   };
 
   window.__filterJobs = function (filter) {
