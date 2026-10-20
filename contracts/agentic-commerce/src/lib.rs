@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token, Address, Env, IntoVal, String, Vec};
 
 /// Contract-level error codes for agentic-commerce (#323, #541).
 #[contracterror]
@@ -28,6 +28,12 @@ pub enum Error {
     /// #706 — the evaluator-asserted deliverable content hash does not match
     /// the hash committed by the provider at submission time.
     HashMismatch = 11,
+    /// Payment-channel operations are paused by the admin.
+    ChannelsPaused = 12,
+    /// A batch request exceeds the safe per-call cap.
+    BatchTooLarge = 13,
+    /// Router swap did not meet the client’s slippage guard.
+    SlippageExceeded = 14,
 }
 
 /// Lifecycle states for a job escrow.
@@ -205,6 +211,8 @@ enum DataKey {
     Version,
     /// #29 — emergency pause flag. Stored as bool; absent == not paused.
     Paused,
+    /// Payment-channel operations pause flag.
+    ChannelsPaused,
     NextChannelId,
     Evaluators(u64),
     Channel(u64),
@@ -222,6 +230,8 @@ enum DataKey {
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
 const MAX_FEE_BPS: u32 = 500; // 5% hard cap
 const BPS_DENOM: i128 = 10_000;
+const SECS_PER_HOUR: u64 = 60 * 60;
+const MAX_SLA_PENALTY_BPS: u32 = 5000; // 50%
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 /// #25 — minimum budget to prevent zero/dust jobs that waste storage and spam events.
 const MIN_BUDGET: i128 = 1;
@@ -340,17 +350,6 @@ pub struct JobDisputed {
     pub timestamp: u64,
 }
 
-/// Emitted when a provider claims payment after the evaluator timeout has passed (#18).
-#[contractevent]
-pub struct JobExpired {
-    #[topic]
-    pub provider: Address,
-    pub job_id: u64,
-    pub payout: i128,
-    pub fee: i128,
-    pub timestamp: u64,
-}
-
 /// Emitted when the contract is emergency-paused.
 #[contractevent]
 pub struct Paused {
@@ -362,6 +361,22 @@ pub struct Paused {
 /// Emitted when the contract is unpaused.
 #[contractevent]
 pub struct Unpaused {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when payment-channel operations are paused.
+#[contractevent]
+pub struct ChannelsPaused {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when payment-channel operations are resumed.
+#[contractevent]
+pub struct ChannelsUnpaused {
     #[topic]
     pub admin: Address,
     pub timestamp: u64,
@@ -503,6 +518,18 @@ impl AgenticCommerceContract {
             .unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Panics if payment-channel operations have been paused by the admin.
+    fn require_channels_not_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ChannelsPaused)
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::ChannelsPaused);
         }
     }
 
@@ -714,6 +741,44 @@ impl AgenticCommerceContract {
             timestamp: env.ledger().timestamp(),
         }
         .publish(&env);
+    }
+
+    /// Admin-only: pause payment-channel operations without interrupting jobs.
+    pub fn pause_channels(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::ChannelsPaused, &true);
+        ChannelsPaused {
+            admin: caller,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Admin-only: resume payment-channel operations.
+    pub fn unpause_channels(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::ChannelsPaused, &false);
+        ChannelsUnpaused {
+            admin: caller,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Read-only: returns true if payment-channel operations are paused.
+    pub fn are_channels_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ChannelsPaused)
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------------
@@ -985,10 +1050,14 @@ impl AgenticCommerceContract {
                 status: JobStatus::Funded,
                 description: req.description,
                 deliverable: String::from_str(&env, ""),
+                deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
                 funded_at: now,
                 created_at: now,
                 updated_at: now,
                 fee_bps: snapshotted_fee_bps, // #23
+                sla_deadline: 0,
+                penalty_bps_per_hour: 0,
+                submitted_at: 0,
             };
             env.storage().persistent().set(&DataKey::Job(id), &job);
             job_ids.push_back(id);
@@ -1270,10 +1339,14 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
             fee_bps,
+            sla_deadline: 0,
+            penalty_bps_per_hour: 0,
+            submitted_at: 0,
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
         env.storage().persistent().set(
@@ -1376,7 +1449,7 @@ impl AgenticCommerceContract {
         env: Env,
         caller: Address,
         id: u64,
-        expected_hash: Option<soroban_sdk::BytesN<32>>,
+        expected_hash: soroban_sdk::BytesN<32>,
     ) {
         Self::require_not_paused(&env); // #29
         caller.require_auth();
@@ -1404,15 +1477,14 @@ impl AgenticCommerceContract {
         if job.status != JobStatus::Submitted && job.status != JobStatus::Disputed {
             panic_with_error!(&env, Error::InvalidStatus);
         }
-        // #706 — optional content-hash attestation. Reject any assertion that
-        // does not match the immutable hash committed by the provider.
-        if let Some(expected) = expected_hash {
-            if expected != job.deliverable_hash {
-                panic_with_error!(&env, Error::HashMismatch);
-            }
+        // #706 — reject any hash assertion that does not match the immutable
+        // digest committed by the provider at submission time.
+        if expected_hash != job.deliverable_hash {
+            panic_with_error!(&env, Error::HashMismatch);
         }
-        // #23 — use the fee_bps snapshotted at job creation time so admin
-        // changes to the global rate don't retroactively alter this job.
+        // #716 — apply any SLA penalty before the platform fee is computed.
+        let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(&job);
+        let penalized_budget = job.budget - penalty;
         let fee: i128 = Self::compute_fee(penalized_budget, job.fee_bps);
         let payout: i128 = penalized_budget - fee;
 
@@ -2021,6 +2093,7 @@ impl AgenticCommerceContract {
         voucher_key: soroban_sdk::BytesN<32>,
     ) -> u64 {
         Self::require_not_paused(&env);
+        Self::require_channels_not_paused(&env);
         payer.require_auth();
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
@@ -2078,6 +2151,7 @@ impl AgenticCommerceContract {
         signature: soroban_sdk::BytesN<64>,
     ) {
         Self::require_not_paused(&env);
+        Self::require_channels_not_paused(&env);
         caller.require_auth();
         let mut channel: PaymentChannel = env
             .storage()
@@ -2116,6 +2190,7 @@ impl AgenticCommerceContract {
     /// Either channel participant may submit settlement once the period ends.
     pub fn force_close(env: Env, caller: Address, channel_id: u64) {
         Self::require_not_paused(&env);
+        Self::require_channels_not_paused(&env);
         caller.require_auth();
         let channel: PaymentChannel = env
             .storage()
