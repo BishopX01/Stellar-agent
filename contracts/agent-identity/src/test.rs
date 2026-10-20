@@ -768,6 +768,91 @@ fn upgrade_panics_when_not_initialized() {
     client.upgrade(&admin, &fake_hash);
 }
 
+#[test]
+fn owner_can_pause_and_resume_agent_without_removing_record() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+    let original = client.get_agent(&id).unwrap();
+
+    client.pause_agent(&owner, &id);
+    assert!(!client.is_active(&id));
+    assert_eq!(client.get_agent(&id), Some(original.clone()));
+    assert_eq!(client.agent_of(&owner), Some(id));
+    assert_eq!(client.list_agents(&1, &100).len(), 1);
+
+    client.resume_agent(&owner, &id);
+    assert!(client.is_active(&id));
+    assert_eq!(client.get_agent(&id), Some(original));
+}
+
+#[test]
+fn admin_suspension_and_owner_pause_are_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+
+    client.suspend_agent(&admin, &id);
+    assert!(!client.is_active(&id));
+    client.pause_agent(&owner, &id);
+    client.unsuspend_agent(&admin, &id);
+    assert!(!client.is_active(&id));
+    client.resume_agent(&owner, &id);
+    assert!(client.is_active(&id));
+}
+
+#[test]
+#[should_panic(expected = "not agent owner")]
+fn pause_agent_rejects_non_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+
+    client.pause_agent(&other, &id);
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn suspend_agent_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+
+    client.suspend_agent(&other, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn is_active_rejects_unknown_agent() {
+    let env = Env::default();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    client.is_active(&1);
+}
+
 // ===========================================================================
 // #782 — boundary tests for register()/update_uri() metadata_uri length.
 //
