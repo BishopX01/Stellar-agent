@@ -13,7 +13,7 @@ test("warns for empty trailing and malformed origin entries", () => {
   );
 
   assert.ok(origins.includes("https://app.example.com"));
-  assert.equal(warnings.length, 3);
+  assert.equal(warnings.length, 4);
 });
 
 test("fails in production when an origin entry is empty or malformed", () => {
