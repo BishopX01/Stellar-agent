@@ -1,0 +1,19 @@
+{
+  "name": "orchestrator-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "start": "npx tsx index.ts",
+    "dev": "npx tsx --watch index.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^12.3.0",
+    "dotenv": "^16.4.5",
+    "marc-stellar-sdk": "file:../../sdk"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
