@@ -21,3 +21,14 @@ test("matches only the requested job's commerce lifecycle events", () => {
     false,
   );
 });
+
+test("decodes the indexed XDR event topic when no event_type name is available", () => {
+  const event = {
+    contract: contractId,
+    payload: {
+      topics: [nativeToScVal("JobCompleted", { type: "symbol" }).toXDR("base64")],
+      value: nativeToScVal([42n]).toXDR("base64"),
+    },
+  };
+  assert.equal(matchesJobEvent(event, contractId, 42n), true);
+});

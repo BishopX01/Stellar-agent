@@ -7,6 +7,37 @@ const JOB_EVENT_TYPES = new Set([
   "JobDisputed",
 ]);
 
+export function getJobEventType(event: Record<string, unknown>): string | null {
+  const eventType = event.event_type ?? event.eventType ?? event.type;
+  if (typeof eventType === "string" && JOB_EVENT_TYPES.has(eventType)) {
+    return eventType;
+  }
+
+  const payload = (event.payload ?? event.data) as Record<string, unknown> | undefined;
+  const topics = payload?.topics;
+  if (!Array.isArray(topics) || topics.length === 0) return null;
+  const topic = topics[0];
+  try {
+    const raw =
+      typeof topic === "string"
+        ? topic
+        : typeof topic === "object" && topic !== null && "xdr" in topic
+          ? (topic as { xdr: string }).xdr
+          : null;
+    if (raw) {
+      const decoded = String(scValToNative(xdr.ScVal.fromXDR(raw, "base64")));
+      return JOB_EVENT_TYPES.has(decoded) ? decoded : null;
+    }
+    if (typeof topic === "object" && topic !== null && "value" in topic) {
+      const decoded = String((topic as { value: unknown }).value);
+      return JOB_EVENT_TYPES.has(decoded) ? decoded : null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function eventJobId(event: Record<string, unknown>): bigint | null {
   const payload = (event.payload ?? event.data) as Record<string, unknown> | undefined;
   const value = payload?.value;
@@ -47,11 +78,9 @@ export function matchesJobEvent(
   jobId: bigint,
 ): boolean {
   const contract = event.contract ?? event.contract_id ?? event.contractId;
-  const eventType = event.event_type ?? event.eventType ?? event.type;
   return (
     contract === contractId &&
-    typeof eventType === "string" &&
-    JOB_EVENT_TYPES.has(eventType) &&
+    getJobEventType(event) !== null &&
     eventJobId(event) === jobId
   );
 }

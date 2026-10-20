@@ -54,7 +54,7 @@ import { parseAllowedOrigins } from "./lib/origins.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getReadOnlyDb } from "../../indexer/src/db.js";
 import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
-import { matchesJobEvent } from "./lib/jobEvents.js";
+import { getJobEventType, matchesJobEvent } from "./lib/jobEvents.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -1349,8 +1349,12 @@ app.get("/api/jobs/:id/events", (req, res) => {
 
   const onEvent = (event: SorobanEvent) => {
     if (matchesJobEvent(event, contractId, jobId)) {
-      const eventType = String(event.event_type ?? event.eventType ?? "event");
-      send(eventType, event, event.id === undefined ? undefined : String(event.id));
+      const eventType = getJobEventType(event) ?? "event";
+      send(
+        eventType,
+        { ...event, eventType },
+        event.id === undefined ? undefined : String(event.id),
+      );
     }
   };
   eventHub.on("event", onEvent);
