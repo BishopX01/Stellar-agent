@@ -8,10 +8,12 @@ Focused dashboard tests passed: 7/7. SDK subscription test passed: 1/1. Full das
 
 ## Related issue
 
-Closes sonoflawal-1/Stellar-agent#820
-Closes sonoflawal-1/Stellar-agent#821
-Closes sonoflawal-1/Stellar-agent#822
-Closes sonoflawal-1/Stellar-agent#823
+- Closes sonoflawal-1/Stellar-agent#820
+- Closes sonoflawal-1/Stellar-agent#821
+- Closes sonoflawal-1/Stellar-agent#822
+- Closes sonoflawal-1/Stellar-agent#823
+
+> Note: This branch is pushed to `BishopX01/Stellar-agent`, while the issues are in `sonoflawal-1/Stellar-agent`. GitHub may not auto-close issues across repositories when this PR is merged.
 
 ## Type of change
 
