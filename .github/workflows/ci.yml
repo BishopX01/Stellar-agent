@@ -78,6 +78,47 @@ jobs:
           node-version: 20
       - run: npx --yes @redocly/cli@latest lint docs/openapi.yaml
 
+  conflict-markers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for git conflict markers in TypeScript files
+        run: |
+          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- '*.ts' '*.tsx'; then
+            echo "Git conflict markers found in the files above" >&2
+            exit 1
+          fi
+
+  state-dump:
+    runs-on: ubuntu-latest
+    env:
+      SOROBAN_RPC_URL: ${{ secrets.SOROBAN_RPC_URL }}
+      CONTRACT_ID: ${{ vars.CONTRACT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Export contract state snapshot
+        shell: bash
+        run: |
+          if [[ -n "$SOROBAN_RPC_URL" && -n "$CONTRACT_ID" ]]; then
+            npm run state:dump -- --rpc-url "$SOROBAN_RPC_URL" --contract-id "$CONTRACT_ID" --out state-manifest.json
+          else
+            echo "RPC secrets unavailable; running state:dump in offline/dry-run mode" >&2
+            npm run state:dump -- --offline --out state-manifest.json
+          fi
+      - name: Upload state manifest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-manifest
+          path: state-manifest.json
+          if-no-files-found: warn
+
   wasm-size:
     runs-on: ubuntu-latest
     env:
@@ -190,6 +231,19 @@ jobs:
             echo "Gas regression exceeds 10% threshold" >&2
             exit 1
           fi
+
+  gas-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Compare contract gas usage against .gas-baseline.json
+        run: npm run gas:check
 
   fuzz-smoke:
     if: github.event_name == 'schedule'

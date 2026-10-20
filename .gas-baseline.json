@@ -1,17 +1,7 @@
 {
-  "version": 1,
-  "generated_by": "scripts/profile-gas.sh",
-  "description": "Baseline Soroban CPU instruction and memory byte consumption per contract entry point. CI compares PR measurements against these values and fails on regressions greater than 10%.",
+  "version": 2,
+  "generated_by": "scripts/measure-gas.ts",
+  "description": "Baseline Soroban CPU instruction and memory byte consumption per agentic_commerce entry point. `npm run gas:check` fails when an operation exceeds these values by more than threshold_percent.",
   "threshold_percent": 10,
-  "contracts": {
-    "hello_world": {
-      "wasm": "target/wasm32-unknown-unknown/release/hello_world.wasm",
-      "entry_points": {
-        "hello": {
-          "cpu_instructions": 0,
-          "memory_bytes": 0
-        }
-      }
-    }
-  }
+  "operations": {}
 }

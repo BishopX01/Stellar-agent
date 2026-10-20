@@ -1,62 +1,75 @@
 import "dotenv/config";
 import express from "express";
 import { marcPaywall } from "marc-stellar-sdk";
-import { z } from "zod";
+import { context, propagation, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 
-const StrKeyEd25519PublicKeySchema = z
-  .string()
-  .regex(/^G[A-Z2-7]{55}$/, "must be a valid Stellar StrKey Ed25519 public key (G...)");
+const serviceName = process.env.OTEL_SERVICE_NAME ?? "seller-mock";
 
-const SellerMockEnvSchema = z.object({
-  PORT: z.coerce.number().int().min(1).max(65535).default(4510),
-  PAY_TO: StrKeyEd25519PublicKeySchema.default(
-    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-  ),
-  X402_FACILITATOR_URL: z
-    .string()
-    .url("must be a valid URL")
-    .default("https://channels.openzeppelin.com/x402/testnet"),
-  X402_API_KEY: z.string().min(1, "must not be empty").optional(),
+const provider = new NodeTracerProvider({
+  resource: resourceFromAttributes({
+    [ATTR_SERVICE_NAME]: serviceName,
+  }),
+  spanProcessors: [
+    new BatchSpanProcessor(
+      new OTLPTraceExporter({
+        url:
+          process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ??
+          process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??
+          "http://localhost:4318/v1/traces",
+      }),
+    ),
+  ],
 });
 
-type SellerMockEnv = z.infer<typeof SellerMockEnvSchema>;
+provider.register();
 
-function formatZodErrorTable(error: z.ZodError): string {
-  const rows = error.issues.map((issue) => ({
-    variable: issue.path.join(".") || "(root)",
-    problem: issue.message,
-  }));
-  const varWidth = Math.max("VARIABLE".length, ...rows.map((r) => r.variable.length));
-  const probWidth = Math.max("PROBLEM".length, ...rows.map((r) => r.problem.length));
-  const line = `+-${"-".repeat(varWidth)}-+-${"-".repeat(probWidth)}-+`;
-  const formatRow = (v: string, p: string) =>
-    `| ${v.padEnd(varWidth)} | ${p.padEnd(probWidth)} |`;
-  return [
-    line,
-    formatRow("VARIABLE", "PROBLEM"),
-    line,
-    ...rows.map((r) => formatRow(r.variable, r.problem)),
-    line,
-  ].join("\n");
-}
-
-function loadEnv(): SellerMockEnv {
-  const result = SellerMockEnvSchema.safeParse(process.env);
-  if (!result.success) {
-    console.error("[seller-mock] Invalid environment configuration:");
-    console.error(formatZodErrorTable(result.error));
-    process.exit(1);
-  }
-  return result.data;
-}
-
-const env = loadEnv();
-const port: number = env.PORT;
-const payTo: string = env.PAY_TO;
+const tracer = trace.getTracer(serviceName);
 
 const app = express();
 
 app.use(express.json());
+
+app.use((req, res, next) => {
+  const parentContext = propagation.extract(context.active(), req.headers);
+  const span = tracer.startSpan(
+    `${req.method} ${req.path}`,
+    {
+      kind: SpanKind.SERVER,
+      attributes: {
+        "http.request.method": req.method,
+        "url.path": req.path,
+        "url.scheme": req.protocol,
+        "server.address": req.hostname,
+        "http.route": req.path,
+      },
+    },
+    parentContext,
+  );
+
+  res.on("finish", () => {
+    span.setAttribute("http.response.status_code", res.statusCode);
+    if (res.statusCode >= 500) {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+    }
+    span.end();
+  });
+
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: "connection closed" });
+      span.end();
+    }
+  });
+
+  context.with(trace.setSpan(parentContext, span), () => {
+    next();
+  });
+});
 
 const mockPaywall = marcPaywall({
   payTo,
@@ -108,7 +121,19 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`[seller-mock] listening on http://localhost:${port}`);
   console.log(`[seller-mock] protected endpoint: http://localhost:${port}/api/mock`);
 });
+
+const shutdown = () => {
+  server.close(() => {
+    provider
+      .shutdown()
+      .catch((err) => console.error("[seller-mock] failed to shutdown tracing", err))
+      .finally(() => process.exit(0));
+  });
+};
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

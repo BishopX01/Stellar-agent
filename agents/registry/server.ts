@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
-import { z } from "zod";
+import { AgentHealthMonitor } from "./src/monitor.js";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -73,14 +73,26 @@ const AGENT_LIST_RATE_WINDOW_MS = 60_000;
 const REGISTRY_API_KEY = registryEnv.REGISTRY_API_KEY;
 const agentListRequestCounts = new Map<string, { count: number; resetAt: number }>();
 
+export type AgentStatus = "Online" | "Offline";
+
 export type AgentEntry = {
   lastHeartbeat: number;
   manifest: Record<string, unknown>;
   /** Capability tags extracted from the manifest and normalised to lowercase. */
   tags: string[];
+  /** Liveness status maintained by the health monitor. */
+  status: AgentStatus;
 };
 
 export const activeAgents = new Map<string, AgentEntry>();
+
+export function setAgentStatus(agentId: string, status: AgentStatus): void {
+  const entry = activeAgents.get(agentId);
+  if (!entry) return;
+  if (entry.status === status) return;
+  entry.status = status;
+  logger.info({ agentId, status }, `[registry] Agent ${agentId} marked ${status}`);
+}
 
 // JSON schema for agent manifests — closes #66
 const REQUIRED_STRING_FIELDS = ["id", "name", "description", "url"] as const;
@@ -252,8 +264,8 @@ function getAliveAgents(): Record<string, unknown>[] {
   const now = Date.now();
   const alive: Record<string, unknown>[] = [];
   for (const entry of activeAgents.values()) {
-    if (now - entry.lastHeartbeat < HEARTBEAT_TIMEOUT_MS) {
-      alive.push({ ...entry.manifest, tags: entry.tags, alive: true });
+    if (now - entry.lastHeartbeat < HEARTBEAT_TIMEOUT_MS && entry.status === "Online") {
+      alive.push({ ...entry.manifest, tags: entry.tags, alive: true, status: entry.status });
     }
   }
   return alive;
@@ -266,7 +278,8 @@ function getAllAgentsWithStatus(): Record<string, unknown>[] {
     const entry = id ? activeAgents.get(id) : undefined;
     const alive = entry !== undefined && now - entry.lastHeartbeat < HEARTBEAT_TIMEOUT_MS;
     const tags = entry ? entry.tags : extractTags(m as Record<string, unknown>);
-    return { ...m, tags, alive };
+    const status: AgentStatus = entry ? entry.status : "Offline";
+    return { ...m, tags, alive, status };
   });
 }
 
@@ -297,7 +310,13 @@ app.post("/heartbeat", heartbeatAuth, (req, res) => {
     return res.status(422).json({ error: `invalid manifest: ${schemaError}` });
   }
 
-  activeAgents.set(agentId, { lastHeartbeat: Date.now(), manifest, tags: extractTags(manifest) });
+  const existing = activeAgents.get(agentId);
+  activeAgents.set(agentId, {
+    lastHeartbeat: Date.now(),
+    manifest,
+    tags: extractTags(manifest),
+    status: existing?.status ?? "Online",
+  });
   logger.info({ agentId, ip }, `[registry] Heartbeat received from ${agentId}`);
   res.json({ status: "ok", agentId, tags: extractTags(manifest) });
 });
@@ -392,6 +411,18 @@ app.get("/agents", async (req, res) => {
   } else {
     result = getAliveAgents();
   }
+
+  // Filter by liveness status (?status=Online / ?status=Offline)
+  if (req.query.status !== undefined) {
+    const rawStatus = String(req.query.status).trim();
+    const normalised = rawStatus.toLowerCase();
+    if (normalised !== "online" && normalised !== "offline") {
+      return res.status(400).json({ error: "status must be 'Online' or 'Offline'" });
+    }
+    const desired: AgentStatus = normalised === "online" ? "Online" : "Offline";
+    result = result.filter((a) => a.status === desired);
+  }
+
   if (typeof req.query.tags === "string" && req.query.tags) {
     result = filterByTags(result, req.query.tags);
   }
@@ -533,6 +564,23 @@ if (isDirectExecution) {
       logger.info({ removedCount: removed }, `[registry] Deregistered ${removed} stale agent(s)`);
     }
   }, HEARTBEAT_INTERVAL_MS);
+
+  // Background liveness monitor: pings /health endpoints without blocking HTTP threads.
+  const healthMonitor = new AgentHealthMonitor({
+    agents: activeAgents,
+    setStatus: setAgentStatus,
+    intervalMs: HEARTBEAT_INTERVAL_MS,
+    logger,
+  });
+  healthMonitor.start();
+
+  const shutdown = () => {
+    healthMonitor.stop();
+    logger.info("[registry] Health monitor stopped");
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   app.listen(PORT, "127.0.0.1", () => {
     logger.info(

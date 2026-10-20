@@ -21,7 +21,7 @@ export {
   verifyChannelVoucher,
 } from "./paymentChannels.js";
 export * from "./signer.js";
-export { marcPaywall, type MarcPaywallOptions } from "./marcPaywall.js";
+export { marcPaywall, FACILITATOR_URLS, type MarcPaywallOptions } from "./marcPaywall.js";
 export { marcPaywallFastify, type MarcPaywallFastifyOptions } from "./marcPaywallFastify.js";
 export { marcPaywallHono, type MarcPaywallHonoOptions } from "./marcPaywallHono.js";
 export { marcPaywallNext, type MarcPaywallNextOptions } from "./marcPaywallNext.js";
@@ -66,6 +66,16 @@ export {
 
 // #781 — RPC failover pool (exported for advanced usage / observability)
 export { RpcFailoverPool, type RpcEndpointHealth } from "./baseClient.js";
+
+// #726 — OpenTelemetry distributed tracing bootstrap
+export {
+  initTracing,
+  getTracer,
+  injectTraceparent,
+  withSpan,
+  type InitTracingOptions,
+  type SpanAttributes,
+} from "./tracing.js";
 
 /**
  * The current semantic version of the `marc-stellar-sdk` package.

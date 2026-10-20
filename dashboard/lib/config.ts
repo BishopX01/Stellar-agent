@@ -3,131 +3,196 @@ import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { TESTNET, type MarcConfig } from "marc-stellar-sdk";
 import { z } from "zod";
 
+export type NetworkId = "testnet" | "futurenet" | "mainnet";
+
+export interface NetworkPreset {
+  id: NetworkId;
+  label: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+  identityContract: string;
+  commerceContract: string;
+  usdcToken: string;
+  /** True when the network uses real funds (e.g. real USDC). */
+  isMainnet: boolean;
+}
+
+export const NETWORKS: Record<NetworkId, NetworkPreset> = {
+  testnet: {
+    id: "testnet",
+    label: "Testnet",
+    rpcUrl: TESTNET.rpcUrl,
+    networkPassphrase: TESTNET.networkPassphrase,
+    identityContract: TESTNET.identityContract,
+    commerceContract: TESTNET.commerceContract,
+    usdcToken: TESTNET.usdcToken,
+    isMainnet: false,
+  },
+  futurenet: {
+    id: "futurenet",
+    label: "Futurenet",
+    rpcUrl: "https://rpc-futurenet.stellar.org",
+    networkPassphrase: "Test SDF Future Network ; October 2022",
+    identityContract: process.env.FUTURENET_AGENT_IDENTITY_CONTRACT ?? "",
+    commerceContract: process.env.FUTURENET_AGENTIC_COMMERCE_CONTRACT ?? "",
+    usdcToken: process.env.FUTURENET_USDC_TOKEN_CONTRACT ?? "",
+    isMainnet: false,
+  },
+  mainnet: {
+    id: "mainnet",
+    label: "Mainnet",
+    rpcUrl: "https://mainnet.sorobanrpc.com",
+    networkPassphrase: "Public Global Stellar Network ; September 2015",
+    identityContract: process.env.MAINNET_AGENT_IDENTITY_CONTRACT ?? "",
+    commerceContract: process.env.MAINNET_AGENTIC_COMMERCE_CONTRACT ?? "",
+    usdcToken:
+      process.env.MAINNET_USDC_TOKEN_CONTRACT ??
+      "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    isMainnet: true,
+  },
+};
+
+export const DEFAULT_NETWORK_ID: NetworkId = "testnet";
+
+export function isNetworkId(value: unknown): value is NetworkId {
+  return value === "testnet" || value === "futurenet" || value === "mainnet";
+}
+
+/**
+ * Resolve the active network id from an explicit value, the STELLAR_NETWORK
+ * env var, or the default (testnet).
+ */
+export function resolveNetworkId(explicit?: string | null): NetworkId {
+  if (isNetworkId(explicit)) return explicit;
+  const fromEnv = process.env.STELLAR_NETWORK?.toLowerCase();
+  if (isNetworkId(fromEnv)) return fromEnv;
+  return DEFAULT_NETWORK_ID;
+}
+
+export function getNetworkPreset(networkId?: string | null): NetworkPreset {
+  return NETWORKS[resolveNetworkId(networkId)];
+}
+
+export const activeNetwork: NetworkPreset = getNetworkPreset();
+
+export const rpcUrls = [
+  process.env.STELLAR_RPC_URL,
+  ...(process.env.STELLAR_RPC_FALLBACK_URLS ?? "")
+    .split(",")
+    .map((url) => url.trim())
+    .filter(Boolean),
+  activeNetwork.rpcUrl,
+  TESTNET.rpcUrl,
+].filter((url, index, list) => Boolean(url) && list.indexOf(url) === index);
+
+export interface RpcHealthResult {
+  url: string;
+  ok: boolean;
+  latencyMs: number;
+  error?: string;
+}
+
+export interface RpcHealthReport {
+  ok: boolean;
+  checkedAt: string;
+  results: RpcHealthResult[];
+}
+
+const RPC_HEALTH_TIMEOUT_MS = 5_000;
+
+async function probeRpc(url: string): Promise<RpcHealthResult> {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RPC_HEALTH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getHealth", params: [] }),
+      signal: controller.signal,
+    });
+    const latencyMs = Date.now() - startedAt;
+    if (!response.ok) {
+      return { url, ok: false, latencyMs, error: `HTTP ${response.status}` };
+    }
+    const payload = (await response.json().catch(() => null)) as
+      | { result?: { status?: string }; error?: { message?: string } }
+      | null;
+    if (payload?.error) {
+      return { url, ok: false, latencyMs, error: payload.error.message ?? "RPC error" };
+    }
+    const status = payload?.result?.status;
+    const ok = status === undefined || status === "healthy";
+    return { url, ok, latencyMs, error: ok ? undefined : `status: ${status}` };
+  } catch (error) {
+    return {
+      url,
+      ok: false,
+      latencyMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Probes every configured RPC node (primary first, then fallbacks) and reports
+ * availability so the dashboard can surface offline/degraded states.
+ */
+export async function checkRpcHealth(): Promise<RpcHealthReport> {
+  const results = await Promise.all(rpcUrls.map((url) => probeRpc(url)));
+  return {
+    ok: results.some((result) => result.ok),
+    checkedAt: new Date().toISOString(),
+    results,
+  };
+}
+
+export const cfg: MarcConfig = {
+  rpcUrl: rpcUrls[0],
+  networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? activeNetwork.networkPassphrase,
+  identityContract: process.env.AGENT_IDENTITY_CONTRACT || activeNetwork.identityContract,
+  commerceContract: process.env.AGENTIC_COMMERCE_CONTRACT || activeNetwork.commerceContract,
+  usdcToken: process.env.USDC_TOKEN_CONTRACT || activeNetwork.usdcToken,
+};
+
+/**
+ * Build a MarcConfig for a specific network, honoring env-var overrides.
+ */
+export function getConfigForNetwork(networkId?: string | null): MarcConfig {
+  const preset = getNetworkPreset(networkId);
+  return {
+    rpcUrl: process.env.STELLAR_RPC_URL || preset.rpcUrl,
+    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? preset.networkPassphrase,
+    identityContract: process.env.AGENT_IDENTITY_CONTRACT || preset.identityContract,
+    commerceContract: process.env.AGENTIC_COMMERCE_CONTRACT || preset.commerceContract,
+    usdcToken: process.env.USDC_TOKEN_CONTRACT || preset.usdcToken,
+  };
+}
+
+export const DEMO_MODE = process.env.DEMO_MODE === "true";
+
+// SEP-0010 (Stellar Web Authentication) configuration.
+// The server signing keypair signs challenge transactions; wallets verify the
+// home_domain and server signature before prompting the user to sign.
+export const homeDomain = process.env.DASHBOARD_HOME_DOMAIN ?? "localhost";
+
+export const serverSigningKeypair = Keypair.fromSecret(
+  process.env.DASHBOARD_SIGNING_SECRET || DEMO_BUYER_SECRET,
+);
+
+// Secret used to sign/verify dashboard session JWTs (24h expiration).
+export const jwtSecret = process.env.DASHBOARD_JWT_SECRET || "demo-dashboard-jwt-secret";
+
+// Challenge transaction validity window (seconds) and JWT lifetime (seconds).
+export const challengeTimeoutSeconds = Number(process.env.DASHBOARD_CHALLENGE_TIMEOUT ?? 300);
+export const jwtExpiresInSeconds = Number(process.env.DASHBOARD_JWT_EXPIRES_IN ?? 24 * 60 * 60);
+
 // In DEMO_MODE, use fixed test keypairs so no secrets are required.
 // These are well-known Stellar testnet keys safe for local demos only.
 const DEMO_BUYER_SECRET = "SDKXSHMO3BR6P7BRH6KNZ7RWHKK4PDACKTUTIHM7J56T55RHT53QHFBX";
 const DEMO_SELLER_SECRET = "SDY6VEDUDJ6JD77NU7KQCQGNP3KCXN57RPUGDDYQBNGAWD2VE5P4RAVF";
-
-const DEMO_MODE = process.env.DEMO_MODE === "true";
-
-const secretKeySchema = z
-  .string()
-  .refine((value) => StrKey.isValidEd25519SecretSeed(value), {
-    message: "must be a valid Stellar Ed25519 secret key (StrKey, starts with 'S')",
-  });
-
-const publicKeySchema = z
-  .string()
-  .refine((value) => StrKey.isValidEd25519PublicKey(value), {
-    message: "must be a valid Stellar Ed25519 public key (StrKey, starts with 'G')",
-  });
-
-const rpcUrlSchema = z
-  .string()
-  .url({ message: "must be a valid URL" })
-  .refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
-    message: "must use the http or https protocol",
-  });
-
-const portSchema = z.coerce
-  .number({ message: "must be a number" })
-  .int({ message: "must be an integer" })
-  .min(1, { message: "must be >= 1" })
-  .max(65535, { message: "must be <= 65535" });
-
-const optionalString = z
-  .string()
-  .trim()
-  .optional()
-  .transform((value) => (value ? value : undefined));
-
-export const AgentConfigSchema = z
-  .object({
-    STELLAR_RPC_URL: rpcUrlSchema,
-    STELLAR_RPC_FALLBACK_URLS: optionalString,
-    STELLAR_NETWORK_PASSPHRASE: optionalString,
-    SECRET_KEY: secretKeySchema.optional(),
-    BUYER_SECRET: secretKeySchema.optional(),
-    SELLER_SECRET: secretKeySchema.optional(),
-    AGENT_IDENTITY_CONTRACT: publicKeySchema.optional(),
-    AGENTIC_COMMERCE_CONTRACT: publicKeySchema.optional(),
-    USDC_TOKEN_CONTRACT: publicKeySchema.optional(),
-    PORT: portSchema.optional(),
-    DEMO_MODE: z
-      .string()
-      .optional()
-      .transform((value) => value === "true"),
-  })
-  .superRefine((value, ctx) => {
-    if (value.DEMO_MODE) return;
-    if (!value.BUYER_SECRET && !value.SECRET_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["BUYER_SECRET"],
-        message: "is required unless DEMO_MODE=true or SECRET_KEY is set",
-      });
-    }
-    if (!value.SELLER_SECRET && !value.SECRET_KEY) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["SELLER_SECRET"],
-        message: "is required unless DEMO_MODE=true or SECRET_KEY is set",
-      });
-    }
-  });
-
-export type AgentConfig = z.infer<typeof AgentConfigSchema>;
-
-function formatIssues(issues: z.ZodIssue[]): string {
-  const rows = issues.map((issue) => {
-    const field = issue.path.length > 0 ? issue.path.join(".") : "(root)";
-    return { field, message: issue.message };
-  });
-  const fieldWidth = Math.max("VARIABLE".length, ...rows.map((row) => row.field.length));
-  const messageWidth = Math.max("ERROR".length, ...rows.map((row) => row.message.length));
-  const line = `+-${"-".repeat(fieldWidth)}-+-${"-".repeat(messageWidth)}-+`;
-  const formatRow = (field: string, message: string) =>
-    `| ${field.padEnd(fieldWidth)} | ${message.padEnd(messageWidth)} |`;
-  return [
-    line,
-    formatRow("VARIABLE", "ERROR"),
-    line,
-    ...rows.map((row) => formatRow(row.field, row.message)),
-    line,
-  ].join("\n");
-}
-
-function loadConfig(env: NodeJS.ProcessEnv): AgentConfig {
-  const result = AgentConfigSchema.safeParse(env);
-  if (!result.success) {
-    const table = formatIssues(result.error.issues);
-    throw new Error(`Invalid environment configuration:\n${table}`);
-  }
-  return result.data;
-}
-
-const env = loadConfig(process.env);
-
-export const rpcUrls: string[] = [
-  env.STELLAR_RPC_URL,
-  ...(env.STELLAR_RPC_FALLBACK_URLS ?? "")
-    .split(",")
-    .map((url) => url.trim())
-    .filter(Boolean),
-  TESTNET.rpcUrl,
-].filter((url, index, list) => Boolean(url) && list.indexOf(url) === index);
-
-export const cfg: MarcConfig = {
-  rpcUrl: rpcUrls[0],
-  networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE ?? TESTNET.networkPassphrase,
-  identityContract: env.AGENT_IDENTITY_CONTRACT ?? TESTNET.identityContract,
-  commerceContract: env.AGENTIC_COMMERCE_CONTRACT ?? TESTNET.commerceContract,
-  usdcToken: env.USDC_TOKEN_CONTRACT ?? TESTNET.usdcToken,
-};
-
-export const PORT: number | undefined = env.PORT;
-
-export { DEMO_MODE };
 
 export const buyerKeypair = DEMO_MODE
   ? Keypair.fromSecret(DEMO_BUYER_SECRET)

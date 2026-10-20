@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "tsx --watch server.ts",
     "start": "tsx server.ts",
-    "test": "tsx --test manifest.test.ts"
+    "test": "tsx --test manifest.test.ts monitor.test.ts",
+    "test:monitor": "tsx --test monitor.test.ts",
+    "agent:publish-metadata": "tsx publish-metadata.ts"
   },
   "dependencies": {
     "express": "^4.19.0",

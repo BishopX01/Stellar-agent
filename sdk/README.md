@@ -176,6 +176,25 @@ install link (`https://www.freighter.app/`) so apps can surface a helpful prompt
 | `network` | `"testnet" \| "pubnet"` | Network (default: `"testnet"`)                    |
 | `token`   | `string`                | Token contract address (defaults to testnet USDC) |
 
+The facilitator URL is selected from `network` via the exported
+`FACILITATOR_URLS` constant. An explicit `facilitatorUrl` always takes
+precedence (e.g. for a self-hosted facilitator).
+
+```typescript
+import { marcPaywall, FACILITATOR_URLS } from "marc-stellar-sdk";
+
+// Mainnet: uses FACILITATOR_URLS.mainnet automatically
+app.use(
+  "/api/summarize",
+  marcPaywall({
+    payTo: "GABC...",
+    price: "$0.01",
+    network: "stellar:pubnet",
+    facilitatorApiKey: process.env.FACILITATOR_KEY,
+  }),
+);
+```
+
 ### `marcFetch(opts)` — auto-paying fetch
 
 | Option               | Type                              | Description                                                                 |

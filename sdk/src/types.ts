@@ -149,6 +149,22 @@ export interface Job {
 }
 
 /**
+ * Optional arguments for `CommerceClient.createJob()`, `createJobAndWait()` and
+ * `approveAndCreateJob()` (#833).
+ *
+ * `slaDeadline` and `penaltyBpsPerHour` map to the contract's `create_job`
+ * SLA arguments (#716). Both default to zero, which disables the SLA penalty.
+ */
+export interface CreateJobOptions {
+  /** Optional transaction memo. */
+  memo?: string;
+  /** Unix timestamp (seconds) by which the deliverable is due. Encoded as `u64`. Default `0n`. */
+  slaDeadline?: bigint;
+  /** Penalty in basis points per overdue hour. Encoded as `u32`. Default `0`. */
+  penaltyBpsPerHour?: number;
+}
+
+/**
  * Configuration required by SDK clients (`IdentityClient`, `CommerceClient`).
  *
  * Specifies network, deployment, and RPC settings. Create once per network

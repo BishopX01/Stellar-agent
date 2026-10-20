@@ -11,8 +11,11 @@ import {
   makeSellerResponse,
   validatePrompt,
   isMockLlm,
+  registerGracefulShutdown,
+  createActiveTaskTracker,
   MOCK_DELIVERABLES,
-  loadAgentConfig,
+  initTracing,
+  withSpan,
 } from "../shared.js";
 
 const config = loadAgentConfig({
@@ -27,6 +30,8 @@ const AGENT_ID = "seller-researcher";
 const OUTPUT_DIR = path.join(AGENT_DIR, "output");
 const OUTPUT_FILE = path.join(OUTPUT_DIR, "research.json");
 
+initTracing(AGENT_ID);
+
 const { app, seller, cfg } = await createSellerAgent({
   id: AGENT_ID,
   port: PORT,
@@ -34,6 +39,7 @@ const { app, seller, cfg } = await createSellerAgent({
 });
 
 const startTime = Date.now();
+const activeTaskTracker = createActiveTaskTracker();
 let jobsActive = 0;
 let jobsCompleted = 0;
 let jobsFailed = 0;
@@ -98,14 +104,22 @@ async function generate(task: string, depth: ResearchDepth = "standard"): Promis
     return MOCK_DELIVERABLES.researcher;
   }
   const { sourceRange, detail } = DEPTH_CONFIG[depth];
-  const res = await callLlmWithRetry(
+  const res = await withSpan(
+    "llm.groq.chat.completions",
+    {
+      "llm.provider": "groq",
+      "llm.model": GROQ_MODEL,
+      "llm.research_depth": depth,
+    },
     () =>
-      groq!.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [
-          {
-            role: "user",
-            content: `You are a research analyst. Research the following topic and return ONLY valid JSON (no markdown, no code fences) with this exact schema:
+      callLlmWithRetry(
+        () =>
+          groq!.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [
+              {
+                role: "user",
+                content: `You are a research analyst. Research the following topic and return ONLY valid JSON (no markdown, no code fences) with this exact schema:
 {
   "summary": "research summary in markdown format",
   "sources": [
@@ -116,11 +130,12 @@ async function generate(task: string, depth: ResearchDepth = "standard"): Promis
 Research depth: ${depth}
 Include ${sourceRange} real, verifiable sources. Each source must have a real URL. The summary must cite sources by their index [1], [2], etc.
 ${detail}`,
-          },
-        ],
-      }),
-    3,
-    AGENT_ID,
+              },
+            ],
+          }),
+        3,
+        AGENT_ID,
+      ),
   );
   const text = res.choices[0].message.content ?? "";
   return JSON.parse(text.replace(/```(?:json)?\s*/gi, "").trim()) as ResearchOutput;
@@ -139,12 +154,40 @@ app.post("/job", limiter, async (req, res) => {
   const startedAt = Date.now();
   const { jobId, task, depth } = req.body;
 
+  await withSpan(
+    "http.server.job",
+    {
+      "http.method": "POST",
+      "http.route": "/job",
+      "agent.id": AGENT_ID,
+      "job.id": jobId != null ? String(jobId) : undefined,
+    },
+    () => handleJob(req, res, requestId, startedAt),
+  );
+});
+
+async function handleJob(
+  req: import("express").Request,
+  res: import("express").Response,
+  requestId: string,
+  startedAt: number,
+): Promise<void> {
+  const { jobId, task, depth } = req.body;
+
   console.log(
     `[${AGENT_ID}] [req:${requestId}] Incoming POST /job — headers: ${JSON.stringify({
       "content-type": req.headers["content-type"],
       "user-agent": req.headers["user-agent"],
       "x-forwarded-for": req.headers["x-forwarded-for"] ?? req.socket.remoteAddress,
-    })} — body: ${JSON.stringify(req.body)}`,
+    })} — body: ${
+      process.env.LOG_LEVEL === "debug"
+        ? JSON.stringify(req.body)
+        : JSON.stringify({
+            jobId,
+            taskLength: typeof task === "string" ? task.length : 0,
+            fields: Object.keys(req.body ?? {}).filter((k) => k !== "jobId" && k !== "task"),
+          })
+    }`,
   );
 
   if (!jobId || isNaN(Number(jobId))) {
@@ -173,7 +216,13 @@ app.post("/job", limiter, async (req, res) => {
   const resolvedDepth: ResearchDepth = ["brief", "standard", "deep"].includes(depth)
     ? depth
     : "standard";
-  console.log(`[${AGENT_ID}] Job #${jobId} (depth=${resolvedDepth}): ${task}`);
+  console.log(
+    `[${AGENT_ID}] Job #${jobId} (depth=${resolvedDepth}): ${
+      process.env.LOG_LEVEL === "debug"
+        ? task
+        : `task length ${typeof task === "string" ? task.length : 0}`
+    }`,
+  );
   const response = makeSellerResponse(
     { status: "accepted", jobId, depth: resolvedDepth },
     startedAt,
@@ -182,6 +231,7 @@ app.post("/job", limiter, async (req, res) => {
   res.json(response);
 
   jobsActive++;
+  const releaseTask = activeTaskTracker.track(`job:${jobId}`);
   try {
     console.log(`[${AGENT_ID}] Calling Groq...`);
     const research = await generate(task, resolvedDepth);
@@ -193,9 +243,14 @@ app.post("/job", limiter, async (req, res) => {
     );
 
     const commerce = new CommerceClient(cfg);
-    await retryWithBackoff(
-      () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
-      { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+    await withSpan(
+      "stellar.commerce.submit",
+      { "job.id": String(jobId), "stellar.operation": "submit" },
+      () =>
+        retryWithBackoff(
+          () => commerce.submit(seller, BigInt(jobId), `file://${path.resolve(OUTPUT_FILE)}`),
+          { maxAttempts: 5, baseDelayMs: 1000, label: AGENT_ID },
+        ),
     );
     console.log(`[${AGENT_ID}] ✓ Job #${jobId} submitted`);
     jobsCompleted++;
@@ -204,14 +259,9 @@ app.post("/job", limiter, async (req, res) => {
     console.error(`[${AGENT_ID}] Error:`, (err as Error).message);
   } finally {
     jobsActive--;
+    releaseTask();
   }
-});
+}
 
 const server = app.listen(PORT, () => console.log(`[${AGENT_ID}] Listening on :${PORT}`));
-const shutdown = () => {
-  console.log(`[${AGENT_ID}] Shutting down...`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+registerGracefulShutdown(server, activeTaskTracker, null, AGENT_ID);

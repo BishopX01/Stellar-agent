@@ -13,7 +13,7 @@ import {
 import type { Agent, MarcConfig, DelegateInfo } from "./types.js";
 import { BaseClient } from "./baseClient.js";
 import type { Signer } from "./signer.js";
-import { signerPublicKey } from "./signer.js";
+import { signerPublicKey, toSigner } from "./signer.js";
 import { isValidMetadataUri } from "./format.js";
 
 /**
@@ -182,9 +182,9 @@ export class IdentityClient extends BaseClient {
    * The contract requires authorization from both the current owner and the
    * new owner. Both keypairs are signed into the same transaction.
    *
-   * @param owner - The current owner's Keypair. Submits and signs the transaction.
+   * @param owner - The current owner's Signer. Submits and signs the transaction.
    * @param id - The agent ID to transfer.
-   * @param newOwner - The new owner's Keypair. Must also sign to accept ownership.
+   * @param newOwner - The new owner's Signer. Must also sign to accept ownership.
    * @returns A promise that resolves when the ownership transfer is confirmed on-chain.
    * @throws {Error} If either signature is invalid or the transaction fails.
    *
@@ -193,12 +193,12 @@ export class IdentityClient extends BaseClient {
    * await identity.updateOwner(currentOwnerKeypair, 42n, newOwnerKeypair);
    * ```
    */
-  async updateOwner(owner: Keypair, id: bigint, newOwner: Keypair): Promise<void> {
+  async updateOwner(owner: Signer, id: bigint, newOwner: Signer): Promise<void> {
     const op = this.contract.call(
       "update_owner",
-      new Address(owner.publicKey()).toScVal(),
+      new Address(signerPublicKey(owner)).toScVal(),
       nativeToScVal(id, { type: "u64" }),
-      new Address(newOwner.publicKey()).toScVal(),
+      new Address(signerPublicKey(newOwner)).toScVal(),
     );
     await this.invokeMultiSig(owner, newOwner, op, "identity");
   }
@@ -209,7 +209,7 @@ export class IdentityClient extends BaseClient {
    * This action is irreversible. The agent ID will no longer be resolvable
    * after deregistration.
    *
-   * @param owner - The current owner's Keypair (must match the on-chain owner address).
+   * @param owner - The current owner's Signer (must match the on-chain owner address).
    * @param id - The agent ID to deregister.
    * @returns A promise that resolves when the deregistration is confirmed on-chain.
    * @throws {Error} If the signer is not the agent's owner, or on network failure.
@@ -453,14 +453,16 @@ export class IdentityClient extends BaseClient {
 
   // --- internals ---
 
-  /** Submit a transaction signed by two keypairs (old owner + new owner). */
+  /** Submit a transaction signed by two signers (old owner + new owner). */
   private async invokeMultiSig(
-    signer1: Keypair,
-    signer2: Keypair,
+    signer1: Signer,
+    signer2: Signer,
     op: xdr.Operation,
     txLabel: string,
   ): Promise<void> {
-    const account = await this.server.getAccount(signer1.publicKey());
+    const s1 = toSigner(signer1);
+    const s2 = toSigner(signer2);
+    const account = await this.server.getAccount(signerPublicKey(s1));
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase: this.cfg.networkPassphrase,
@@ -469,8 +471,8 @@ export class IdentityClient extends BaseClient {
       .setTimeout(30)
       .build();
     const prepared = await this.server.prepareTransaction(tx);
-    prepared.sign(signer1);
-    prepared.sign(signer2);
+    await s1.sign(prepared);
+    await s2.sign(prepared);
     const sent = await this.server.sendTransaction(prepared);
     if (sent.status === "ERROR") throw new Error(`submit failed: ${sent.errorResult}`);
     let getResp = await this.server.getTransaction(sent.hash);

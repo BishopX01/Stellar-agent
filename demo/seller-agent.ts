@@ -9,6 +9,12 @@ import {
   TESTNET,
   type MarcConfig,
 } from "marc-stellar-sdk";
+import {
+  initTracing,
+  startServerSpan,
+  type RemoteSigner,
+  createRemoteSignerFromEnv,
+} from "marc-stellar-sdk/observability";
 
 const cfg: MarcConfig = {
   rpcUrl: process.env.STELLAR_RPC_URL ?? TESTNET.rpcUrl,
@@ -33,7 +39,35 @@ const readTimeoutSecs = (): number => {
 
 const txTimeoutSecs = readTimeoutSecs();
 
-const seller = Keypair.fromSecret(process.env.SELLER_SECRET!);
+// Initialize OpenTelemetry tracing (issue #726). No-op unless OTEL_EXPORTER_OTLP_ENDPOINT
+// (or OTEL_TRACES_EXPORTER) is configured; exports spans via OTLP to Jaeger / Tempo.
+initTracing({ serviceName: process.env.OTEL_SERVICE_NAME ?? "marc-seller-agent" });
+
+/**
+ * Resolve the seller signer (issue #727).
+ *
+ * When a remote signer is configured (AWS KMS / HashiCorp Vault), the agent
+ * never holds a plaintext secret key in memory. Falling back to
+ * `Keypair.fromSecret` is only permitted in local/demo mode.
+ */
+const resolveSellerSigner = (): Keypair | RemoteSigner => {
+  const remote = createRemoteSignerFromEnv();
+  if (remote) {
+    console.log(`Signer: remote (${remote.constructor.name})`);
+    return remote;
+  }
+  const secret = process.env.SELLER_SECRET;
+  if (!secret) {
+    throw new Error(
+      "No signer configured: set a remote signer (AWS KMS / Vault) or SELLER_SECRET for local demo mode",
+    );
+  }
+  console.log(`Signer: local Keypair (demo mode — plaintext secret in memory)`);
+  return Keypair.fromSecret(secret);
+};
+
+const seller = resolveSellerSigner();
+const sellerPublicKey = "publicKey" in seller ? seller.publicKey() : seller.publicKey();
 
 const jobIdRaw = process.env.JOB_ID;
 if (jobIdRaw !== undefined && !/^\d+$/.test(jobIdRaw)) {
@@ -58,7 +92,7 @@ const getServicePrice = (req?: express.Request): string => {
 const servicePrice: string = getServicePrice();
 
 console.log(`\n=== SELLER DEMO ===`);
-console.log(`Seller: ${seller.publicKey()}`);
+console.log(`Seller: ${sellerPublicKey}`);
 console.log(`Transaction timeout: ${txTimeoutSecs}s (TX_TIMEOUT_SECS or --timeout-sec)`);
 console.log(
   `Default service price: ${servicePrice} (configurable via SELLER_SERVICE_PRICE env var or ?price= query param)\n`,
@@ -66,7 +100,7 @@ console.log(
 
 // Step 1: Register agent identity
 const identity = new IdentityClient(cfg);
-let agentId = await identity.agentOf(seller.publicKey());
+let agentId = await identity.agentOf(sellerPublicKey);
 if (!agentId) {
   agentId = await identity.register(seller, "ipfs://seller-metadata.json", { timeoutSecs: txTimeoutSecs });
   console.log(`[1] Registered on-chain as agent #${agentId}`);
@@ -78,10 +112,21 @@ if (!agentId) {
 const app = express();
 app.use(cors());
 
+// Server span per inbound request (issue #726). The span is continued from the
+// incoming `traceparent` header so buyer → seller traces correlate end-to-end.
+app.use((req, res, next) => {
+  const span = startServerSpan(req.method, req.path, req.headers);
+  res.on("finish", () => {
+    span.setAttribute("http.status_code", res.statusCode);
+    span.end();
+  });
+  next();
+});
+
 app.use(
   "/api/work",
   marcPaywall({
-    payTo: seller.publicKey(),
+    payTo: sellerPublicKey,
     price: servicePrice, // ← driven by env var, not hardcoded
     network: "stellar:testnet",
     token: cfg.usdcToken,
@@ -93,7 +138,7 @@ app.use(
 
 app.get("/api/work", (_req, res) => {
   console.log(`[2] Work request received — payment verified`);
-  res.json({ result: `Report #${Date.now()}`, seller: seller.publicKey() });
+  res.json({ result: `Report #${Date.now()}`, seller: sellerPublicKey });
 });
 
 const port = Number(process.env.SELLER_PORT ?? 4402);

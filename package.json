@@ -22,16 +22,27 @@
     "test:rust": "cargo test --workspace",
     "test:ts": "npm run test --workspaces --if-present",
     "test:react": "npm run test --workspace packages/react",
+    "state:dump": "tsx scripts/state-dump.ts",
+    "gas:check": "tsx scripts/measure-gas.ts",
+    "gas:update": "tsx scripts/measure-gas.ts --update",
     "prepare": "husky"
   },
   "lint-staged": {
     "*.{css,html,js,json,md,ts,tsx}": "prettier --write"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.52.1",
+    "@opentelemetry/resources": "^1.25.1",
+    "@opentelemetry/sdk-trace-node": "^1.25.1",
+    "@opentelemetry/semantic-conventions": "^1.25.1"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.8.1",
     "@commitlint/config-conventional": "^19.8.1",
     "husky": "^9.0.11",
     "lint-staged": "^15.5.2",
-    "prettier": "^3.3.0"
+    "prettier": "^3.3.0",
+    "tsx": "^4.19.2"
   }
 }
