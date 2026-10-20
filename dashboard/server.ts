@@ -50,6 +50,7 @@ import {
 } from "./lib/matchmaking.js";
 import { SlidingWindowRateLimiter } from "./lib/rateLimiter.js";
 import { IssuedChallengeStore } from "./lib/authChallenges.js";
+import { parseAllowedOrigins } from "./lib/origins.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getReadOnlyDb } from "../../indexer/src/db.js";
 import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
@@ -448,12 +449,7 @@ async function warmMatchmakingIndex(): Promise<void> {
   }
 }
 
-const allowedOrigins = [
-  "http://localhost:3000",
-  "http://localhost:5173",
-  process.env.ALLOWED_ORIGIN,
-  ...(process.env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()),
-].filter(Boolean) as string[];
+const allowedOrigins = parseAllowedOrigins(process.env);
 
 // ── #722: Sliding-window rate limiter for mutating API endpoints ─────────────
 // Tracks request timestamps per key (IP + optional wallet) in a sliding window,
