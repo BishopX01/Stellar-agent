@@ -52,6 +52,7 @@ import { SlidingWindowRateLimiter } from "./lib/rateLimiter.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getReadOnlyDb } from "../../indexer/src/db.js";
 import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
+import { matchesJobEvent } from "./lib/jobEvents.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -1287,12 +1288,56 @@ app.get("/api/admin/audit", requireAuth, (req, res) => {
   }
 });
 
+// ── #821: GET /api/jobs/:id/events — SSE stream for a single job ─────────────
+app.get("/api/jobs/:id/events", (req, res) => {
+  const parsedId = numericIdParamSchema.safeParse(req.params);
+  if (!parsedId.success) {
+    res.status(400).json({ error: "Invalid job ID" });
+    return;
+  }
+  const jobId = parsedId.data.id;
+  const contractId = getRequestNetwork(req).commerceContract;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const send = (event: string, data: unknown, id?: string) => {
+    if (id) res.write(`id: ${id}\n`);
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+  send("hello", { message: "connected", jobId: jobId.toString() });
+
+  const onEvent = (event: SorobanEvent) => {
+    if (matchesJobEvent(event, contractId, jobId)) {
+      const eventType = String(event.event_type ?? event.eventType ?? "event");
+      send(eventType, event, event.id === undefined ? undefined : String(event.id));
+    }
+  };
+  eventHub.on("event", onEvent);
+
+  const heartbeat = setInterval(() => {
+    res.write(`event: ping\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
+  }, SSE_HEARTBEAT_MS);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    eventHub.off("event", onEvent);
+  });
+});
+
 // ── #719: GET /api/events/stream — SSE stream of newly indexed events ────────
 // Supports filtering by contract, event_type, and address topic. Clients may
 // resume after a reconnect by sending Last-Event-ID; buffered events newer than
 // that id are replayed before live streaming resumes.
 app.get("/api/events/stream", (req, res) => {
-  const filter = parseEventFilter(req.query as Record<string, unknown>);
+  const filter = parseEventFilter({
+    ...req.query,
+    eventType: req.query.eventType ?? req.query.filter,
+  } as Record<string, unknown>);
   const lastEventId = req.header("last-event-id") ?? (req.query.lastEventId as string | undefined);
 
   res.setHeader("Content-Type", "text/event-stream");
