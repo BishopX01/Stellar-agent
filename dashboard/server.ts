@@ -49,6 +49,7 @@ import {
   type AgentDocument,
 } from "./lib/matchmaking.js";
 import { SlidingWindowRateLimiter } from "./lib/rateLimiter.js";
+import { IssuedChallengeStore } from "./lib/authChallenges.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getReadOnlyDb } from "../../indexer/src/db.js";
 import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
@@ -746,6 +747,11 @@ const SEP10_SERVER_KEYPAIR = process.env.SEP10_SERVER_SECRET
 const SEP10_HOME_DOMAIN = process.env.SEP10_HOME_DOMAIN ?? "localhost";
 const SEP10_WEB_AUTH_DOMAIN = process.env.SEP10_WEB_AUTH_DOMAIN ?? SEP10_HOME_DOMAIN;
 const SEP10_CHALLENGE_TIMEOUT_SECONDS = 300;
+const challengeRateLimiter = new SlidingWindowRateLimiter({
+  limit: 10,
+  windowMs: 60_000,
+});
+const issuedChallenges = new IssuedChallengeStore({ ttlMs: 5 * 60_000 });
 
 /**
  * GET /api/auth/challenge — Issue a SEP-0010 challenge transaction.
@@ -753,16 +759,30 @@ const SEP10_CHALLENGE_TIMEOUT_SECONDS = 300;
  * Returns the base64 challenge XDR for the wallet to sign.
  */
 app.get("/api/auth/challenge", async (req, res) => {
+  const rate = challengeRateLimiter.check(req.ip || "unknown");
+  res.setHeader("X-RateLimit-Limit", String(rate.limit));
+  res.setHeader("X-RateLimit-Remaining", String(rate.remaining));
+  if (!rate.allowed) {
+    res.setHeader("Retry-After", String(rate.retryAfterSeconds));
+    res.status(429).json({ error: "challenge rate limit exceeded" });
+    return;
+  }
+
   try {
     const publicKeySchema = z.object({
       publicKey: stellarAddressSchema,
     });
     const parsed = publicKeySchema.parse(req.query);
-    const account = await tracedRpc(
-      "getAccount",
-      { "rpc.method": "getAccount", "stellar.account": parsed.publicKey },
-      () => withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey)),
-    );
+    try {
+      await tracedRpc(
+        "getAccount",
+        { "rpc.method": "getAccount", "stellar.account": parsed.publicKey },
+        () => withRpcFallback((rpcServer) => rpcServer.getAccount(parsed.publicKey)),
+      );
+    } catch {
+      res.status(400).json({ error: "Unable to verify Stellar account" });
+      return;
+    }
     const challengeTx = Utils.buildChallengeTx(
       SEP10_SERVER_KEYPAIR,
       parsed.publicKey,
@@ -772,9 +792,7 @@ app.get("/api/auth/challenge", async (req, res) => {
       SEP10_WEB_AUTH_DOMAIN,
       cfg.networkPassphrase === Networks.PUBLIC ? undefined : cfg.networkPassphrase,
     );
-    // buildChallengeTx builds its own sequence number; the account lookup above
-    // validates the account exists on-chain before issuing a challenge.
-    void account;
+    issuedChallenges.issue(challengeTx.hash().toString("hex"));
     res.json({
       transaction: challengeTx.toXDR(),
       network_passphrase: cfg.networkPassphrase,
@@ -796,6 +814,23 @@ app.post("/api/auth/token", (req, res) => {
     });
     const parsed = authSchema.parse(req.body);
 
+    let challengeHash: string;
+    try {
+      challengeHash = TransactionBuilder.fromXDR(
+        parsed.transaction,
+        cfg.networkPassphrase,
+      )
+        .hash()
+        .toString("hex");
+    } catch {
+      res.status(401).json({ error: "Invalid or expired challenge transaction" });
+      return;
+    }
+    if (!issuedChallenges.has(challengeHash)) {
+      res.status(401).json({ error: "Invalid or expired challenge transaction" });
+      return;
+    }
+
     let clientPublicKey: string;
     try {
       clientPublicKey = Utils.verifyChallengeTx(
@@ -807,6 +842,11 @@ app.post("/api/auth/token", (req, res) => {
       );
     } catch (err: unknown) {
       res.status(401).json({ error: `Invalid challenge transaction: ${(err as Error).message}` });
+      return;
+    }
+
+    if (!issuedChallenges.consume(challengeHash)) {
+      res.status(401).json({ error: "Invalid or expired challenge transaction" });
       return;
     }
 
