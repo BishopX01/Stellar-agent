@@ -1608,16 +1608,18 @@ impl AgenticCommerceContract {
         // Refund only the net (unreleased) portion of the budget so the
         // contract never transfers more than it actually holds for this job.
         let net_budget = job.budget - job.released;
-        if net_budget > 0 {
-            let token_client = token::TokenClient::new(&env, &job.token);
-            let contract_addr = env.current_contract_address();
-            token_client.transfer(&contract_addr, &job.client, &net_budget);
-        }
+        // Persist settlement before the external token call; failures roll back atomically.
         job.released = job.budget; // mark everything as settled
         job.status = JobStatus::Cancelled;
         job.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Job(id), &job);
         env.storage().persistent().remove(&DataKey::Evaluators(id));
+
+        if net_budget > 0 {
+            let token_client = token::TokenClient::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.client, &net_budget);
+        }
 
         JobCancelled {
             client: caller,
@@ -2286,16 +2288,18 @@ impl AgenticCommerceContract {
         }
         // Refund only the net (unreleased) portion to avoid over-transfer.
         let net_budget = job.budget - job.released;
-        if net_budget > 0 {
-            let token_client = token::TokenClient::new(&env, &job.token);
-            let contract_addr = env.current_contract_address();
-            token_client.transfer(&contract_addr, &job.client, &net_budget);
-        }
+        // Persist settlement before the external token call; failures roll back atomically.
         job.released = job.budget;
         job.status = JobStatus::Cancelled;
         job.updated_at = now;
         env.storage().persistent().set(&DataKey::Job(id), &job);
         env.storage().persistent().remove(&DataKey::Evaluators(id));
+
+        if net_budget > 0 {
+            let token_client = token::TokenClient::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.client, &net_budget);
+        }
 
         JobRefunded {
             client: caller,
@@ -2660,16 +2664,18 @@ impl AgenticCommerceContract {
             panic!("not a milestone job");
         }
         let net_budget = job.budget - job.released;
+        let refund = net_budget;
+        // Persist settlement before the external token call; failures roll back atomically.
+        job.released = job.budget;
+        job.status = JobStatus::Cancelled;
+        job.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::Job(job_id), &job);
+
         if net_budget > 0 {
             let token_client = token::TokenClient::new(&env, &job.token);
             let contract_addr = env.current_contract_address();
             token_client.transfer(&contract_addr, &job.client, &net_budget);
         }
-        let refund = net_budget;
-        job.released = job.budget;
-        job.status = JobStatus::Cancelled;
-        job.updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&DataKey::Job(job_id), &job);
 
         MilestonesPartialCancelled {
             client: caller,
