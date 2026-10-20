@@ -233,8 +233,10 @@ const BPS_DENOM: i128 = 10_000;
 const SECS_PER_HOUR: u64 = 60 * 60;
 const MAX_SLA_PENALTY_BPS: u32 = 5_000; // 50%
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
-/// #25 — minimum budget to prevent zero/dust jobs that waste storage and spam events.
-const MIN_BUDGET: i128 = 1;
+const DEFAULT_TOKEN_DECIMALS: u32 = 7;
+const MAX_TOKEN_DECIMALS: u32 = 38;
+/// Keep the existing minimum for payment channels; the one-token floor is for jobs.
+const MIN_CHANNEL_DEPOSIT: i128 = 1;
 /// #619 — maximum deliverable URI length to prevent storage griefing.
 const MAX_DELIVERABLE_LEN: u32 = 1024;
 /// #706 — maximum metadata URI length accepted alongside a content hash.
@@ -492,6 +494,22 @@ pub struct AgenticCommerceContract;
 // ---------------------------------------------------------------------------
 
 impl AgenticCommerceContract {
+    fn require_minimum_job_budget(env: &Env, token: &Address, budget: i128) {
+        let token_info: Option<TokenInfo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedToken(token.clone()));
+        let decimals = token_info
+            .map(|info| info.decimals)
+            .unwrap_or(DEFAULT_TOKEN_DECIMALS);
+        let minimum = 10_i128
+            .checked_pow(decimals)
+            .unwrap_or_else(|| panic!("token decimals too high"));
+        if budget < minimum {
+            panic!("budget below minimum");
+        }
+    }
+
     /// Panics with `ContractPaused` if the `Paused` flag is set. Call this at
     /// the top of every state-changing entry point (#29).
     fn require_not_paused(env: &Env) {
@@ -749,10 +767,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        // #25 — reject zero/dust budgets that waste storage and emit spam events.
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         let multi_eval_threshold: i128 = env
             .storage()
             .instance()
@@ -867,7 +882,7 @@ impl AgenticCommerceContract {
     /// # Panics
     /// - `BatchTooLarge` if `requests` is empty or longer than `MAX_BATCH_SIZE`.
     /// - `SelfEscrow` / `InvalidParties` / `UnsupportedToken` for invalid requests.
-    /// - `"budget below minimum"` if any request's budget is below `MIN_BUDGET`.
+    /// - `"budget below minimum"` if any request's budget is below one whole token.
     pub fn batch_create_jobs(
         env: Env,
         client: Address,
@@ -907,9 +922,7 @@ impl AgenticCommerceContract {
         let mut index = 0u32;
         while index < requests.len() {
             let req = requests.get(index).unwrap();
-            if req.budget < MIN_BUDGET {
-                panic!("budget below minimum");
-            }
+            Self::require_minimum_job_budget(&env, &req.token, req.budget);
             if req.budget > multi_eval_threshold {
                 panic!("high-value job requires multiple evaluators");
             }
@@ -1041,9 +1054,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         let multi_eval_threshold: i128 = env
             .storage()
             .instance()
@@ -1188,9 +1199,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         let multi_eval_threshold: i128 = env
             .storage()
             .instance()
@@ -1718,6 +1727,9 @@ impl AgenticCommerceContract {
         if admin != current_admin {
             panic_with_error!(&env, Error::NotAdmin);
         }
+        if decimals > MAX_TOKEN_DECIMALS {
+            panic!("token decimals too high");
+        }
         // Normalization factor: if decimals <= 7, factor = 10^(7 - decimals); else 1.
         let normalization_factor: i128 = if decimals <= 7 {
             let exp = 7u32 - decimals;
@@ -2048,7 +2060,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if deposit < MIN_BUDGET {
+        if deposit < MIN_CHANNEL_DEPOSIT {
             panic!("deposit below minimum");
         }
         if payer == provider {
@@ -2398,9 +2410,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         if milestones.is_empty() || milestones.len() > 20 {
             panic!("milestones must contain between 1 and 20 entries");
         }
