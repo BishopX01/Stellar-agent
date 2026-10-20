@@ -48,6 +48,7 @@ import {
   type MatchmakingEngine,
   type AgentDocument,
 } from "./lib/matchmaking.js";
+import { SlidingWindowRateLimiter } from "./lib/rateLimiter.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getReadOnlyDb } from "../../indexer/src/db.js";
 import { eventHub, type SorobanEvent } from "../../indexer/src/events.js";
@@ -457,104 +458,6 @@ const allowedOrigins = [
 // which avoids the boundary-bursting problem of fixed-window counters. Expired
 // entries are pruned periodically so memory stays bounded under many distinct
 // IP probes.
-export type SlidingWindowResult = {
-  allowed: boolean;
-  limit: number;
-  remaining: number;
-  /** Seconds until the oldest in-window request expires (0 when allowed). */
-  retryAfterSeconds: number;
-};
-
-export class SlidingWindowRateLimiter {
-  private readonly buckets = new Map<string, number[]>();
-  private readonly limit: number;
-  private readonly windowMs: number;
-  private readonly pruneIntervalMs: number;
-  private pruneTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly now: () => number;
-
-  constructor(options: {
-    limit: number;
-    windowMs: number;
-    pruneIntervalMs?: number;
-    now?: () => number;
-  }) {
-    this.limit = Math.max(1, Math.floor(options.limit));
-    this.windowMs = Math.max(1, Math.floor(options.windowMs));
-    this.pruneIntervalMs = Math.max(1, Math.floor(options.pruneIntervalMs ?? 5 * 60_000));
-    this.now = options.now ?? Date.now;
-    this.startPruning();
-  }
-
-  /** Record a request for `key` and report whether it is allowed. */
-  check(key: string): SlidingWindowResult {
-    const now = this.now();
-    const windowStart = now - this.windowMs;
-    let timestamps = this.buckets.get(key);
-    if (!timestamps) {
-      timestamps = [];
-      this.buckets.set(key, timestamps);
-    }
-    // Drop timestamps that have fallen out of the sliding window.
-    let expired = 0;
-    while (expired < timestamps.length && timestamps[expired] <= windowStart) {
-      expired += 1;
-    }
-    if (expired > 0) timestamps.splice(0, expired);
-
-    if (timestamps.length >= this.limit) {
-      const oldest = timestamps[0];
-      const retryAfterMs = Math.max(0, oldest + this.windowMs - now);
-      return {
-        allowed: false,
-        limit: this.limit,
-        remaining: 0,
-        retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
-      };
-    }
-
-    timestamps.push(now);
-    return {
-      allowed: true,
-      limit: this.limit,
-      remaining: Math.max(0, this.limit - timestamps.length),
-      retryAfterSeconds: 0,
-    };
-  }
-
-  /** Remove all keys whose timestamps have fully expired. */
-  prune(): void {
-    const windowStart = this.now() - this.windowMs;
-    for (const [key, timestamps] of this.buckets) {
-      let expired = 0;
-      while (expired < timestamps.length && timestamps[expired] <= windowStart) {
-        expired += 1;
-      }
-      if (expired > 0) timestamps.splice(0, expired);
-      if (timestamps.length === 0) this.buckets.delete(key);
-    }
-  }
-
-  /** Number of tracked keys (exposed for tests / metrics). */
-  size(): number {
-    return this.buckets.size;
-  }
-
-  /** Stop the background pruning timer. */
-  stop(): void {
-    if (this.pruneTimer) {
-      clearInterval(this.pruneTimer);
-      this.pruneTimer = null;
-    }
-  }
-
-  private startPruning(): void {
-    this.pruneTimer = setInterval(() => this.prune(), this.pruneIntervalMs);
-    // Do not keep the Node.js event loop alive solely for pruning.
-    this.pruneTimer.unref?.();
-  }
-}
-
 const MUTATING_RATE_LIMIT = Number(process.env.MUTATING_RATE_LIMIT ?? 30);
 const MUTATING_RATE_WINDOW_MS = Number(process.env.MUTATING_RATE_WINDOW_MS ?? 60_000);
 
