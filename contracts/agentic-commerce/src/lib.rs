@@ -1,5 +1,9 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token, Address, Env, String, Vec};
+#![allow(clippy::too_many_arguments)]
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    Address, Env, IntoVal, String, Vec,
+};
 
 /// Contract-level error codes for agentic-commerce (#323, #541).
 #[contracterror]
@@ -28,6 +32,10 @@ pub enum Error {
     /// #706 — the evaluator-asserted deliverable content hash does not match
     /// the hash committed by the provider at submission time.
     HashMismatch = 11,
+    /// The supplied batch is empty or exceeds the maximum supported size.
+    BatchTooLarge = 12,
+    /// A swap did not deliver the expected output within the authorized input.
+    SlippageExceeded = 13,
 }
 
 /// Lifecycle states for a job escrow.
@@ -222,6 +230,8 @@ enum DataKey {
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
 const MAX_FEE_BPS: u32 = 500; // 5% hard cap
 const BPS_DENOM: i128 = 10_000;
+const SECS_PER_HOUR: u64 = 60 * 60;
+const MAX_SLA_PENALTY_BPS: u32 = 5_000; // 50%
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 /// #25 — minimum budget to prevent zero/dust jobs that waste storage and spam events.
 const MIN_BUDGET: i128 = 1;
@@ -337,17 +347,6 @@ pub struct JobDisputed {
     #[topic]
     pub client: Address,
     pub job_id: u64,
-    pub timestamp: u64,
-}
-
-/// Emitted when a provider claims payment after the evaluator timeout has passed (#18).
-#[contractevent]
-pub struct JobExpired {
-    #[topic]
-    pub provider: Address,
-    pub job_id: u64,
-    pub payout: i128,
-    pub fee: i128,
     pub timestamp: u64,
 }
 
@@ -551,10 +550,8 @@ impl AgenticCommerceContract {
         }
         let overdue_secs = job.submitted_at - job.sla_deadline;
         // Round up to at least one full hour for any partial hour overdue.
-        let overdue_hours = (overdue_secs + SECS_PER_HOUR - 1) / SECS_PER_HOUR;
-        let raw_bps = overdue_hours
-            .checked_mul(job.penalty_bps_per_hour as u64)
-            .unwrap_or(u64::MAX);
+        let overdue_hours = overdue_secs.div_ceil(SECS_PER_HOUR);
+        let raw_bps = overdue_hours.saturating_mul(job.penalty_bps_per_hour as u64);
         let penalty_bps = if raw_bps > MAX_SLA_PENALTY_BPS as u64 {
             MAX_SLA_PENALTY_BPS
         } else {
@@ -775,7 +772,11 @@ impl AgenticCommerceContract {
         // #694 — reject tokens not on the approved whitelist.
         // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
         // is skipped so the contract can still be used before whitelist setup.
-        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
             let list: Vec<Address> = env
                 .storage()
                 .instance()
@@ -920,7 +921,11 @@ impl AgenticCommerceContract {
             }
             // #694 — reject tokens not on the approved whitelist. If no tokens
             // have been whitelisted yet the check is skipped, matching create_job.
-            if env.storage().instance().has(&DataKey::AllowedToken(req.token.clone())) == false {
+            if !env
+                .storage()
+                .instance()
+                .has(&DataKey::AllowedToken(req.token.clone()))
+            {
                 let list: Vec<Address> = env
                     .storage()
                     .instance()
@@ -985,10 +990,14 @@ impl AgenticCommerceContract {
                 status: JobStatus::Funded,
                 description: req.description,
                 deliverable: String::from_str(&env, ""),
+                deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
                 funded_at: now,
                 created_at: now,
                 updated_at: now,
                 fee_bps: snapshotted_fee_bps, // #23
+                sla_deadline: 0,
+                penalty_bps_per_hour: 0,
+                submitted_at: 0,
             };
             env.storage().persistent().set(&DataKey::Job(id), &job);
             job_ids.push_back(id);
@@ -1072,7 +1081,11 @@ impl AgenticCommerceContract {
         // #694 — reject tokens not on the approved whitelist.
         // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
         // is skipped so the contract can still be used before whitelist setup.
-        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
             let list: Vec<Address> = env
                 .storage()
                 .instance()
@@ -1231,7 +1244,11 @@ impl AgenticCommerceContract {
         // #694 — reject tokens not on the approved whitelist.
         // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
         // is skipped so the contract can still be used before whitelist setup.
-        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
             let list: Vec<Address> = env
                 .storage()
                 .instance()
@@ -1270,10 +1287,14 @@ impl AgenticCommerceContract {
             status: JobStatus::Funded,
             description,
             deliverable: String::from_str(&env, ""),
+            deliverable_hash: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
             funded_at: now,
             created_at: now,
             updated_at: now,
             fee_bps,
+            sla_deadline: 0,
+            penalty_bps_per_hour: 0,
+            submitted_at: 0,
         };
         env.storage().persistent().set(&DataKey::Job(next), &job);
         env.storage().persistent().set(
@@ -1413,6 +1434,8 @@ impl AgenticCommerceContract {
         }
         // #23 — use the fee_bps snapshotted at job creation time so admin
         // changes to the global rate don't retroactively alter this job.
+        let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(&job);
+        let penalized_budget = job.budget - penalty;
         let fee: i128 = Self::compute_fee(penalized_budget, job.fee_bps);
         let payout: i128 = penalized_budget - fee;
 

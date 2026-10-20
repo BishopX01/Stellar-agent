@@ -254,7 +254,9 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
     );
 
     let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    client.submit(&seller, &id, &deliverable, &sample_hash(&env));
+    assert!(deliverable.len() <= MAX_DELIVERABLE_LEN);
+    let oversized = String::from_bytes(&env, &[b'a'; MAX_DELIVERABLE_LEN as usize + 1]);
+    client.submit(&seller, &id, &oversized, &sample_hash(&env));
 }
 
 #[test]
@@ -284,7 +286,7 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
         &String::from_str(&env, "ipfs://work.json"),
         &hash,
     );
-    client.complete(&buyer, &id, &hash);
+    client.complete(&buyer, &id, &Some(hash));
 
     let expected_event = JobCompleted {
         evaluator: buyer.clone(),
@@ -337,7 +339,7 @@ fn complete_rejects_non_evaluator() {
         &String::from_str(&env, "ipfs://work.json"),
         &hash,
     );
-    client.complete(&mallory, &id, &hash);
+    client.complete(&mallory, &id, &Some(hash));
 }
 
 #[test]
@@ -608,8 +610,8 @@ fn complete_panics_on_double_complete() {
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-    client.complete(&buyer, &id, &hash); // first complete — OK
-    client.complete(&buyer, &id, &hash); // second complete — must panic
+    client.complete(&buyer, &id, &Some(hash.clone())); // first complete — OK
+    client.complete(&buyer, &id, &Some(hash)); // second complete — must panic
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +642,7 @@ fn complete_panics_when_called_by_non_evaluator() {
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
     // impostor is neither buyer nor seller — must be rejected
-    client.complete(&impostor, &id, &hash);
+    client.complete(&impostor, &id, &Some(hash));
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +721,7 @@ fn complete_panics_with_job_not_found_for_unknown_id() {
     env.mock_all_auths();
     let (client, _admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
-    client.complete(&buyer, &9999u64, &sample_hash(&env));
+    client.complete(&buyer, &9999u64, &Some(sample_hash(&env)));
 }
 
 /// cancel() on a non-existent job id must panic with JobNotFound (#5).
@@ -962,7 +964,7 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-    client.complete(&buyer, &id, &hash);
+    client.complete(&buyer, &id, &Some(hash));
 
     // 5% fee → fee = 5_000, payout = 95_000
     assert_eq!(token.balance(&seller), 95_000);
@@ -1004,3 +1006,12 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+    client.complete(&buyer, &id, &Some(hash));
+
+    assert_eq!(token.balance(&seller), budget);
+    assert_eq!(token.balance(&treasury), 0);
+    assert_eq!(token.balance(&client.address), 0);
+
+    let job = client.get_job(&id).unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
+}
