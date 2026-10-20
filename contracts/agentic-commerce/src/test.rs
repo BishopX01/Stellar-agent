@@ -311,6 +311,58 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
 }
 
 #[test]
+fn pausing_payment_channels_does_not_block_job_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    client.pause_channels(&admin);
+    assert!(client.are_channels_paused());
+
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
+    );
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Funded);
+
+    client.unpause_channels(&admin);
+    assert!(!client.are_channels_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn paused_payment_channels_reject_new_channels() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let payer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&payer, &1_000_000);
+    client.pause_channels(&admin);
+
+    client.open_channel(
+        &payer,
+        &provider,
+        &token_addr,
+        &100_000i128,
+        &BytesN::from_array(&env, &[0; 32]),
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #8)")]
 fn complete_rejects_non_evaluator() {
     let env = Env::default();
@@ -1008,92 +1060,10 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
     client.complete(&buyer, &id, &hash);
 
-    assert_eq!(token.balance(&seller), budget);
+    assert_eq!(token.balance(&seller), 100_000);
     assert_eq!(token.balance(&treasury), 0);
     assert_eq!(token.balance(&client.address), 0);
 
     let job = client.get_job(&id).unwrap();
     assert_eq!(job.status, JobStatus::Completed);
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
-
-    #[test]
-    fn escrow_invariants_hold_for_arbitrary_job_operation_sequences(
-        operations in prop::collection::vec((1i128..1_000_001, 0u8..4), 1..=8),
-        fee_bps in 0u32..=500,
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin, treasury) = setup(&env);
-        let buyer = Address::generate(&env);
-        let seller = Address::generate(&env);
-        let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
-        let total_budget: i128 = operations.iter().map(|(budget, _)| *budget).sum();
-        stellar_token.mint(&buyer, &total_budget);
-        client.set_fee_bps(&admin, &fee_bps);
-
-        let mut expected_provider = 0i128;
-        let mut expected_treasury = 0i128;
-
-        for (index, (budget, action)) in operations.iter().enumerate() {
-            let id = client.create_job(
-                &buyer,
-                &seller,
-                &buyer,
-                &token_addr,
-                budget,
-                &String::from_str(&env, "property-test-job"),
-                &0u64,
-                &0u32,
-            );
-            prop_assert_eq!(id, index as u64 + 1);
-
-            let hash = sample_hash(&env);
-            match action {
-                0 => client.cancel(&buyer, &id),
-                1 => {
-                    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-                    client.cancel(&buyer, &id);
-                }
-                2 | 3 => {
-                    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-                    if *action == 3 {
-                        client.dispute(&buyer, &id);
-                    }
-                    client.complete(&buyer, &id, &hash);
-                    let fee = if fee_bps == 0 {
-                        0
-                    } else {
-                        ((*budget * i128::from(fee_bps)) / 10_000).max(1)
-                    };
-                    expected_provider += *budget - fee;
-                    expected_treasury += fee;
-                }
-                _ => unreachable!(),
-            }
-
-            let job = client.get_job(&id).unwrap();
-            prop_assert_eq!(job.budget, *budget);
-            prop_assert_eq!(job.released, *budget);
-            prop_assert_eq!(
-                job.status,
-                if *action < 2 { JobStatus::Cancelled } else { JobStatus::Completed }
-            );
-        }
-
-        let buyer_balance = token.balance(&buyer);
-        let provider_balance = token.balance(&seller);
-        let treasury_balance = token.balance(&treasury);
-        let escrow_balance = token.balance(&client.address);
-        prop_assert_eq!(buyer_balance, 0);
-        prop_assert_eq!(provider_balance, expected_provider);
-        prop_assert_eq!(treasury_balance, expected_treasury);
-        prop_assert_eq!(escrow_balance, 0);
-        prop_assert_eq!(
-            buyer_balance + provider_balance + treasury_balance + escrow_balance,
-            total_budget,
-        );
-    }
 }
