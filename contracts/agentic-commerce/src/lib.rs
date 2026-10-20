@@ -222,6 +222,7 @@ enum DataKey {
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
 const MAX_FEE_BPS: u32 = 500; // 5% hard cap
 const BPS_DENOM: i128 = 10_000;
+const EVENT_VERSION: u32 = 2;
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 /// #25 — minimum budget to prevent zero/dust jobs that waste storage and spam events.
 const MIN_BUDGET: i128 = 1;
@@ -241,6 +242,8 @@ const MAX_BATCH_SIZE: u32 = 10;
 #[contractevent]
 pub struct Initialized {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub admin: Address,
     pub treasury: Address,
 }
@@ -248,6 +251,8 @@ pub struct Initialized {
 /// Emitted when a job is created and funded.
 #[contractevent]
 pub struct JobCreated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -257,6 +262,8 @@ pub struct JobCreated {
 /// #698 — Emitted when a batch of jobs is created and funded atomically.
 #[contractevent]
 pub struct BatchJobsCreated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_ids: Vec<u64>,
@@ -270,8 +277,9 @@ pub struct BatchJobsCreated {
 #[contractevent]
 pub struct JobSubmitted {
     #[topic]
-    pub provider: Address,
+    pub version: u32,
     #[topic]
+    pub provider: Address,
     pub deliverable_hash: soroban_sdk::BytesN<32>,
     pub job_id: u64,
 }
@@ -283,6 +291,8 @@ pub struct JobSubmitted {
 /// (#27).
 #[contractevent]
 pub struct JobCompleted {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub evaluator: Address,
     pub job_id: u64,
@@ -297,6 +307,8 @@ pub struct JobCompleted {
 #[contractevent]
 pub struct JobExpired {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub provider: Address,
     pub job_id: u64,
     pub payout: i128,
@@ -308,6 +320,8 @@ pub struct JobExpired {
 #[contractevent]
 pub struct JobRefunded {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub client: Address,
     pub job_id: u64,
 }
@@ -315,6 +329,8 @@ pub struct JobRefunded {
 /// Emitted when a job is cancelled and refunded.
 #[contractevent]
 pub struct JobCancelled {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -325,6 +341,9 @@ pub struct JobCancelled {
 #[contractevent]
 pub struct SlaPenaltyApplied {
     #[topic]
+    pub version: u32,
+    #[topic]
+    pub actor: Address,
     pub job_id: u64,
     pub overdue_hours: u64,
     pub penalty_bps: u32,
@@ -335,25 +354,18 @@ pub struct SlaPenaltyApplied {
 #[contractevent]
 pub struct JobDisputed {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub client: Address,
     pub job_id: u64,
-    pub timestamp: u64,
-}
-
-/// Emitted when a provider claims payment after the evaluator timeout has passed (#18).
-#[contractevent]
-pub struct JobExpired {
-    #[topic]
-    pub provider: Address,
-    pub job_id: u64,
-    pub payout: i128,
-    pub fee: i128,
     pub timestamp: u64,
 }
 
 /// Emitted when the contract is emergency-paused.
 #[contractevent]
 pub struct Paused {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub admin: Address,
     pub timestamp: u64,
@@ -363,6 +375,8 @@ pub struct Paused {
 #[contractevent]
 pub struct Unpaused {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub admin: Address,
     pub timestamp: u64,
 }
@@ -370,6 +384,8 @@ pub struct Unpaused {
 /// Emitted when an admin adds a token to the whitelist.
 #[contractevent]
 pub struct TokenWhitelisted {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub admin: Address,
     pub token: Address,
@@ -380,6 +396,8 @@ pub struct TokenWhitelisted {
 #[contractevent]
 pub struct TokenRemoved {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub admin: Address,
     pub token: Address,
 }
@@ -387,6 +405,8 @@ pub struct TokenRemoved {
 /// Emitted when admin/treasury are updated via `re_init`.
 #[contractevent]
 pub struct ReInitialized {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub admin: Address,
     pub new_admin: Address,
@@ -396,6 +416,8 @@ pub struct ReInitialized {
 /// Emitted when a milestone-based job is created.
 #[contractevent]
 pub struct MilestoneJobCreated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -407,6 +429,8 @@ pub struct MilestoneJobCreated {
 #[contractevent]
 pub struct MilestoneSubmitted {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub provider: Address,
     pub job_id: u64,
     pub milestone_index: u32,
@@ -415,6 +439,8 @@ pub struct MilestoneSubmitted {
 /// Emitted when an evaluator approves a milestone and releases partial funds.
 #[contractevent]
 pub struct MilestoneApproved {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub evaluator: Address,
     pub job_id: u64,
@@ -427,6 +453,8 @@ pub struct MilestoneApproved {
 #[contractevent]
 pub struct MilestonesPartialCancelled {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub client: Address,
     pub job_id: u64,
     pub refund: i128,
@@ -435,6 +463,8 @@ pub struct MilestonesPartialCancelled {
 /// #713 — Emitted when a job is funded via a cross-currency path payment swap.
 #[contractevent]
 pub struct SwapFunded {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -453,6 +483,8 @@ pub struct SwapFunded {
 #[contractevent]
 pub struct ChannelOpened {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub payer: Address,
     pub channel_id: u64,
     pub provider: Address,
@@ -461,6 +493,8 @@ pub struct ChannelOpened {
 
 #[contractevent]
 pub struct ChannelClosing {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub actor: Address,
     pub channel_id: u64,
@@ -471,6 +505,9 @@ pub struct ChannelClosing {
 #[contractevent]
 pub struct ChannelSettled {
     #[topic]
+    pub version: u32,
+    #[topic]
+    pub actor: Address,
     pub channel_id: u64,
     pub amount: i128,
     pub refund: i128,
@@ -478,6 +515,8 @@ pub struct ChannelSettled {
 
 #[contractevent]
 pub struct JobApproved {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub evaluator: Address,
     pub job_id: u64,
@@ -622,6 +661,7 @@ impl AgenticCommerceContract {
 
         // #31 — emit Initialized event so indexers can track contract setup.
         Initialized {
+            version: EVENT_VERSION,
             admin,
             treasury,
         }
@@ -646,6 +686,7 @@ impl AgenticCommerceContract {
         env.storage().instance().set(&DataKey::Treasury, &new_treasury);
 
         ReInitialized {
+            version: EVENT_VERSION,
             admin: caller,
             new_admin,
             new_treasury,
@@ -694,6 +735,7 @@ impl AgenticCommerceContract {
         }
         env.storage().instance().set(&DataKey::Paused, &true);
         Paused {
+            version: EVENT_VERSION,
             admin: caller,
             timestamp: env.ledger().timestamp(),
         }
@@ -710,6 +752,7 @@ impl AgenticCommerceContract {
         }
         env.storage().instance().set(&DataKey::Paused, &false);
         Unpaused {
+            version: EVENT_VERSION,
             admin: caller,
             timestamp: env.ledger().timestamp(),
         }
@@ -834,6 +877,7 @@ impl AgenticCommerceContract {
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
 
         JobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -1001,6 +1045,7 @@ impl AgenticCommerceContract {
 
         // (6) Emit the batch event with the assigned job ids.
         BatchJobsCreated {
+            version: EVENT_VERSION,
             client,
             job_ids: job_ids.clone(),
         }
@@ -1143,6 +1188,7 @@ impl AgenticCommerceContract {
         );
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
         JobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -1289,6 +1335,7 @@ impl AgenticCommerceContract {
         );
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
         JobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -1352,6 +1399,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobSubmitted {
+            version: EVENT_VERSION,
             provider: caller,
             deliverable_hash,
             job_id: id,
@@ -1426,6 +1474,8 @@ impl AgenticCommerceContract {
         if penalty > 0 {
             token_client.transfer(&contract_addr, &job.client, &penalty);
             SlaPenaltyApplied {
+                version: EVENT_VERSION,
+                actor: caller.clone(),
                 job_id: id,
                 overdue_hours,
                 penalty_bps,
@@ -1440,6 +1490,7 @@ impl AgenticCommerceContract {
         }
 
         JobCompleted {
+            version: EVENT_VERSION,
             evaluator: caller,
             job_id: id,
             provider: job.provider.clone(),
@@ -1500,6 +1551,7 @@ impl AgenticCommerceContract {
             .persistent()
             .set(&DataKey::Evaluators(job_id), &quorum);
         JobApproved {
+            version: EVENT_VERSION,
             evaluator: evaluator.clone(),
             job_id,
             approvals: accumulated_weight,
@@ -1527,6 +1579,8 @@ impl AgenticCommerceContract {
         if penalty > 0 {
             token_client.transfer(&contract_addr, &job.client, &penalty);
             SlaPenaltyApplied {
+                version: EVENT_VERSION,
+                actor: evaluator.clone(),
                 job_id: id,
                 overdue_hours,
                 penalty_bps,
@@ -1540,6 +1594,7 @@ impl AgenticCommerceContract {
             token_client.transfer(&contract_addr, &treasury, &fee);
         }
         JobCompleted {
+            version: EVENT_VERSION,
             evaluator,
             job_id: id,
             provider: job.provider.clone(),
@@ -1588,6 +1643,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().remove(&DataKey::Evaluators(id));
 
         JobCancelled {
+            version: EVENT_VERSION,
             client: caller,
             job_id: id,
         }
@@ -1624,6 +1680,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobDisputed {
+            version: EVENT_VERSION,
             client: caller,
             job_id: id,
             timestamp: env.ledger().timestamp(),
@@ -1733,6 +1790,7 @@ impl AgenticCommerceContract {
             env.storage().instance().set(&DataKey::AllowedTokenList, &list);
         }
         TokenWhitelisted {
+            version: EVENT_VERSION,
             admin,
             token,
             decimals,
@@ -1762,6 +1820,7 @@ impl AgenticCommerceContract {
         }
         env.storage().instance().set(&DataKey::AllowedTokenList, &new_list);
         TokenRemoved {
+            version: EVENT_VERSION,
             admin,
             token,
         }
@@ -1947,6 +2006,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(job_id), &job);
 
         SwapFunded {
+            version: EVENT_VERSION,
             client,
             job_id,
             input_token,
@@ -2059,6 +2119,7 @@ impl AgenticCommerceContract {
             .instance()
             .set(&DataKey::NextChannelId, &(id + 1));
         ChannelOpened {
+            version: EVENT_VERSION,
             payer,
             channel_id: id,
             provider,
@@ -2104,6 +2165,7 @@ impl AgenticCommerceContract {
             .persistent()
             .set(&DataKey::Channel(channel_id), &channel);
         ChannelClosing {
+            version: EVENT_VERSION,
             actor: caller,
             channel_id,
             amount: channel.amount,
@@ -2146,6 +2208,8 @@ impl AgenticCommerceContract {
             token_client.transfer(&contract_addr, &channel.payer, &refund);
         }
         ChannelSettled {
+            version: EVENT_VERSION,
+            actor: caller,
             channel_id,
             amount: channel.amount,
             refund,
@@ -2263,6 +2327,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().remove(&DataKey::Evaluators(id));
 
         JobRefunded {
+            version: EVENT_VERSION,
             client: caller,
             job_id: id,
         }
@@ -2314,6 +2379,8 @@ impl AgenticCommerceContract {
         if penalty > 0 {
             token_client.transfer(&contract_addr, &job.client, &penalty);
             SlaPenaltyApplied {
+                version: EVENT_VERSION,
+                actor: caller.clone(),
                 job_id: id,
                 overdue_hours,
                 penalty_bps,
@@ -2328,6 +2395,7 @@ impl AgenticCommerceContract {
         }
 
         JobExpired {
+            version: EVENT_VERSION,
             provider: caller,
             job_id: id,
             payout,
@@ -2455,6 +2523,7 @@ impl AgenticCommerceContract {
 
         let milestone_count = normalised.len();
         MilestoneJobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -2525,6 +2594,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Milestones(job_id), &milestones);
 
         MilestoneSubmitted {
+            version: EVENT_VERSION,
             provider: caller,
             job_id,
             milestone_index: milestone_idx,
@@ -2594,6 +2664,7 @@ impl AgenticCommerceContract {
         }
 
         MilestoneApproved {
+            version: EVENT_VERSION,
             evaluator: caller,
             job_id,
             milestone_index: milestone_idx,
@@ -2639,6 +2710,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(job_id), &job);
 
         MilestonesPartialCancelled {
+            version: EVENT_VERSION,
             client: caller,
             job_id,
             refund,

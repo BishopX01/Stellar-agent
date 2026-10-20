@@ -133,6 +133,7 @@ fn create_job_transfers_budget_into_escrow() {
     assert_eq!(job_id, 1);
 
     let expected_event = JobCreated {
+        version: EVENT_VERSION,
         client: buyer.clone(),
         job_id,
         budget,
@@ -185,6 +186,7 @@ fn submit_flips_status_and_records_deliverable() {
     );
 
     let expected_event = JobSubmitted {
+        version: EVENT_VERSION,
         provider: seller,
         job_id: id,
         deliverable_hash: hash.clone(),
@@ -287,6 +289,7 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
     client.complete(&buyer, &id, &hash);
 
     let expected_event = JobCompleted {
+        version: EVENT_VERSION,
         evaluator: buyer.clone(),
         job_id: id,
         provider: seller.clone(),
@@ -365,6 +368,7 @@ fn cancel_refunds_buyer_when_not_yet_submitted() {
     client.cancel(&buyer, &id);
 
     let expected_event = JobCancelled {
+        version: EVENT_VERSION,
         client: buyer.clone(),
         job_id: id,
     };
@@ -568,6 +572,7 @@ fn init_emits_initialized_event() {
     client.init(&admin, &treasury);
 
     let expected = Initialized {
+        version: EVENT_VERSION,
         admin: admin.clone(),
         treasury: treasury.clone(),
     };
