@@ -1341,9 +1341,13 @@ app.get("/api/jobs/:id/events", (req, res) => {
   res.flushHeaders?.();
 
   const send = (event: string, data: unknown, id?: string) => {
-    if (id) res.write(`id: ${id}\n`);
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    try {
+      if (id) res.write(`id: ${id}\n`);
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Client disconnect cleanup runs on the response's close event.
+    }
   };
   send("hello", { message: "connected", jobId: jobId.toString() });
 
@@ -1360,10 +1364,10 @@ app.get("/api/jobs/:id/events", (req, res) => {
   eventHub.on("event", onEvent);
 
   const heartbeat = setInterval(() => {
-    res.write(`event: ping\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`);
+    send("ping", { t: Date.now() });
   }, SSE_HEARTBEAT_MS);
 
-  req.on("close", () => {
+  res.on("close", () => {
     clearInterval(heartbeat);
     eventHub.off("event", onEvent);
   });
