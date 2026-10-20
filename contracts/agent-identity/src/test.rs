@@ -882,3 +882,69 @@ fn register_and_update_uri_accept_single_byte_uri() {
     client.update_uri(&alice, &id, &one);
     assert_eq!(client.get_agent(&id).unwrap().uri, one);
 }
+
+// ===========================================================================
+// #701 — badge issuer and deregistration cleanup tests
+// ===========================================================================
+
+#[test]
+fn authorized_issuer_can_issue_and_revoke_badges() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let tag = soroban_sdk::Symbol::new(&env, "code_audit");
+
+    client.init(&admin);
+    client.set_authorized_issuer(&admin, &issuer, &true);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+    client.issue_badge(&issuer, &id, &tag, &95u32, &86_400u64);
+
+    let badges = client.get_badges(&id);
+    assert_eq!(badges.len(), 1);
+    assert_eq!(badges.get(0).unwrap().tag, tag);
+
+    client.revoke_badge(&issuer, &id, &tag);
+    assert_eq!(client.get_badges(&id).len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "issuer not authorized")]
+fn unauthorized_address_cannot_issue_badges() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let tag = soroban_sdk::Symbol::new(&env, "code_audit");
+
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+    client.issue_badge(&issuer, &id, &tag, &95u32, &86_400u64);
+}
+
+#[test]
+fn deregister_removes_badges_from_the_credential_index() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let tag = soroban_sdk::Symbol::new(&env, "code_audit");
+
+    client.init(&admin);
+    client.set_authorized_issuer(&admin, &issuer, &true);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+    client.issue_badge(&issuer, &id, &tag, &95u32, &86_400u64);
+    assert_eq!(client.get_badges(&id).len(), 1);
+
+    client.deregister(&owner, &id);
+    assert_eq!(client.get_badges(&id).len(), 0);
+}

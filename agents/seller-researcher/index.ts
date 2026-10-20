@@ -9,7 +9,6 @@ import {
   retryWithBackoff,
   createSellerAgent,
   makeSellerResponse,
-  validateEnv,
   validatePrompt,
   isMockLlm,
   registerGracefulShutdown,
@@ -19,11 +18,14 @@ import {
   withSpan,
 } from "../shared.js";
 
-validateEnv(["PORT", "SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"]);
+const config = loadAgentConfig({
+  required: ["SECRET_KEY", "REGISTRY_URL", "GROQ_API_KEY"],
+  port: { envVar: "SELLER_PORT", default: 4504 },
+});
 
 const AGENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-const PORT = Number(process.env.SELLER_PORT ?? 4504);
+const PORT = config.port;
 const AGENT_ID = "seller-researcher";
 const OUTPUT_DIR = path.join(AGENT_DIR, "output");
 const OUTPUT_FILE = path.join(OUTPUT_DIR, "research.json");
@@ -49,7 +51,7 @@ app.get("/health", (_req, res) => {
     version: "1.0.0",
     uptime: Math.floor((Date.now() - startTime) / 1000),
     jobs: { active: jobsActive, completed: jobsCompleted, failed: jobsFailed },
-    wallet: { address: process.env.SECRET_KEY ? "configured" : "not-configured" },
+    wallet: { address: config.secretKey ? "configured" : "not-configured" },
   });
 });
 
@@ -74,8 +76,8 @@ app.get("/metrics", (_req, res) => {
   );
 });
 
-const groq = isMockLlm() ? null : new Groq({ apiKey: process.env.GROQ_API_KEY });
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const groq = isMockLlm() ? null : new Groq({ apiKey: config.groqApiKey });
+const GROQ_MODEL = config.groqModel;
 
 interface ResearchOutput {
   summary: string;

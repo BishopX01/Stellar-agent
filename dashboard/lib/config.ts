@@ -1,6 +1,7 @@
 import "dotenv/config";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { TESTNET, type MarcConfig } from "marc-stellar-sdk";
+import { z } from "zod";
 
 export type NetworkId = "testnet" | "futurenet" | "mainnet";
 
@@ -82,7 +83,7 @@ export const rpcUrls = [
     .filter(Boolean),
   activeNetwork.rpcUrl,
   TESTNET.rpcUrl,
-].filter((url, index, list): url is string => Boolean(url) && list.indexOf(url) === index);
+].filter((url, index, list) => Boolean(url) && list.indexOf(url) === index);
 
 export interface RpcHealthResult {
   url: string;
@@ -195,11 +196,11 @@ const DEMO_SELLER_SECRET = "SDY6VEDUDJ6JD77NU7KQCQGNP3KCXN57RPUGDDYQBNGAWD2VE5P4
 
 export const buyerKeypair = DEMO_MODE
   ? Keypair.fromSecret(DEMO_BUYER_SECRET)
-  : Keypair.fromSecret(process.env.BUYER_SECRET!);
+  : Keypair.fromSecret(env.BUYER_SECRET ?? env.SECRET_KEY ?? "");
 
 export const sellerKeypair = DEMO_MODE
   ? Keypair.fromSecret(DEMO_SELLER_SECRET)
-  : Keypair.fromSecret(process.env.SELLER_SECRET!);
+  : Keypair.fromSecret(env.SELLER_SECRET ?? env.SECRET_KEY ?? "");
 
 export function getKeypair(wallet: string): Keypair {
   if (wallet === "buyer") return buyerKeypair;

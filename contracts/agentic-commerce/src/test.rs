@@ -2,6 +2,8 @@ use super::*;
 use soroban_sdk::testutils::{Address as _, Events as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
 use soroban_sdk::{Address, BytesN, Env, Event, String};
+extern crate std;
+use proptest::prelude::*;
 
 fn setup<'a>(env: &Env) -> (AgenticCommerceContractClient<'a>, Address, Address) {
     let admin = Address::generate(env);
@@ -309,6 +311,58 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
     assert_eq!(token.balance(&client.address), 0);
     let job = client.get_job(&id).unwrap();
     assert_eq!(job.status, JobStatus::Completed);
+}
+
+#[test]
+fn pausing_payment_channels_does_not_block_job_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    client.pause_channels(&admin);
+    assert!(client.are_channels_paused());
+
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
+    );
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Funded);
+
+    client.unpause_channels(&admin);
+    assert!(!client.are_channels_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn paused_payment_channels_reject_new_channels() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let payer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&payer, &1_000_000);
+    client.pause_channels(&admin);
+
+    client.open_channel(
+        &payer,
+        &provider,
+        &token_addr,
+        &100_000i128,
+        &BytesN::from_array(&env, &[0; 32]),
+    );
 }
 
 #[test]
@@ -1116,8 +1170,10 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
     client.complete(&buyer, &id, &hash);
 
-    assert_eq!(token.balance(&seller), budget);
+    assert_eq!(token.balance(&seller), 100_000);
     assert_eq!(token.balance(&treasury), 0);
     assert_eq!(token.balance(&client.address), 0);
-    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Completed);
+
+    let job = client.get_job(&id).unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
 }
