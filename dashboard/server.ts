@@ -448,9 +448,9 @@ async function warmMatchmakingIndex(): Promise<void> {
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
-  process.env.ALLOWED_ORIGIN,
-  ...(process.env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()),
-].filter(Boolean) as string[];
+  ...(env.ALLOWED_ORIGIN ? [env.ALLOWED_ORIGIN] : []),
+  ...(env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean),
+];
 
 // ── #722: Sliding-window rate limiter for mutating API endpoints ─────────────
 // Tracks request timestamps per key (IP + optional wallet) in a sliding window,
@@ -1018,7 +1018,7 @@ function serialize(obj: unknown): unknown {
 }
 
 const HORIZON_URL =
-  process.env.HORIZON_URL ??
+  env.HORIZON_URL ??
   (cfg.networkPassphrase === Networks.PUBLIC
     ? "https://horizon.stellar.org"
     : "https://horizon-testnet.stellar.org");
@@ -1143,7 +1143,7 @@ app.get("/api/network", (req, res) => {
 });
 
 let statsCache: { ts: number; payload: unknown } | null = null;
-const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS ?? 5_000);
+const STATS_CACHE_TTL_MS = env.STATS_CACHE_TTL_MS;
 
 // GET /api/stats
 app.get("/api/stats", async (req, res) => {

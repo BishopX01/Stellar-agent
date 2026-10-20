@@ -17,7 +17,7 @@ import {
   type MarcConfig,
   type Job,
 } from "marc-stellar-sdk";
-import { retryWithBackoff } from "../shared.js";
+import { retryWithBackoff, loadAgentConfig } from "../shared.js";
 import { watchFile, unwatchFile, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { context, propagation, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
@@ -73,10 +73,8 @@ async function tracedFetch(
 // Provider/model are env-configurable per issue #650. Supported providers:
 //   AGENT_LLM_PROVIDER=openai    (default model: gpt-4o)
 //   AGENT_LLM_PROVIDER=anthropic (default model: claude-3-5-sonnet-latest)
-const LLM_PROVIDER = (process.env.AGENT_LLM_PROVIDER ?? "openai").toLowerCase();
-const LLM_MODEL =
-  process.env.AGENT_LLM_MODEL ??
-  (LLM_PROVIDER === "anthropic" ? "claude-3-5-sonnet-latest" : "gpt-4o");
+const LLM_PROVIDER = agentConfig.llm.provider;
+const LLM_MODEL = agentConfig.llm.model;
 
 interface TaskClassification {
   capabilities: string[];
@@ -258,11 +256,11 @@ function parseCliArgs(args: string[]) {
 const cliArgs = parseCliArgs(process.argv.slice(2));
 
 const cfg: MarcConfig = {
-  rpcUrl: process.env.STELLAR_RPC_URL ?? TESTNET.rpcUrl,
-  networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? TESTNET.networkPassphrase,
-  identityContract: process.env.AGENT_IDENTITY_CONTRACT || TESTNET.identityContract,
-  commerceContract: process.env.AGENTIC_COMMERCE_CONTRACT || TESTNET.commerceContract,
-  usdcToken: process.env.USDC_TOKEN_CONTRACT || TESTNET.usdcToken,
+  rpcUrl: agentConfig.stellar.rpcUrl,
+  networkPassphrase: agentConfig.stellar.networkPassphrase,
+  identityContract: agentConfig.stellar.identityContract,
+  commerceContract: agentConfig.stellar.commerceContract,
+  usdcToken: agentConfig.stellar.usdcToken,
   onTx: (hash) =>
     log(
       `{gray-fg}tx: ${hash.slice(0, 16)}... → https://stellar.expert/explorer/testnet/tx/${hash}{/gray-fg}`,
