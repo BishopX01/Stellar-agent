@@ -2,6 +2,8 @@ use super::*;
 use soroban_sdk::testutils::{Address as _, Events as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
 use soroban_sdk::{Address, BytesN, Env, Event, String};
+extern crate std;
+use proptest::prelude::*;
 
 fn setup<'a>(env: &Env) -> (AgenticCommerceContractClient<'a>, Address, Address) {
     let admin = Address::generate(env);

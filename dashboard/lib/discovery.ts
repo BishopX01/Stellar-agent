@@ -54,10 +54,19 @@ async function findMaxId(getter: (id: bigint) => Promise<unknown | null>): Promi
 
 /** Fetch all items 1..max in parallel batches */
 async function fetchAll<T>(maxId: number, getter: (id: bigint) => Promise<T | null>): Promise<T[]> {
+  return fetchRange(1, maxId, getter);
+}
+
+/** Fetch an inclusive id range in bounded parallel batches. */
+async function fetchRange<T>(
+  startId: number,
+  endId: number,
+  getter: (id: bigint) => Promise<T | null>,
+): Promise<T[]> {
   const BATCH = 10;
   const results: T[] = [];
-  for (let start = 1; start <= maxId; start += BATCH) {
-    const end = Math.min(start + BATCH - 1, maxId);
+  for (let start = startId; start <= endId; start += BATCH) {
+    const end = Math.min(start + BATCH - 1, endId);
     const batch = [];
     for (let i = start; i <= end; i++) {
       batch.push(getter(BigInt(i)));
@@ -98,6 +107,20 @@ export async function getAllJobs(force = false): Promise<Job[]> {
   const jobs = await fetchAll(max, (id) => commerce.getJob(id));
   jobCache = { data: jobs, ts: Date.now() };
   return jobs;
+}
+
+export async function getJobsPage(
+  page = 1,
+  pageSize = DEFAULT_AGENT_PAGE_SIZE,
+): Promise<{ items: Job[]; page: number; pageSize: number; total: number; hasNext: boolean }> {
+  const total = await getJobCount();
+  const endId = total - (page - 1) * pageSize;
+  const startId = Math.max(endId - pageSize + 1, 1);
+  const items =
+    endId >= 1
+      ? await fetchRange(startId, endId, (id) => commerce.getJob(id))
+      : [];
+  return { items, page, pageSize, total, hasNext: startId > 1 };
 }
 
 async function getRegisteredAgentCount(): Promise<number> {

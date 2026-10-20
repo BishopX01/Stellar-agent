@@ -28,6 +28,7 @@ import {
   getAllAgents,
   getAgentsPage,
   getAllJobs,
+  getJobsPage,
   invalidateAgents,
   invalidateJobs,
   identity,
@@ -667,8 +668,8 @@ const jobStatusSchema = z.enum([
 
 const jobsQuerySchema = z.object({
   status: z.string().min(1).optional(),
-  page: z.coerce.number().int().positive().optional(),
-  limit: z.coerce.number().int().positive().max(100).optional(),
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(24),
 });
 
 const agentsQuerySchema = z.object({
@@ -1625,33 +1626,23 @@ app.post(
 app.get("/api/jobs", async (req, res) => {
   try {
     const parsed = jobsQuerySchema.parse(req.query);
-    let jobs = await tracedDb("getAllJobs", () => getAllJobs());
+    const page = await tracedDb("getJobsPage", () => getJobsPage(parsed.page, parsed.limit));
+    let jobs = page.items;
     if (parsed.status === "Active") {
       jobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted");
     } else if (parsed.status) {
       jobs = jobs.filter((j) => j.status === parsed.status);
     }
-    if (parsed.page || parsed.limit) {
-      const page = parsed.page ?? 1;
-      const limit = parsed.limit ?? 24;
-      const offset = (page - 1) * limit;
-      const items = jobs.slice(offset, offset + limit);
-      res.json({
-        page,
-        limit,
-        total: jobs.length,
-        hasNext: offset + limit < jobs.length,
-        items: serialize(await Promise.all(items.map(async (job) => ({
-          ...job,
-          evaluatorProgress: await commerce.getEvaluatorProgress(job.id).catch(() => null),
-        })))),
-      });
-      return;
-    }
-    res.json(serialize(await Promise.all(jobs.map(async (job) => ({
-      ...job,
-      evaluatorProgress: await commerce.getEvaluatorProgress(job.id).catch(() => null),
-    })))));
+    res.json({
+      page: page.page,
+      limit: page.pageSize,
+      total: page.total,
+      hasNext: page.hasNext,
+      items: serialize(await Promise.all(jobs.map(async (job) => ({
+        ...job,
+        evaluatorProgress: await commerce.getEvaluatorProgress(job.id).catch(() => null),
+      })))),
+    });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
