@@ -332,6 +332,9 @@ export class EventStore {
   private stmtGetReputation: Database.Statement;
   private stmtGetAllReputations: Database.Statement;
   private stmtDeleteFromLedger: Database.Statement;
+  private stmtGetCache: Database.Statement;
+  private stmtSetCache: Database.Statement;
+  private stmtDeleteCache: Database.Statement;
 
   private emitHook: EventEmitHook | null = null;
 
@@ -372,6 +375,41 @@ export class EventStore {
     this.stmtDeleteFromLedger = db.prepare(
       `DELETE FROM events WHERE ledger >= ?`,
     );
+    this.stmtGetCache = db.prepare(
+      `SELECT value, updated_at FROM dashboard_cache WHERE cache_key = ?`,
+    );
+    this.stmtSetCache = db.prepare(`
+      INSERT INTO dashboard_cache (cache_key, value, updated_at)
+      VALUES (@cache_key, @value, @updated_at)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = excluded.updated_at
+    `);
+    this.stmtDeleteCache = db.prepare(
+      `DELETE FROM dashboard_cache WHERE cache_key = ?`,
+    );
+  }
+
+  /** Fetch a persisted dashboard cache entry, or null when it is absent. */
+  getCache(key: string): { value: string; updatedAt: number } | null {
+    const row = this.stmtGetCache.get(key) as
+      | { value: string; updated_at: number }
+      | undefined;
+    return row ? { value: row.value, updatedAt: row.updated_at } : null;
+  }
+
+  /** Atomically persist a serialized dashboard cache entry. */
+  setCache(key: string, value: string, updatedAt: number): void {
+    this.stmtSetCache.run({
+      cache_key: key,
+      value,
+      updated_at: updatedAt,
+    });
+  }
+
+  /** Remove a persisted dashboard cache entry after an on-chain mutation. */
+  deleteCache(key: string): void {
+    this.stmtDeleteCache.run(key);
   }
 
   /**

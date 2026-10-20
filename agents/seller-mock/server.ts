@@ -31,8 +31,6 @@ provider.register();
 const tracer = trace.getTracer(serviceName);
 
 const app = express();
-const port = Number(process.env.PORT ?? 4510);
-const payTo = process.env.PAY_TO ?? "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 app.use(express.json());
 
@@ -79,9 +77,8 @@ const mockPaywall = marcPaywall({
   network: "stellar:testnet",
   description: "Access the local mock seller agent",
   mimeType: "application/json",
-  facilitatorUrl:
-    process.env.X402_FACILITATOR_URL ?? "https://channels.openzeppelin.com/x402/testnet",
-  facilitatorApiKey: process.env.X402_API_KEY,
+  facilitatorUrl: env.X402_FACILITATOR_URL,
+  facilitatorApiKey: env.X402_API_KEY,
 });
 
 app.get("/health", (_req, res) => {

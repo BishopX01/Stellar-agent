@@ -57,6 +57,18 @@ jobs:
             exit 1
           fi
 
+  env-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Validate .env.example files against Zod schemas
+        run: npm run validate:env-examples
+
   openapi-lint:
     runs-on: ubuntu-latest
     steps:

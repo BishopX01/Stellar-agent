@@ -13,6 +13,7 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = "1"
 
 [features]
 # `testutils` exposes test-only helpers (e.g. `Env::default()`, `Address::generate`,

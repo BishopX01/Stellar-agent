@@ -2,6 +2,8 @@ use super::*;
 use soroban_sdk::testutils::{Address as _, Events as _};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
 use soroban_sdk::{Address, BytesN, Env, Event, String};
+extern crate std;
+use proptest::prelude::*;
 
 fn setup<'a>(env: &Env) -> (AgenticCommerceContractClient<'a>, Address, Address) {
     let admin = Address::generate(env);
@@ -367,6 +369,7 @@ fn create_job_transfers_budget_into_escrow() {
     assert_eq!(job_id, 1);
 
     let expected_event = JobCreated {
+        version: EVENT_VERSION,
         client: buyer.clone(),
         job_id,
         budget,
@@ -419,6 +422,7 @@ fn submit_flips_status_and_records_deliverable() {
     );
 
     let expected_event = JobSubmitted {
+        version: EVENT_VERSION,
         provider: seller,
         job_id: id,
         deliverable_hash: hash.clone(),
@@ -523,6 +527,7 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
     client.complete(&buyer, &id, &Some(hash));
 
     let expected_event = JobCompleted {
+        version: EVENT_VERSION,
         evaluator: buyer.clone(),
         job_id: id,
         provider: seller.clone(),
@@ -542,6 +547,58 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
     assert_eq!(token.balance(&client.address), 0);
     let job = client.get_job(&id).unwrap();
     assert_eq!(job.status, JobStatus::Completed);
+}
+
+#[test]
+fn pausing_payment_channels_does_not_block_job_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    client.pause_channels(&admin);
+    assert!(client.are_channels_paused());
+
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
+    );
+    assert_eq!(client.get_job(&id).unwrap().status, JobStatus::Funded);
+
+    client.unpause_channels(&admin);
+    assert!(!client.are_channels_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn paused_payment_channels_reject_new_channels() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+
+    let payer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&payer, &1_000_000);
+    client.pause_channels(&admin);
+
+    client.open_channel(
+        &payer,
+        &provider,
+        &token_addr,
+        &100_000i128,
+        &BytesN::from_array(&env, &[0; 32]),
+    );
 }
 
 #[test]
@@ -601,6 +658,7 @@ fn cancel_refunds_buyer_when_not_yet_submitted() {
     client.cancel(&buyer, &id);
 
     let expected_event = JobCancelled {
+        version: EVENT_VERSION,
         client: buyer.clone(),
         job_id: id,
     };
@@ -805,6 +863,7 @@ fn init_emits_initialized_event() {
     client.init(&admin, &treasury);
 
     let expected = Initialized {
+        version: EVENT_VERSION,
         admin: admin.clone(),
         treasury: treasury.clone(),
     };
@@ -845,8 +904,113 @@ fn complete_panics_on_double_complete() {
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-    client.complete(&buyer, &id, &Some(hash.clone())); // first complete — OK
-    client.complete(&buyer, &id, &Some(hash)); // second complete — must panic
+    client.complete(&buyer, &id, &hash);
+    client.complete(&buyer, &id, &hash); // second complete — must panic
+}
+
+#[test]
+fn staking_rewards_follow_stake_weight_and_unstaked_tokens_are_withdrawn() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let grant_pool = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let first_staker = Address::generate(&env);
+    let second_staker = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000_000);
+    stellar_token.mint(&first_staker, &1_000);
+    stellar_token.mint(&second_staker, &3_000);
+
+    client.set_treasury_split(
+        &admin,
+        &TreasurySplit {
+            dev_pool_bps: 0,
+            staking_pool_bps: 10_000,
+            grant_pool_bps: 0,
+        },
+        &treasury,
+        &grant_pool,
+    );
+    client.stake_tokens(&first_staker, &token_addr, &1_000);
+    client.stake_tokens(&second_staker, &token_addr, &3_000);
+
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &100_000i128,
+        &String::from_str(&env, "job"),
+        &0u64,
+        &0u32,
+    );
+    let hash = sample_hash(&env);
+    client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+    client.complete(&buyer, &id, &hash);
+
+    assert_eq!(client.claim_staking_rewards(&first_staker, &token_addr), 250);
+    assert_eq!(client.claim_staking_rewards(&second_staker, &token_addr), 750);
+    assert_eq!(token.balance(&first_staker), 250);
+    assert_eq!(token.balance(&second_staker), 750);
+
+    client.unstake_tokens(&first_staker, &token_addr, &1_000);
+    client.unstake_tokens(&second_staker, &token_addr, &3_000);
+    assert_eq!(token.balance(&first_staker), 1_000);
+    assert_eq!(token.balance(&second_staker), 3_000);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+#[test]
+fn staking_reward_rounding_is_carried_between_fee_distributions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, treasury) = setup(&env);
+    let grant_pool = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let first_staker = Address::generate(&env);
+    let second_staker = Address::generate(&env);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    stellar_token.mint(&buyer, &1_000);
+    stellar_token.mint(&first_staker, &1);
+    stellar_token.mint(&second_staker, &1);
+
+    client.set_fee_bps(&admin, &100u32);
+    client.set_treasury_split(
+        &admin,
+        &TreasurySplit {
+            dev_pool_bps: 0,
+            staking_pool_bps: 10_000,
+            grant_pool_bps: 0,
+        },
+        &treasury,
+        &grant_pool,
+    );
+    client.stake_tokens(&first_staker, &token_addr, &1);
+    client.stake_tokens(&second_staker, &token_addr, &1);
+
+    for _ in 0..2 {
+        let id = client.create_job(
+            &buyer,
+            &seller,
+            &buyer,
+            &token_addr,
+            &100i128,
+            &String::from_str(&env, "job"),
+            &0u64,
+            &0u32,
+        );
+        let hash = sample_hash(&env);
+        client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
+        client.complete(&buyer, &id, &hash);
+    }
+
+    let first_reward = client.claim_staking_rewards(&first_staker, &token_addr);
+    let second_reward = client.claim_staking_rewards(&second_staker, &token_addr);
+    assert_eq!(first_reward + second_reward, 2);
+    assert_eq!(token.balance(&client.address), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,9 +1405,9 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-    client.complete(&buyer, &id, &Some(hash));
+    client.complete(&buyer, &id, &hash);
 
-    assert_eq!(token.balance(&seller), budget);
+    assert_eq!(token.balance(&seller), 100_000);
     assert_eq!(token.balance(&treasury), 0);
     assert_eq!(token.balance(&client.address), 0);
 

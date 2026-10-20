@@ -13,6 +13,9 @@ Single-page status tracker. **If you're a Claude agent picking up this project, 
 **Phase:** 7 (Submission Materials)
 **Last completed:** Phase 6 — Landing page shipped at `landing/index.html` with hero, protocol stack, how-it-works, contract addresses, SDK snippets, i18n, consent banner, and Vercel deploy config ✅
 **Next action:** Phase 7 Task 7.1 — finalize README for submission
+**Current maintenance:** Contract/indexer issue batch is in progress on
+`feat/versioned-events-staking-mutual-cancel-wasm-size`; versioned event headers
+and the event registry are implemented.
 
 **Deployed contracts (testnet):**
 

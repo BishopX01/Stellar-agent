@@ -1,9 +1,5 @@
 #![no_std]
-#![allow(clippy::too_many_arguments)]
-use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, Env, IntoVal, String, Vec,
-};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token, Address, Env, IntoVal, String, Vec};
 
 /// Contract-level error codes for agentic-commerce (#323, #541).
 #[contracterror]
@@ -32,10 +28,12 @@ pub enum Error {
     /// #706 — the evaluator-asserted deliverable content hash does not match
     /// the hash committed by the provider at submission time.
     HashMismatch = 11,
-    /// The supplied batch is empty or exceeds the maximum supported size.
-    BatchTooLarge = 12,
-    /// A swap did not deliver the expected output within the authorized input.
-    SlippageExceeded = 13,
+    /// Payment-channel operations are paused by the admin.
+    ChannelsPaused = 12,
+    /// A batch request exceeds the safe per-call cap.
+    BatchTooLarge = 13,
+    /// Router swap did not meet the client’s slippage guard.
+    SlippageExceeded = 14,
 }
 
 /// Lifecycle states for a job escrow.
@@ -173,6 +171,23 @@ pub struct TokenInfo {
     pub normalization_factor: i128,
 }
 
+/// Basis-point allocations for every protocol fee. The three values must sum
+/// to 10,000. The default preserves the existing 100% treasury destination.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreasurySplit {
+    pub dev_pool_bps: u32,
+    pub staking_pool_bps: u32,
+    pub grant_pool_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+struct RewardAccount {
+    accrued_scaled: i128,
+    reward_debt_scaled: i128,
+}
+
 /// A single job request within a batch (#698).
 ///
 /// Mirrors the per-job arguments of `create_job` so an agent orchestrator can
@@ -208,11 +223,16 @@ enum DataKey {
     NextId,
     Job(u64),
     Treasury,
+    TreasurySplit,
+    DevPool,
+    GrantPool,
     Admin,
     FeeBps,
     Version,
     /// #29 — emergency pause flag. Stored as bool; absent == not paused.
     Paused,
+    /// Payment-channel operations pause flag.
+    ChannelsPaused,
     NextChannelId,
     Evaluators(u64),
     Channel(u64),
@@ -225,13 +245,23 @@ enum DataKey {
     AllowedTokenList,
     /// #713 — address of the AMM/DEX router contract used for path payments.
     AmmRouter,
+    TotalStake(Address),
+    Stake(Address, Address),
+    RewardPerShare(Address),
+    RewardRemainder(Address),
+    RewardAccount(Address, Address),
 }
 
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
+const DEFAULT_TREASURY_SPLIT: TreasurySplit = TreasurySplit {
+    dev_pool_bps: 10_000,
+    staking_pool_bps: 0,
+    grant_pool_bps: 0,
+};
 const MAX_FEE_BPS: u32 = 500; // 5% hard cap
 const BPS_DENOM: i128 = 10_000;
 const SECS_PER_HOUR: u64 = 60 * 60;
-const MAX_SLA_PENALTY_BPS: u32 = 5_000; // 50%
+const MAX_SLA_PENALTY_BPS: u32 = 5000; // 50%
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 const DEFAULT_TOKEN_DECIMALS: u32 = 7;
 const MAX_TOKEN_DECIMALS: u32 = 38;
@@ -253,6 +283,8 @@ const MAX_BATCH_SIZE: u32 = 10;
 #[contractevent]
 pub struct Initialized {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub admin: Address,
     pub treasury: Address,
 }
@@ -260,6 +292,8 @@ pub struct Initialized {
 /// Emitted when a job is created and funded.
 #[contractevent]
 pub struct JobCreated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -269,6 +303,8 @@ pub struct JobCreated {
 /// #698 — Emitted when a batch of jobs is created and funded atomically.
 #[contractevent]
 pub struct BatchJobsCreated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_ids: Vec<u64>,
@@ -282,8 +318,9 @@ pub struct BatchJobsCreated {
 #[contractevent]
 pub struct JobSubmitted {
     #[topic]
-    pub provider: Address,
+    pub version: u32,
     #[topic]
+    pub provider: Address,
     pub deliverable_hash: soroban_sdk::BytesN<32>,
     pub job_id: u64,
 }
@@ -295,6 +332,8 @@ pub struct JobSubmitted {
 /// (#27).
 #[contractevent]
 pub struct JobCompleted {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub evaluator: Address,
     pub job_id: u64,
@@ -309,6 +348,8 @@ pub struct JobCompleted {
 #[contractevent]
 pub struct JobExpired {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub provider: Address,
     pub job_id: u64,
     pub payout: i128,
@@ -320,6 +361,8 @@ pub struct JobExpired {
 #[contractevent]
 pub struct JobRefunded {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub client: Address,
     pub job_id: u64,
 }
@@ -327,6 +370,8 @@ pub struct JobRefunded {
 /// Emitted when a job is cancelled and refunded.
 #[contractevent]
 pub struct JobCancelled {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -337,6 +382,9 @@ pub struct JobCancelled {
 #[contractevent]
 pub struct SlaPenaltyApplied {
     #[topic]
+    pub version: u32,
+    #[topic]
+    pub actor: Address,
     pub job_id: u64,
     pub overdue_hours: u64,
     pub penalty_bps: u32,
@@ -364,6 +412,26 @@ pub struct Paused {
 #[contractevent]
 pub struct Unpaused {
     #[topic]
+    pub version: u32,
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when payment-channel operations are paused.
+#[contractevent]
+pub struct ChannelsPaused {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when payment-channel operations are resumed.
+#[contractevent]
+pub struct ChannelsUnpaused {
+    #[topic]
+    pub version: u32,
+    #[topic]
     pub admin: Address,
     pub timestamp: u64,
 }
@@ -371,6 +439,8 @@ pub struct Unpaused {
 /// Emitted when an admin adds a token to the whitelist.
 #[contractevent]
 pub struct TokenWhitelisted {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub admin: Address,
     pub token: Address,
@@ -381,6 +451,8 @@ pub struct TokenWhitelisted {
 #[contractevent]
 pub struct TokenRemoved {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub admin: Address,
     pub token: Address,
 }
@@ -388,6 +460,8 @@ pub struct TokenRemoved {
 /// Emitted when admin/treasury are updated via `re_init`.
 #[contractevent]
 pub struct ReInitialized {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub admin: Address,
     pub new_admin: Address,
@@ -397,6 +471,8 @@ pub struct ReInitialized {
 /// Emitted when a milestone-based job is created.
 #[contractevent]
 pub struct MilestoneJobCreated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -408,6 +484,8 @@ pub struct MilestoneJobCreated {
 #[contractevent]
 pub struct MilestoneSubmitted {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub provider: Address,
     pub job_id: u64,
     pub milestone_index: u32,
@@ -416,6 +494,8 @@ pub struct MilestoneSubmitted {
 /// Emitted when an evaluator approves a milestone and releases partial funds.
 #[contractevent]
 pub struct MilestoneApproved {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub evaluator: Address,
     pub job_id: u64,
@@ -428,6 +508,8 @@ pub struct MilestoneApproved {
 #[contractevent]
 pub struct MilestonesPartialCancelled {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub client: Address,
     pub job_id: u64,
     pub refund: i128,
@@ -436,6 +518,8 @@ pub struct MilestonesPartialCancelled {
 /// #713 — Emitted when a job is funded via a cross-currency path payment swap.
 #[contractevent]
 pub struct SwapFunded {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub client: Address,
     pub job_id: u64,
@@ -454,6 +538,8 @@ pub struct SwapFunded {
 #[contractevent]
 pub struct ChannelOpened {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub payer: Address,
     pub channel_id: u64,
     pub provider: Address,
@@ -462,6 +548,8 @@ pub struct ChannelOpened {
 
 #[contractevent]
 pub struct ChannelClosing {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub actor: Address,
     pub channel_id: u64,
@@ -472,6 +560,9 @@ pub struct ChannelClosing {
 #[contractevent]
 pub struct ChannelSettled {
     #[topic]
+    pub version: u32,
+    #[topic]
+    pub actor: Address,
     pub channel_id: u64,
     pub amount: i128,
     pub refund: i128,
@@ -479,6 +570,8 @@ pub struct ChannelSettled {
 
 #[contractevent]
 pub struct JobApproved {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub evaluator: Address,
     pub job_id: u64,
@@ -520,6 +613,18 @@ impl AgenticCommerceContract {
             .unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Panics if payment-channel operations have been paused by the admin.
+    fn require_channels_not_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ChannelsPaused)
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, Error::ChannelsPaused);
         }
     }
 
@@ -637,6 +742,7 @@ impl AgenticCommerceContract {
 
         // #31 — emit Initialized event so indexers can track contract setup.
         Initialized {
+            version: EVENT_VERSION,
             admin,
             treasury,
         }
@@ -661,6 +767,7 @@ impl AgenticCommerceContract {
         env.storage().instance().set(&DataKey::Treasury, &new_treasury);
 
         ReInitialized {
+            version: EVENT_VERSION,
             admin: caller,
             new_admin,
             new_treasury,
@@ -709,6 +816,7 @@ impl AgenticCommerceContract {
         }
         env.storage().instance().set(&DataKey::Paused, &true);
         Paused {
+            version: EVENT_VERSION,
             admin: caller,
             timestamp: env.ledger().timestamp(),
         }
@@ -725,10 +833,49 @@ impl AgenticCommerceContract {
         }
         env.storage().instance().set(&DataKey::Paused, &false);
         Unpaused {
+            version: EVENT_VERSION,
             admin: caller,
             timestamp: env.ledger().timestamp(),
         }
         .publish(&env);
+    }
+
+    /// Admin-only: pause payment-channel operations without interrupting jobs.
+    pub fn pause_channels(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::ChannelsPaused, &true);
+        ChannelsPaused {
+            admin: caller,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Admin-only: resume payment-channel operations.
+    pub fn unpause_channels(env: Env, caller: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            panic_with_error!(&env, Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::ChannelsPaused, &false);
+        ChannelsUnpaused {
+            admin: caller,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Read-only: returns true if payment-channel operations are paused.
+    pub fn are_channels_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ChannelsPaused)
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------------
@@ -850,6 +997,7 @@ impl AgenticCommerceContract {
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
 
         JobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -1023,6 +1171,7 @@ impl AgenticCommerceContract {
 
         // (6) Emit the batch event with the assigned job ids.
         BatchJobsCreated {
+            version: EVENT_VERSION,
             client,
             job_ids: job_ids.clone(),
         }
@@ -1167,6 +1316,7 @@ impl AgenticCommerceContract {
         );
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
         JobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -1319,6 +1469,7 @@ impl AgenticCommerceContract {
         );
         env.storage().instance().set(&DataKey::NextId, &(next + 1));
         JobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -1382,6 +1533,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobSubmitted {
+            version: EVENT_VERSION,
             provider: caller,
             deliverable_hash,
             job_id: id,
@@ -1406,7 +1558,7 @@ impl AgenticCommerceContract {
         env: Env,
         caller: Address,
         id: u64,
-        expected_hash: Option<soroban_sdk::BytesN<32>>,
+        expected_hash: soroban_sdk::BytesN<32>,
     ) {
         Self::require_not_paused(&env); // #29
         caller.require_auth();
@@ -1434,15 +1586,12 @@ impl AgenticCommerceContract {
         if job.status != JobStatus::Submitted && job.status != JobStatus::Disputed {
             panic_with_error!(&env, Error::InvalidStatus);
         }
-        // #706 — optional content-hash attestation. Reject any assertion that
-        // does not match the immutable hash committed by the provider.
-        if let Some(expected) = expected_hash {
-            if expected != job.deliverable_hash {
-                panic_with_error!(&env, Error::HashMismatch);
-            }
+        // #706 — reject any hash assertion that does not match the immutable
+        // digest committed by the provider at submission time.
+        if expected_hash != job.deliverable_hash {
+            panic_with_error!(&env, Error::HashMismatch);
         }
-        // #23 — use the fee_bps snapshotted at job creation time so admin
-        // changes to the global rate don't retroactively alter this job.
+        // #716 — apply any SLA penalty before the platform fee is computed.
         let (overdue_hours, penalty_bps, penalty) = Self::compute_sla_penalty(&job);
         let penalized_budget = job.budget - penalty;
         let fee: i128 = Self::compute_fee(penalized_budget, job.fee_bps);
@@ -1458,6 +1607,8 @@ impl AgenticCommerceContract {
         if penalty > 0 {
             token_client.transfer(&contract_addr, &job.client, &penalty);
             SlaPenaltyApplied {
+                version: EVENT_VERSION,
+                actor: caller.clone(),
                 job_id: id,
                 overdue_hours,
                 penalty_bps,
@@ -1472,6 +1623,7 @@ impl AgenticCommerceContract {
         }
 
         JobCompleted {
+            version: EVENT_VERSION,
             evaluator: caller,
             job_id: id,
             provider: job.provider.clone(),
@@ -1532,6 +1684,7 @@ impl AgenticCommerceContract {
             .persistent()
             .set(&DataKey::Evaluators(job_id), &quorum);
         JobApproved {
+            version: EVENT_VERSION,
             evaluator: evaluator.clone(),
             job_id,
             approvals: accumulated_weight,
@@ -1559,6 +1712,8 @@ impl AgenticCommerceContract {
         if penalty > 0 {
             token_client.transfer(&contract_addr, &job.client, &penalty);
             SlaPenaltyApplied {
+                version: EVENT_VERSION,
+                actor: evaluator.clone(),
                 job_id: id,
                 overdue_hours,
                 penalty_bps,
@@ -1572,6 +1727,7 @@ impl AgenticCommerceContract {
             token_client.transfer(&contract_addr, &treasury, &fee);
         }
         JobCompleted {
+            version: EVENT_VERSION,
             evaluator,
             job_id: id,
             provider: job.provider.clone(),
@@ -1622,6 +1778,7 @@ impl AgenticCommerceContract {
         }
 
         JobCancelled {
+            version: EVENT_VERSION,
             client: caller,
             job_id: id,
         }
@@ -1658,6 +1815,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(id), &job);
 
         JobDisputed {
+            version: EVENT_VERSION,
             client: caller,
             job_id: id,
             timestamp: env.ledger().timestamp(),
@@ -1770,6 +1928,7 @@ impl AgenticCommerceContract {
             env.storage().instance().set(&DataKey::AllowedTokenList, &list);
         }
         TokenWhitelisted {
+            version: EVENT_VERSION,
             admin,
             token,
             decimals,
@@ -1799,6 +1958,7 @@ impl AgenticCommerceContract {
         }
         env.storage().instance().set(&DataKey::AllowedTokenList, &new_list);
         TokenRemoved {
+            version: EVENT_VERSION,
             admin,
             token,
         }
@@ -1984,6 +2144,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Job(job_id), &job);
 
         SwapFunded {
+            version: EVENT_VERSION,
             client,
             job_id,
             input_token,
@@ -2058,6 +2219,7 @@ impl AgenticCommerceContract {
         voucher_key: soroban_sdk::BytesN<32>,
     ) -> u64 {
         Self::require_not_paused(&env);
+        Self::require_channels_not_paused(&env);
         payer.require_auth();
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
@@ -2096,6 +2258,7 @@ impl AgenticCommerceContract {
             .instance()
             .set(&DataKey::NextChannelId, &(id + 1));
         ChannelOpened {
+            version: EVENT_VERSION,
             payer,
             channel_id: id,
             provider,
@@ -2115,6 +2278,7 @@ impl AgenticCommerceContract {
         signature: soroban_sdk::BytesN<64>,
     ) {
         Self::require_not_paused(&env);
+        Self::require_channels_not_paused(&env);
         caller.require_auth();
         let mut channel: PaymentChannel = env
             .storage()
@@ -2141,6 +2305,7 @@ impl AgenticCommerceContract {
             .persistent()
             .set(&DataKey::Channel(channel_id), &channel);
         ChannelClosing {
+            version: EVENT_VERSION,
             actor: caller,
             channel_id,
             amount: channel.amount,
@@ -2153,6 +2318,7 @@ impl AgenticCommerceContract {
     /// Either channel participant may submit settlement once the period ends.
     pub fn force_close(env: Env, caller: Address, channel_id: u64) {
         Self::require_not_paused(&env);
+        Self::require_channels_not_paused(&env);
         caller.require_auth();
         let channel: PaymentChannel = env
             .storage()
@@ -2183,6 +2349,8 @@ impl AgenticCommerceContract {
             token_client.transfer(&contract_addr, &channel.payer, &refund);
         }
         ChannelSettled {
+            version: EVENT_VERSION,
+            actor: caller,
             channel_id,
             amount: channel.amount,
             refund,
@@ -2302,6 +2470,7 @@ impl AgenticCommerceContract {
         }
 
         JobRefunded {
+            version: EVENT_VERSION,
             client: caller,
             job_id: id,
         }
@@ -2353,6 +2522,8 @@ impl AgenticCommerceContract {
         if penalty > 0 {
             token_client.transfer(&contract_addr, &job.client, &penalty);
             SlaPenaltyApplied {
+                version: EVENT_VERSION,
+                actor: caller.clone(),
                 job_id: id,
                 overdue_hours,
                 penalty_bps,
@@ -2367,6 +2538,7 @@ impl AgenticCommerceContract {
         }
 
         JobExpired {
+            version: EVENT_VERSION,
             provider: caller,
             job_id: id,
             payout,
@@ -2492,6 +2664,7 @@ impl AgenticCommerceContract {
 
         let milestone_count = normalised.len();
         MilestoneJobCreated {
+            version: EVENT_VERSION,
             client: client_addr,
             job_id: next,
             budget,
@@ -2562,6 +2735,7 @@ impl AgenticCommerceContract {
         env.storage().persistent().set(&DataKey::Milestones(job_id), &milestones);
 
         MilestoneSubmitted {
+            version: EVENT_VERSION,
             provider: caller,
             job_id,
             milestone_index: milestone_idx,
@@ -2631,6 +2805,7 @@ impl AgenticCommerceContract {
         }
 
         MilestoneApproved {
+            version: EVENT_VERSION,
             evaluator: caller,
             job_id,
             milestone_index: milestone_idx,
@@ -2678,6 +2853,7 @@ impl AgenticCommerceContract {
         }
 
         MilestonesPartialCancelled {
+            version: EVENT_VERSION,
             client: caller,
             job_id,
             refund,

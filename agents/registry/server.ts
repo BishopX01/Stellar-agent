@@ -7,6 +7,46 @@ import { AgentHealthMonitor } from "./src/monitor.js";
 
 const isProduction = process.env.NODE_ENV === "production";
 
+const RegistryEnvSchema = z.object({
+  PORT: z.coerce.number().int().min(1).max(65535).default(4500),
+  REGISTRY_API_KEY: z
+    .string()
+    .trim()
+    .min(1, "REGISTRY_API_KEY must be a non-empty string")
+    .optional(),
+});
+
+export type RegistryEnv = z.infer<typeof RegistryEnvSchema>;
+
+function formatZodErrorTable(error: z.ZodError): string {
+  const rows = error.issues.map((issue) => ({
+    Variable: issue.path.join(".") || "(root)",
+    Problem: issue.message,
+  }));
+  const headers = ["Variable", "Problem"] as const;
+  const widths = headers.map((h) =>
+    Math.max(h.length, ...rows.map((r) => String(r[h]).length)),
+  );
+  const line = (cells: readonly string[]) =>
+    cells.map((c, i) => c.padEnd(widths[i])).join(" | ");
+  const divider = widths.map((w) => "-".repeat(w)).join("-+-");
+  return [line(headers), divider, ...rows.map((r) => line(headers.map((h) => String(r[h]))))].join(
+    "\n",
+  );
+}
+
+export function loadRegistryEnv(env: NodeJS.ProcessEnv = process.env): RegistryEnv {
+  const result = RegistryEnvSchema.safeParse(env);
+  if (!result.success) {
+    const table = formatZodErrorTable(result.error);
+    console.error(`[registry] Invalid environment configuration:\n\n${table}\n`);
+    throw new Error("Invalid registry environment configuration");
+  }
+  return result.data;
+}
+
+const registryEnv = loadRegistryEnv();
+
 export const logger = isProduction
   ? pino({ level: process.env.LOG_LEVEL || "info" })
   : pino({
@@ -23,14 +63,14 @@ export const logger = isProduction
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AGENTS_DIR = path.join(__dirname, "..");
-const PORT = 4500;
+const PORT = registryEnv.PORT;
 
 const MISSED_BEATS_LIMIT = 3;
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const HEARTBEAT_TIMEOUT_MS = MISSED_BEATS_LIMIT * HEARTBEAT_INTERVAL_MS;
 const AGENT_LIST_RATE_LIMIT = 60;
 const AGENT_LIST_RATE_WINDOW_MS = 60_000;
-const REGISTRY_API_KEY = process.env.REGISTRY_API_KEY?.trim();
+const REGISTRY_API_KEY = registryEnv.REGISTRY_API_KEY;
 const agentListRequestCounts = new Map<string, { count: number; resetAt: number }>();
 
 export type AgentStatus = "Online" | "Offline";
@@ -180,7 +220,7 @@ function getRequestKey(req: any) {
   );
 }
 
-const API_KEY = process.env.REGISTRY_API_KEY || "dev-registry-key";
+const API_KEY = registryEnv.REGISTRY_API_KEY ?? "dev-registry-key";
 
 function requireApiKey(req: any, res: any, next: any) {
   const key = req.headers["x-api-key"];

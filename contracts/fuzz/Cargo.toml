@@ -20,9 +20,6 @@ path = "../agent-identity"
 [dependencies.agentic-commerce]
 path = "../agentic-commerce"
 
-[workspace]
-members = ["."]
-
 [profile.release]
 debug = 1
 overflow-checks = true
