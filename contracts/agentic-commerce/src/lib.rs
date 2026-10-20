@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    Address, Env, IntoVal, String, Vec,
+};
 
 /// Contract-level error codes for agentic-commerce (#323, #541).
 #[contracterror]
@@ -28,6 +31,10 @@ pub enum Error {
     /// #706 — the evaluator-asserted deliverable content hash does not match
     /// the hash committed by the provider at submission time.
     HashMismatch = 11,
+    InvalidTreasurySplit = 12,
+    InvalidStake = 13,
+    InsufficientStake = 14,
+    ArithmeticOverflow = 15,
 }
 
 /// Lifecycle states for a job escrow.
@@ -165,6 +172,23 @@ pub struct TokenInfo {
     pub normalization_factor: i128,
 }
 
+/// Basis-point allocations for every protocol fee. The three values must sum
+/// to 10,000. The default preserves the existing 100% treasury destination.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TreasurySplit {
+    pub dev_pool_bps: u32,
+    pub staking_pool_bps: u32,
+    pub grant_pool_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+struct RewardAccount {
+    accrued_scaled: i128,
+    reward_debt_scaled: i128,
+}
+
 /// A single job request within a batch (#698).
 ///
 /// Mirrors the per-job arguments of `create_job` so an agent orchestrator can
@@ -200,6 +224,9 @@ enum DataKey {
     NextId,
     Job(u64),
     Treasury,
+    TreasurySplit,
+    DevPool,
+    GrantPool,
     Admin,
     FeeBps,
     Version,
@@ -217,11 +244,22 @@ enum DataKey {
     AllowedTokenList,
     /// #713 — address of the AMM/DEX router contract used for path payments.
     AmmRouter,
+    TotalStake(Address),
+    Stake(Address, Address),
+    RewardPerShare(Address),
+    RewardRemainder(Address),
+    RewardAccount(Address, Address),
 }
 
 const DEFAULT_FEE_BPS: u32 = 100; // 1%
+const DEFAULT_TREASURY_SPLIT: TreasurySplit = TreasurySplit {
+    dev_pool_bps: 10_000,
+    staking_pool_bps: 0,
+    grant_pool_bps: 0,
+};
 const MAX_FEE_BPS: u32 = 500; // 5% hard cap
 const BPS_DENOM: i128 = 10_000;
+const REWARD_SCALE: i128 = 1_000_000_000_000;
 const EVENT_VERSION: u32 = 2;
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
 /// #25 — minimum budget to prevent zero/dust jobs that waste storage and spam events.
