@@ -5,6 +5,7 @@ use soroban_sdk::{
 };
 
 const MAX_METADATA_URI_LEN: u32 = 256; // prevents storage-griefing via oversized URI (#320)
+const EVENT_VERSION: u32 = 2;
 
 // Soroban rent constants (#322).
 // LEDGER_BUMP  — target TTL after every write/read (~30 days at ~5 s/ledger).
@@ -128,6 +129,8 @@ enum DataKey {
 #[contractevent]
 pub struct Registered {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub owner: Address,
     pub agent_id: u64,
 }
@@ -135,6 +138,8 @@ pub struct Registered {
 /// Emitted when an agent owner updates their metadata URI.
 #[contractevent]
 pub struct UriUpdated {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub owner: Address,
     pub agent_id: u64,
@@ -144,6 +149,8 @@ pub struct UriUpdated {
 #[contractevent]
 pub struct AgentDeregistered {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub owner: Address,
     pub agent_id: u64,
 }
@@ -151,6 +158,8 @@ pub struct AgentDeregistered {
 /// Emitted when an agent's owner address is transferred to a new wallet.
 #[contractevent]
 pub struct OwnerTransferred {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub old_owner: Address,
     pub new_owner: Address,
@@ -163,6 +172,8 @@ pub struct OwnerTransferred {
 #[contractevent]
 pub struct DelegateGranted {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub owner: Address,
     pub agent_id: u64,
     pub delegate: Address,
@@ -173,6 +184,8 @@ pub struct DelegateGranted {
 /// Emitted when a delegate is explicitly revoked by an agent owner.
 #[contractevent]
 pub struct DelegateRevoked {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub owner: Address,
     pub agent_id: u64,
@@ -185,6 +198,8 @@ pub struct DelegateRevoked {
 #[contractevent]
 pub struct BadgeIssued {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub issuer: Address,
     pub agent_id: u64,
     pub tag: Symbol,
@@ -195,6 +210,8 @@ pub struct BadgeIssued {
 /// Emitted when a capability badge is revoked by its issuer.
 #[contractevent]
 pub struct BadgeRevoked {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub issuer: Address,
     pub agent_id: u64,
@@ -334,6 +351,7 @@ impl AgentIdentityContract {
             .set(&DataKey::RegisteredCount, &count.checked_add(1).expect("count overflow"));
 
         Registered {
+            version: EVENT_VERSION,
             owner,
             agent_id: next,
         }
@@ -368,6 +386,7 @@ impl AgentIdentityContract {
             .extend_ttl(&DataKey::Agent(id), LEDGER_THRESHOLD, LEDGER_BUMP);
 
         UriUpdated {
+            version: EVENT_VERSION,
             owner: caller,
             agent_id: id,
         }
@@ -427,6 +446,7 @@ impl AgentIdentityContract {
             .set(&DataKey::RegisteredCount, &count.saturating_sub(1));
 
         AgentDeregistered {
+            version: EVENT_VERSION,
             owner: agent.owner,
             agent_id: id,
         }
@@ -468,6 +488,7 @@ impl AgentIdentityContract {
             .extend_ttl(&DataKey::Agent(id), LEDGER_THRESHOLD, LEDGER_BUMP);
 
         OwnerTransferred {
+            version: EVENT_VERSION,
             old_owner: caller,
             new_owner,
             agent_id: id,
@@ -529,6 +550,7 @@ impl AgentIdentityContract {
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
 
         DelegateGranted {
+            version: EVENT_VERSION,
             owner,
             agent_id,
             delegate,
@@ -561,6 +583,7 @@ impl AgentIdentityContract {
         }
 
         DelegateRevoked {
+            version: EVENT_VERSION,
             owner,
             agent_id,
             delegate,

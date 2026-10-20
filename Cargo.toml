@@ -4,6 +4,7 @@ members = [
     "contracts/agent-identity",
     "contracts/agentic-commerce",
 ]
+exclude = ["contracts/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,4 +23,4 @@ strip = "symbols"
 debug-assertions = false
 panic = "abort"
 codegen-units = 1
-lto = true
+lto = "fat"

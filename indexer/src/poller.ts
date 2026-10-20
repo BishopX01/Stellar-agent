@@ -1,4 +1,8 @@
-import { rpc as StellarRpc } from "@stellar/stellar-sdk";
+import {
+  rpc as StellarRpc,
+  scValToNative,
+  xdr,
+} from "@stellar/stellar-sdk";
 import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { EventStore, type InsertEventParams } from "./db.js";
 import { ReputationEngine } from "./reputation.js";
@@ -53,6 +57,40 @@ export const BEAR_EVENT_TYPES = [
 
 export type BearEventType = (typeof BEAR_EVENT_TYPES)[number];
 
+export type EventTopicHeader = {
+  eventName: string;
+  version: number;
+  actor: string | null;
+};
+
+/**
+ * Decode both the legacy [event, actor, ...] header and the versioned
+ * [event, version, actor, ...] header. The emitting contract is reported
+ * separately by Soroban RPC as contractId.
+ */
+export function parseEventTopicHeader(
+  topics: readonly xdr.ScVal[],
+): EventTopicHeader | null {
+  if (topics.length === 0) return null;
+  const eventName = scValToNative<unknown>(topics[0]);
+  if (typeof eventName !== "string") return null;
+
+  const secondTopic = topics[1]
+    ? scValToNative<unknown>(topics[1])
+    : undefined;
+  const hasVersion = typeof secondTopic === "number" && Number.isInteger(secondTopic);
+  const version = hasVersion ? secondTopic : 1;
+  const actorValue = topics[hasVersion ? 2 : 1]
+    ? scValToNative<unknown>(topics[hasVersion ? 2 : 1])
+    : null;
+
+  return {
+    eventName,
+    version,
+    actor: typeof actorValue === "string" ? actorValue : null,
+  };
+}
+
 /**
  * Converts a raw Soroban event into the InsertEventParams format.
  * The full event is stored as a JSON blob in `payload` so no information
@@ -62,33 +100,23 @@ function toInsertParams(
   event: StellarRpc.Api.EventResponse,
   ledgerCloseTime: number,
 ): InsertEventParams {
-  // The first topic element is typically the event name / discriminant
   const topics = event.topic ?? [];
-  const firstTopic = topics[0];
-  let eventType = "Unknown";
-  try {
-    // Topic values come back as xdr strings; attempt a best-effort decode
-    if (firstTopic && typeof firstTopic === "object" && "value" in firstTopic) {
-      eventType = String((firstTopic as Record<string, unknown>).value);
-    } else if (typeof firstTopic === "string") {
-      eventType = firstTopic;
-    }
-  } catch {
-    // leave as "Unknown"
-  }
+  const header = parseEventTopicHeader(topics);
 
   const payload: Record<string, unknown> = {
     topics: topics,
     value: event.value,
     txHash: event.txHash,
     id: event.id,
+    eventVersion: header?.version ?? 1,
+    actor: header?.actor ?? null,
   };
 
   return {
     ledger: event.ledger,
     timestamp: ledgerCloseTime,
     contract: event.contractId ?? "",
-    event_type: eventType,
+    event_type: header?.eventName ?? "Unknown",
     payload,
   };
 }
@@ -120,16 +148,7 @@ const REPUTATION_EVENT_TYPES: ReadonlySet<string> = new Set([
  * topics for the first string-like value that is not the event name.
  */
 function extractAgentId(event: StellarRpc.Api.EventResponse): string | null {
-  const topics = event.topic ?? [];
-  for (let i = 1; i < topics.length; i++) {
-    const topic = topics[i] as unknown;
-    if (typeof topic === "string") return topic;
-    if (topic && typeof topic === "object") {
-      const value = (topic as Record<string, unknown>).value;
-      if (typeof value === "string") return value;
-    }
-  }
-  return null;
+  return parseEventTopicHeader(event.topic ?? [])?.actor ?? null;
 }
 
 /**

@@ -65,6 +65,7 @@ fn register_emits_registered_event() {
     let id = client.register(&alice, &String::from_str(&env, "ipfs://alice.json"));
 
     let expected_event = Registered {
+        version: EVENT_VERSION,
         owner: alice,
         agent_id: id,
     };
@@ -129,6 +130,7 @@ fn deregister_emits_agent_deregistered_event() {
     client.deregister(&alice, &id);
 
     let expected_event = AgentDeregistered {
+        version: EVENT_VERSION,
         owner: alice,
         agent_id: id,
     };
