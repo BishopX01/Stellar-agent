@@ -263,7 +263,7 @@ fn update_owner_rejects_non_owner_caller() {
 }
 
 #[test]
-#[should_panic(expected = "new owner already registered")]
+#[should_panic(expected = "Error(Contract, #2)")]
 fn update_owner_rejects_new_owner_already_registered() {
     let env = Env::default();
     env.mock_all_auths();
@@ -279,7 +279,7 @@ fn update_owner_rejects_new_owner_already_registered() {
 }
 
 #[test]
-#[should_panic(expected = "metadata_uri cannot be empty")]
+#[should_panic(expected = "Error(Contract, #6)")]
 fn register_rejects_empty_uri() {
     let env = Env::default();
     env.mock_all_auths();
@@ -291,7 +291,7 @@ fn register_rejects_empty_uri() {
 }
 
 #[test]
-#[should_panic(expected = "metadata_uri too long")]
+#[should_panic(expected = "Error(Contract, #7)")]
 fn register_rejects_uri_longer_than_256_chars() {
     let env = Env::default();
     env.mock_all_auths();
@@ -324,7 +324,7 @@ fn register_panics_instead_of_wrapping_when_next_id_overflows() {
 }
 
 #[test]
-#[should_panic(expected = "metadata_uri too long")]
+#[should_panic(expected = "Error(Contract, #7)")]
 fn update_uri_rejects_uri_longer_than_256_chars() {
     let env = Env::default();
     env.mock_all_auths();
@@ -669,7 +669,7 @@ fn get_agent_missing_does_not_bump_ttl() {
 /// owner is mapped in OwnerToId, which means any attempt to transfer to them
 /// is treated as a conflict.
 #[test]
-#[should_panic(expected = "new owner already registered")]
+#[should_panic(expected = "Error(Contract, #2)")]
 fn test_update_owner_to_already_registered_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -770,6 +770,91 @@ fn upgrade_panics_when_not_initialized() {
     client.upgrade(&admin, &fake_hash);
 }
 
+#[test]
+fn owner_can_pause_and_resume_agent_without_removing_record() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+    let original = client.get_agent(&id).unwrap();
+
+    client.pause_agent(&owner, &id);
+    assert!(!client.is_active(&id));
+    assert_eq!(client.get_agent(&id), Some(original.clone()));
+    assert_eq!(client.agent_of(&owner), Some(id));
+    assert_eq!(client.list_agents(&1, &100).len(), 1);
+
+    client.resume_agent(&owner, &id);
+    assert!(client.is_active(&id));
+    assert_eq!(client.get_agent(&id), Some(original));
+}
+
+#[test]
+fn admin_suspension_and_owner_pause_are_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+
+    client.suspend_agent(&admin, &id);
+    assert!(!client.is_active(&id));
+    client.pause_agent(&owner, &id);
+    client.unsuspend_agent(&admin, &id);
+    assert!(!client.is_active(&id));
+    client.resume_agent(&owner, &id);
+    assert!(client.is_active(&id));
+}
+
+#[test]
+#[should_panic(expected = "not agent owner")]
+fn pause_agent_rejects_non_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+
+    client.pause_agent(&other, &id);
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn suspend_agent_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.init(&admin);
+    let id = client.register(&owner, &String::from_str(&env, "ipfs://agent.json"));
+
+    client.suspend_agent(&other, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn is_active_rejects_unknown_agent() {
+    let env = Env::default();
+    let contract_id = env.register(AgentIdentityContract, ());
+    let client = AgentIdentityContractClient::new(&env, &contract_id);
+
+    client.is_active(&1);
+}
+
 // ===========================================================================
 // #782 — boundary tests for register()/update_uri() metadata_uri length.
 //
@@ -782,7 +867,7 @@ fn upgrade_panics_when_not_initialized() {
 
 /// Builds a `String` of exactly `len` ASCII bytes ('a' repeated).
 fn uri_of_len(env: &Env, len: u32) -> String {
-    let mut buf = [b'a'; MAX_METADATA_URI_LEN as usize];
+    let mut buf = [b'a'; MAX_METADATA_URI_LEN as usize + 1];
     let slice = &mut buf[..len as usize];
     String::from_bytes(env, slice)
 }
@@ -806,7 +891,7 @@ fn register_accepts_uri_at_max_length() {
 /// register() rejects a URI one byte over MAX_METADATA_URI_LEN with a clean
 /// contract error rather than a panic or overflow.
 #[test]
-#[should_panic(expected = "metadata_uri too long")]
+#[should_panic(expected = "Error(Contract, #7)")]
 fn register_rejects_uri_one_over_max_length() {
     let env = Env::default();
     env.mock_all_auths();
@@ -838,7 +923,7 @@ fn update_uri_accepts_uri_at_max_length() {
 
 /// update_uri() rejects a URI one byte over MAX_METADATA_URI_LEN.
 #[test]
-#[should_panic(expected = "metadata_uri too long")]
+#[should_panic(expected = "Error(Contract, #7)")]
 fn update_uri_rejects_uri_one_over_max_length() {
     let env = Env::default();
     env.mock_all_auths();
@@ -853,7 +938,7 @@ fn update_uri_rejects_uri_one_over_max_length() {
 
 /// update_uri() rejects the empty string with a clean contract error.
 #[test]
-#[should_panic(expected = "metadata_uri cannot be empty")]
+#[should_panic(expected = "Error(Contract, #6)")]
 fn update_uri_rejects_empty_uri() {
     let env = Env::default();
     env.mock_all_auths();

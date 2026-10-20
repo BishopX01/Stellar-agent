@@ -263,8 +263,10 @@ const BPS_DENOM: i128 = 10_000;
 const SECS_PER_HOUR: u64 = 60 * 60;
 const MAX_SLA_PENALTY_BPS: u32 = 5000; // 50%
 const REFUND_TIMEOUT_SECS: u64 = 7 * 24 * 3600; // 7 days
-/// #25 — minimum budget to prevent zero/dust jobs that waste storage and spam events.
-const MIN_BUDGET: i128 = 1;
+const DEFAULT_TOKEN_DECIMALS: u32 = 7;
+const MAX_TOKEN_DECIMALS: u32 = 38;
+/// Keep the existing minimum for payment channels; the one-token floor is for jobs.
+const MIN_CHANNEL_DEPOSIT: i128 = 1;
 /// #619 — maximum deliverable URI length to prevent storage griefing.
 const MAX_DELIVERABLE_LEN: u32 = 1024;
 /// #706 — maximum metadata URI length accepted alongside a content hash.
@@ -585,6 +587,22 @@ pub struct AgenticCommerceContract;
 // ---------------------------------------------------------------------------
 
 impl AgenticCommerceContract {
+    fn require_minimum_job_budget(env: &Env, token: &Address, budget: i128) {
+        let token_info: Option<TokenInfo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedToken(token.clone()));
+        let decimals = token_info
+            .map(|info| info.decimals)
+            .unwrap_or(DEFAULT_TOKEN_DECIMALS);
+        let minimum = 10_i128
+            .checked_pow(decimals)
+            .unwrap_or_else(|| panic!("token decimals too high"));
+        if budget < minimum {
+            panic!("budget below minimum");
+        }
+    }
+
     /// Panics with `ContractPaused` if the `Paused` flag is set. Call this at
     /// the top of every state-changing entry point (#29).
     fn require_not_paused(env: &Env) {
@@ -655,10 +673,8 @@ impl AgenticCommerceContract {
         }
         let overdue_secs = job.submitted_at - job.sla_deadline;
         // Round up to at least one full hour for any partial hour overdue.
-        let overdue_hours = (overdue_secs + SECS_PER_HOUR - 1) / SECS_PER_HOUR;
-        let raw_bps = overdue_hours
-            .checked_mul(job.penalty_bps_per_hour as u64)
-            .unwrap_or(u64::MAX);
+        let overdue_hours = overdue_secs.div_ceil(SECS_PER_HOUR);
+        let raw_bps = overdue_hours.saturating_mul(job.penalty_bps_per_hour as u64);
         let penalty_bps = if raw_bps > MAX_SLA_PENALTY_BPS as u64 {
             MAX_SLA_PENALTY_BPS
         } else {
@@ -898,10 +914,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        // #25 — reject zero/dust budgets that waste storage and emit spam events.
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         let multi_eval_threshold: i128 = env
             .storage()
             .instance()
@@ -921,7 +934,11 @@ impl AgenticCommerceContract {
         // #694 — reject tokens not on the approved whitelist.
         // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
         // is skipped so the contract can still be used before whitelist setup.
-        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
             let list: Vec<Address> = env
                 .storage()
                 .instance()
@@ -1013,7 +1030,7 @@ impl AgenticCommerceContract {
     /// # Panics
     /// - `BatchTooLarge` if `requests` is empty or longer than `MAX_BATCH_SIZE`.
     /// - `SelfEscrow` / `InvalidParties` / `UnsupportedToken` for invalid requests.
-    /// - `"budget below minimum"` if any request's budget is below `MIN_BUDGET`.
+    /// - `"budget below minimum"` if any request's budget is below one whole token.
     pub fn batch_create_jobs(
         env: Env,
         client: Address,
@@ -1053,9 +1070,7 @@ impl AgenticCommerceContract {
         let mut index = 0u32;
         while index < requests.len() {
             let req = requests.get(index).unwrap();
-            if req.budget < MIN_BUDGET {
-                panic!("budget below minimum");
-            }
+            Self::require_minimum_job_budget(&env, &req.token, req.budget);
             if req.budget > multi_eval_threshold {
                 panic!("high-value job requires multiple evaluators");
             }
@@ -1067,7 +1082,11 @@ impl AgenticCommerceContract {
             }
             // #694 — reject tokens not on the approved whitelist. If no tokens
             // have been whitelisted yet the check is skipped, matching create_job.
-            if env.storage().instance().has(&DataKey::AllowedToken(req.token.clone())) == false {
+            if !env
+                .storage()
+                .instance()
+                .has(&DataKey::AllowedToken(req.token.clone()))
+            {
                 let list: Vec<Address> = env
                     .storage()
                     .instance()
@@ -1184,9 +1203,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         let multi_eval_threshold: i128 = env
             .storage()
             .instance()
@@ -1224,7 +1241,11 @@ impl AgenticCommerceContract {
         // #694 — reject tokens not on the approved whitelist.
         // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
         // is skipped so the contract can still be used before whitelist setup.
-        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
             let list: Vec<Address> = env
                 .storage()
                 .instance()
@@ -1328,9 +1349,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         let multi_eval_threshold: i128 = env
             .storage()
             .instance()
@@ -1384,7 +1403,11 @@ impl AgenticCommerceContract {
         // #694 — reject tokens not on the approved whitelist.
         // If no tokens have been whitelisted yet (e.g. fresh deploy), the check
         // is skipped so the contract can still be used before whitelist setup.
-        if env.storage().instance().has(&DataKey::AllowedToken(token.clone())) == false {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
             let list: Vec<Address> = env
                 .storage()
                 .instance()
@@ -1741,16 +1764,18 @@ impl AgenticCommerceContract {
         // Refund only the net (unreleased) portion of the budget so the
         // contract never transfers more than it actually holds for this job.
         let net_budget = job.budget - job.released;
-        if net_budget > 0 {
-            let token_client = token::TokenClient::new(&env, &job.token);
-            let contract_addr = env.current_contract_address();
-            token_client.transfer(&contract_addr, &job.client, &net_budget);
-        }
+        // Persist settlement before the external token call; failures roll back atomically.
         job.released = job.budget; // mark everything as settled
         job.status = JobStatus::Cancelled;
         job.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&DataKey::Job(id), &job);
         env.storage().persistent().remove(&DataKey::Evaluators(id));
+
+        if net_budget > 0 {
+            let token_client = token::TokenClient::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.client, &net_budget);
+        }
 
         JobCancelled {
             version: EVENT_VERSION,
@@ -1861,6 +1886,9 @@ impl AgenticCommerceContract {
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != current_admin {
             panic_with_error!(&env, Error::NotAdmin);
+        }
+        if decimals > MAX_TOKEN_DECIMALS {
+            panic!("token decimals too high");
         }
         // Normalization factor: if decimals <= 7, factor = 10^(7 - decimals); else 1.
         let normalization_factor: i128 = if decimals <= 7 {
@@ -2196,7 +2224,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if deposit < MIN_BUDGET {
+        if deposit < MIN_CHANNEL_DEPOSIT {
             panic!("deposit below minimum");
         }
         if payer == provider {
@@ -2428,16 +2456,18 @@ impl AgenticCommerceContract {
         }
         // Refund only the net (unreleased) portion to avoid over-transfer.
         let net_budget = job.budget - job.released;
-        if net_budget > 0 {
-            let token_client = token::TokenClient::new(&env, &job.token);
-            let contract_addr = env.current_contract_address();
-            token_client.transfer(&contract_addr, &job.client, &net_budget);
-        }
+        // Persist settlement before the external token call; failures roll back atomically.
         job.released = job.budget;
         job.status = JobStatus::Cancelled;
         job.updated_at = now;
         env.storage().persistent().set(&DataKey::Job(id), &job);
         env.storage().persistent().remove(&DataKey::Evaluators(id));
+
+        if net_budget > 0 {
+            let token_client = token::TokenClient::new(&env, &job.token);
+            let contract_addr = env.current_contract_address();
+            token_client.transfer(&contract_addr, &job.client, &net_budget);
+        }
 
         JobRefunded {
             version: EVENT_VERSION,
@@ -2556,9 +2586,7 @@ impl AgenticCommerceContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("not initialized");
         }
-        if budget < MIN_BUDGET {
-            panic!("budget below minimum");
-        }
+        Self::require_minimum_job_budget(&env, &token, budget);
         if milestones.is_empty() || milestones.len() > 20 {
             panic!("milestones must contain between 1 and 20 entries");
         }
@@ -2811,16 +2839,18 @@ impl AgenticCommerceContract {
             panic!("not a milestone job");
         }
         let net_budget = job.budget - job.released;
+        let refund = net_budget;
+        // Persist settlement before the external token call; failures roll back atomically.
+        job.released = job.budget;
+        job.status = JobStatus::Cancelled;
+        job.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::Job(job_id), &job);
+
         if net_budget > 0 {
             let token_client = token::TokenClient::new(&env, &job.token);
             let contract_addr = env.current_contract_address();
             token_client.transfer(&contract_addr, &job.client, &net_budget);
         }
-        let refund = net_budget;
-        job.released = job.budget;
-        job.status = JobStatus::Cancelled;
-        job.updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&DataKey::Job(job_id), &job);
 
         MilestonesPartialCancelled {
             version: EVENT_VERSION,

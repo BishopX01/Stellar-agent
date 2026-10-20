@@ -17,9 +17,20 @@ fn setup<'a>(env: &Env) -> (AgenticCommerceContractClient<'a>, Address, Address)
 fn deploy_token<'a>(
     env: &Env,
     admin: &Address,
+    client: &AgenticCommerceContractClient<'a>,
+) -> (Address, TokenClient<'a>, StellarAssetClient<'a>) {
+    deploy_token_with_decimals(env, admin, client, 0)
+}
+
+fn deploy_token_with_decimals<'a>(
+    env: &Env,
+    admin: &Address,
+    client: &AgenticCommerceContractClient<'a>,
+    decimals: u32,
 ) -> (Address, TokenClient<'a>, StellarAssetClient<'a>) {
     let contract = env.register_stellar_asset_contract_v2(admin.clone());
     let addr = contract.address();
+    client.add_token(admin, &addr, &decimals);
     (
         addr.clone(),
         TokenClient::new(env, &addr),
@@ -46,7 +57,7 @@ fn create_job_stores_and_returns_description() {
 
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let description = String::from_str(&env, "Generate a product description for SKU-42");
@@ -70,6 +81,229 @@ fn init_sets_admin_and_treasury() {
     let env = Env::default();
     env.mock_all_auths();
     let (_client, _admin, _treasury) = setup(&env);
+}
+
+#[test]
+#[should_panic(expected = "budget below minimum")]
+fn create_job_rejects_budget_below_one_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 7);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &9_999_999i128,
+        &String::from_str(&env, "dust job"),
+        &0u64,
+        &0u32,
+    );
+}
+
+#[test]
+fn create_job_accepts_exactly_one_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 7);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &10_000_000i128,
+        &String::from_str(&env, "one token"),
+        &0u64,
+        &0u32,
+    );
+
+    assert_eq!(client.get_job(&id).unwrap().budget, 10_000_000);
+}
+
+#[test]
+fn create_job_uses_configured_token_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 6);
+    stellar_token.mint(&buyer, &1_000_000);
+
+    let id = client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &1_000_000i128,
+        &String::from_str(&env, "one six-decimal token"),
+        &0u64,
+        &0u32,
+    );
+
+    assert_eq!(client.get_job(&id).unwrap().budget, 1_000_000);
+}
+
+#[test]
+#[should_panic(expected = "budget below minimum")]
+fn create_job_uses_default_decimals_when_token_not_whitelisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let stellar_token = StellarAssetClient::new(&env, &token_addr);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    client.create_job(
+        &buyer,
+        &seller,
+        &buyer,
+        &token_addr,
+        &9_999_999i128,
+        &String::from_str(&env, "dust unlisted-token job"),
+        &0u64,
+        &0u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "token decimals too high")]
+fn add_token_rejects_unrepresentable_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token, &39u32);
+}
+
+#[test]
+#[should_panic(expected = "budget below minimum")]
+fn batch_create_jobs_rejects_budget_below_one_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 7);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    client.batch_create_jobs(
+        &buyer,
+        &soroban_sdk::vec![
+            &env,
+            JobRequest {
+                provider,
+                evaluator: buyer.clone(),
+                token: token_addr,
+                budget: 9_999_999,
+                description: String::from_str(&env, "dust batch job"),
+            },
+        ],
+    );
+}
+
+#[test]
+#[should_panic(expected = "budget below minimum")]
+fn create_job_multi_eval_rejects_budget_below_one_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let evaluator = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 7);
+    client.set_multi_eval_threshold(&admin, &0i128);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    client.create_job_multi_eval(
+        &buyer,
+        &provider,
+        &soroban_sdk::vec![&env, evaluator],
+        &1u32,
+        &token_addr,
+        &9_999_999i128,
+        &String::from_str(&env, "dust multi-evaluator job"),
+        &0u64,
+        &0u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "budget below minimum")]
+fn create_job_multi_eval_weighted_rejects_budget_below_one_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let evaluator = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 7);
+    client.set_multi_eval_threshold(&admin, &0i128);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    client.create_job_multi_eval_weighted(
+        &buyer,
+        &provider,
+        &soroban_sdk::vec![&env, evaluator],
+        &soroban_sdk::vec![&env, 1u32],
+        &1u32,
+        &token_addr,
+        &9_999_999i128,
+        &String::from_str(&env, "dust weighted job"),
+    );
+}
+
+#[test]
+#[should_panic(expected = "budget below minimum")]
+fn create_milestone_job_rejects_budget_below_one_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury) = setup(&env);
+    let buyer = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let (token_addr, _token, stellar_token) =
+        deploy_token_with_decimals(&env, &admin, &client, 7);
+    stellar_token.mint(&buyer, &10_000_000);
+
+    client.create_milestone_job(
+        &buyer,
+        &provider,
+        &buyer,
+        &token_addr,
+        &9_999_999i128,
+        &String::from_str(&env, "dust milestone job"),
+        &soroban_sdk::vec![
+            &env,
+            Milestone {
+                index: 0,
+                amount: 9_999_999,
+                description: String::from_str(&env, "one milestone"),
+                deliverable: String::from_str(&env, ""),
+                approved: false,
+            },
+        ],
+    );
 }
 
 #[test]
@@ -115,7 +349,7 @@ fn create_job_transfers_budget_into_escrow() {
     let seller = Address::generate(&env);
     let evaluator = buyer.clone();
 
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let contract_id = client.address.clone();
@@ -165,7 +399,7 @@ fn submit_flips_status_and_records_deliverable() {
     let (client, admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -214,7 +448,7 @@ fn submit_rejects_non_provider() {
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
     let mallory = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -243,7 +477,7 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
     let (client, admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -258,7 +492,9 @@ fn submit_rejects_deliverable_longer_than_1024_chars() {
     );
 
     let deliverable = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    client.submit(&seller, &id, &deliverable, &sample_hash(&env));
+    assert!(deliverable.len() <= MAX_DELIVERABLE_LEN);
+    let oversized = String::from_bytes(&env, &[b'a'; MAX_DELIVERABLE_LEN as usize + 1]);
+    client.submit(&seller, &id, &oversized, &sample_hash(&env));
 }
 
 #[test]
@@ -268,7 +504,7 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
     let (client, admin, treasury) = setup(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -288,7 +524,7 @@ fn complete_splits_payout_99_1_between_provider_and_treasury() {
         &String::from_str(&env, "ipfs://work.json"),
         &hash,
     );
-    client.complete(&buyer, &id, &hash);
+    client.complete(&buyer, &id, &Some(hash));
 
     let expected_event = JobCompleted {
         version: EVENT_VERSION,
@@ -374,7 +610,7 @@ fn complete_rejects_non_evaluator() {
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
     let mallory = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -394,7 +630,7 @@ fn complete_rejects_non_evaluator() {
         &String::from_str(&env, "ipfs://work.json"),
         &hash,
     );
-    client.complete(&mallory, &id, &hash);
+    client.complete(&mallory, &id, &Some(hash));
 }
 
 #[test]
@@ -404,7 +640,7 @@ fn cancel_refunds_buyer_when_not_yet_submitted() {
     let (client, admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -448,7 +684,7 @@ fn cancel_rejects_non_client() {
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
     let mallory = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -506,7 +742,8 @@ fn create_job_rejects_call_before_init() {
     let admin = Address::generate(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let token_addr = env.register_stellar_asset_contract_v2(admin).address();
+    let stellar_token = StellarAssetClient::new(&env, &token_addr);
     stellar_token.mint(&buyer, &1_000_000);
 
     // init() was never called on this contract instance.
@@ -536,7 +773,7 @@ fn create_job_rejects_client_as_provider() {
 
     let buyer = Address::generate(&env);
     let evaluator = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     // buyer is both client and provider — must be rejected.
@@ -562,7 +799,7 @@ fn create_job_rejects_provider_as_evaluator() {
 
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     // seller is both provider and evaluator — must be rejected.
@@ -588,7 +825,7 @@ fn create_job_allows_client_as_evaluator() {
 
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let job_id = client.create_job(
@@ -652,7 +889,7 @@ fn complete_panics_on_double_complete() {
     let (client, admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -788,7 +1025,7 @@ fn complete_panics_when_called_by_non_evaluator() {
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
     let impostor = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -804,7 +1041,7 @@ fn complete_panics_when_called_by_non_evaluator() {
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
     // impostor is neither buyer nor seller — must be rejected
-    client.complete(&impostor, &id, &hash);
+    client.complete(&impostor, &id, &Some(hash));
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +1057,7 @@ fn submit_panics_when_called_by_non_provider() {
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
     let interloper = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -883,7 +1120,7 @@ fn complete_panics_with_job_not_found_for_unknown_id() {
     env.mock_all_auths();
     let (client, _admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
-    client.complete(&buyer, &9999u64, &sample_hash(&env));
+    client.complete(&buyer, &9999u64, &Some(sample_hash(&env)));
 }
 
 /// cancel() on a non-existent job id must panic with JobNotFound (#5).
@@ -909,7 +1146,7 @@ fn jobs_by_provider_returns_only_that_providers_jobs() {
     let buyer = Address::generate(&env);
     let seller_a = Address::generate(&env);
     let seller_b = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let desc = String::from_str(&env, "job");
@@ -959,7 +1196,7 @@ fn jobs_by_client_returns_only_that_clients_jobs() {
     let buyer_a = Address::generate(&env);
     let buyer_b = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer_a, &1_000_000);
     stellar_token.mint(&buyer_b, &1_000_000);
 
@@ -998,7 +1235,7 @@ fn jobs_by_provider_respects_limit_and_start_id() {
 
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let desc = String::from_str(&env, "job");
@@ -1065,7 +1302,7 @@ fn cancel_panics_on_already_cancelled_job() {
     let (client, admin, _treasury) = setup(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, _token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let id = client.create_job(
@@ -1110,7 +1347,7 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
 
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let budget: i128 = 100_000;
@@ -1126,7 +1363,7 @@ fn complete_with_max_fee_bps_500_splits_correctly() {
     );
     let hash = sample_hash(&env);
     client.submit(&seller, &id, &String::from_str(&env, "deliverable"), &hash);
-    client.complete(&buyer, &id, &hash);
+    client.complete(&buyer, &id, &Some(hash));
 
     // 5% fee → fee = 5_000, payout = 95_000
     assert_eq!(token.balance(&seller), 95_000);
@@ -1152,7 +1389,7 @@ fn complete_with_zero_fee_bps_sends_full_budget_to_provider() {
 
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let (token_addr, token, stellar_token) = deploy_token(&env, &admin);
+    let (token_addr, token, stellar_token) = deploy_token(&env, &admin, &client);
     stellar_token.mint(&buyer, &1_000_000);
 
     let budget: i128 = 100_000;
