@@ -5,6 +5,7 @@ use soroban_sdk::{
 };
 
 const MAX_METADATA_URI_LEN: u32 = 256; // prevents storage-griefing via oversized URI (#320)
+const EVENT_VERSION: u32 = 2;
 
 // Soroban rent constants (#322).
 // LEDGER_BUMP  — target TTL after every write/read (~30 days at ~5 s/ledger).
@@ -120,6 +121,8 @@ enum DataKey {
     Badges(u64, Symbol),
     /// Admin-managed allowlist of addresses permitted to mint badges. (#701)
     AuthorizedIssuer(Address),
+    /// Ordered badge tags stored for an agent so deregistration can remove them.
+    BadgeTags(u64),
 }
 
 // --- Events ---
@@ -127,6 +130,8 @@ enum DataKey {
 /// Emitted when a new agent is registered.
 #[contractevent]
 pub struct Registered {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub owner: Address,
     pub agent_id: u64,
@@ -136,6 +141,8 @@ pub struct Registered {
 #[contractevent]
 pub struct UriUpdated {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub owner: Address,
     pub agent_id: u64,
 }
@@ -144,6 +151,8 @@ pub struct UriUpdated {
 #[contractevent]
 pub struct AgentDeregistered {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub owner: Address,
     pub agent_id: u64,
 }
@@ -151,6 +160,8 @@ pub struct AgentDeregistered {
 /// Emitted when an agent's owner address is transferred to a new wallet.
 #[contractevent]
 pub struct OwnerTransferred {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub old_owner: Address,
     pub new_owner: Address,
@@ -163,6 +174,8 @@ pub struct OwnerTransferred {
 #[contractevent]
 pub struct DelegateGranted {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub owner: Address,
     pub agent_id: u64,
     pub delegate: Address,
@@ -173,6 +186,8 @@ pub struct DelegateGranted {
 /// Emitted when a delegate is explicitly revoked by an agent owner.
 #[contractevent]
 pub struct DelegateRevoked {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub owner: Address,
     pub agent_id: u64,
@@ -185,6 +200,8 @@ pub struct DelegateRevoked {
 #[contractevent]
 pub struct BadgeIssued {
     #[topic]
+    pub version: u32,
+    #[topic]
     pub issuer: Address,
     pub agent_id: u64,
     pub tag: Symbol,
@@ -195,6 +212,8 @@ pub struct BadgeIssued {
 /// Emitted when a capability badge is revoked by its issuer.
 #[contractevent]
 pub struct BadgeRevoked {
+    #[topic]
+    pub version: u32,
     #[topic]
     pub issuer: Address,
     pub agent_id: u64,
@@ -334,6 +353,7 @@ impl AgentIdentityContract {
             .set(&DataKey::RegisteredCount, &count.checked_add(1).expect("count overflow"));
 
         Registered {
+            version: EVENT_VERSION,
             owner,
             agent_id: next,
         }
@@ -368,6 +388,7 @@ impl AgentIdentityContract {
             .extend_ttl(&DataKey::Agent(id), LEDGER_THRESHOLD, LEDGER_BUMP);
 
         UriUpdated {
+            version: EVENT_VERSION,
             owner: caller,
             agent_id: id,
         }
@@ -427,16 +448,20 @@ impl AgentIdentityContract {
             .set(&DataKey::RegisteredCount, &count.saturating_sub(1));
 
         AgentDeregistered {
+            version: EVENT_VERSION,
             owner: agent.owner,
             agent_id: id,
         }
         .publish(&env);
     }
 
-    /// Transfer ownership of an agent to a new wallet. Caller must be the
-    /// current owner. The new owner must not already own an agent.
-    pub fn transfer_owner(env: Env, caller: Address, id: u64, new_owner: Address) {
+    /// Transfer ownership of an agent to a new wallet. Both the current owner
+    /// and the new owner must authorize the transfer.
+    pub fn update_owner(env: Env, caller: Address, id: u64, new_owner: Address) {
         caller.require_auth();
+        if new_owner != caller {
+            new_owner.require_auth();
+        }
         let mut agent: Agent = env
             .storage()
             .persistent()
@@ -468,11 +493,17 @@ impl AgentIdentityContract {
             .extend_ttl(&DataKey::Agent(id), LEDGER_THRESHOLD, LEDGER_BUMP);
 
         OwnerTransferred {
+            version: EVENT_VERSION,
             old_owner: caller,
             new_owner,
             agent_id: id,
         }
         .publish(&env);
+    }
+
+    /// Backward-compatible alias for `update_owner`.
+    pub fn transfer_owner(env: Env, caller: Address, id: u64, new_owner: Address) {
+        Self::update_owner(env, caller, id, new_owner);
     }
 
     // -----------------------------------------------------------------------
@@ -529,6 +560,7 @@ impl AgentIdentityContract {
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
 
         DelegateGranted {
+            version: EVENT_VERSION,
             owner,
             agent_id,
             delegate,
@@ -561,6 +593,7 @@ impl AgentIdentityContract {
         }
 
         DelegateRevoked {
+            version: EVENT_VERSION,
             owner,
             agent_id,
             delegate,
@@ -666,6 +699,30 @@ impl AgentIdentityContract {
         env.storage().persistent().get(&DataKey::OwnerToId(owner))
     }
 
+    /// Return whether an owner currently has a registered agent.
+    pub fn is_registered(env: Env, owner: Address) -> bool {
+        env.storage().persistent().has(&DataKey::OwnerToId(owner))
+    }
+
+    /// Return a bounded page of agents, skipping deregistered IDs.
+    pub fn list_agents(env: Env, start_id: u32, limit: u32) -> Vec<Agent> {
+        if limit > MAX_AGENT_PAGE_SIZE {
+            panic!("page limit exceeds maximum");
+        }
+        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
+        let mut agents = Vec::new(&env);
+        let mut id = start_id as u64;
+        let mut included = 0u32;
+        while id < next_id && included < limit {
+            if let Some(agent) = Self::get_agent(env.clone(), id) {
+                agents.push_back(agent);
+                included += 1;
+            }
+            id += 1;
+        }
+        agents
+    }
+
     /// Return the total number of agents ever registered (append-only).
     pub fn registered_count(env: Env) -> u32 {
         env.storage()
@@ -687,6 +744,9 @@ impl AgentIdentityContract {
         env.storage()
             .instance()
             .get(&DataKey::Version)
-            .unwrap_or(1u32)
+            .unwrap_or(0u32)
     }
 }
+
+#[cfg(test)]
+mod test;

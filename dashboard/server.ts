@@ -28,6 +28,7 @@ import {
   getAllAgents,
   getAgentsPage,
   getAllJobs,
+  getJobsPage,
   invalidateAgents,
   invalidateJobs,
   identity,
@@ -449,7 +450,12 @@ async function warmMatchmakingIndex(): Promise<void> {
   }
 }
 
-const allowedOrigins = parseAllowedOrigins(process.env);
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://localhost:5173",
+  ...(env.ALLOWED_ORIGIN ? [env.ALLOWED_ORIGIN] : []),
+  ...(env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean),
+];
 
 // ── #722: Sliding-window rate limiter for mutating API endpoints ─────────────
 // Tracks request timestamps per key (IP + optional wallet) in a sliding window,
@@ -568,8 +574,8 @@ const jobStatusSchema = z.enum([
 
 const jobsQuerySchema = z.object({
   status: z.string().min(1).optional(),
-  page: z.coerce.number().int().positive().optional(),
-  limit: z.coerce.number().int().positive().max(100).optional(),
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(24),
 });
 
 const agentsQuerySchema = z.object({
@@ -958,7 +964,7 @@ function serialize(obj: unknown): unknown {
 }
 
 const HORIZON_URL =
-  process.env.HORIZON_URL ??
+  env.HORIZON_URL ??
   (cfg.networkPassphrase === Networks.PUBLIC
     ? "https://horizon.stellar.org"
     : "https://horizon-testnet.stellar.org");
@@ -1083,7 +1089,7 @@ app.get("/api/network", (req, res) => {
 });
 
 let statsCache: { ts: number; payload: unknown } | null = null;
-const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS ?? 5_000);
+const STATS_CACHE_TTL_MS = env.STATS_CACHE_TTL_MS;
 
 // GET /api/stats
 app.get("/api/stats", async (req, res) => {
@@ -1617,33 +1623,23 @@ app.post(
 app.get("/api/jobs", async (req, res) => {
   try {
     const parsed = jobsQuerySchema.parse(req.query);
-    let jobs = await tracedDb("getAllJobs", () => getAllJobs());
+    const page = await tracedDb("getJobsPage", () => getJobsPage(parsed.page, parsed.limit));
+    let jobs = page.items;
     if (parsed.status === "Active") {
       jobs = jobs.filter((j) => j.status === "Funded" || j.status === "Submitted");
     } else if (parsed.status) {
       jobs = jobs.filter((j) => j.status === parsed.status);
     }
-    if (parsed.page || parsed.limit) {
-      const page = parsed.page ?? 1;
-      const limit = parsed.limit ?? 24;
-      const offset = (page - 1) * limit;
-      const items = jobs.slice(offset, offset + limit);
-      res.json({
-        page,
-        limit,
-        total: jobs.length,
-        hasNext: offset + limit < jobs.length,
-        items: serialize(await Promise.all(items.map(async (job) => ({
-          ...job,
-          evaluatorProgress: await commerce.getEvaluatorProgress(job.id).catch(() => null),
-        })))),
-      });
-      return;
-    }
-    res.json(serialize(await Promise.all(jobs.map(async (job) => ({
-      ...job,
-      evaluatorProgress: await commerce.getEvaluatorProgress(job.id).catch(() => null),
-    })))));
+    res.json({
+      page: page.page,
+      limit: page.pageSize,
+      total: page.total,
+      hasNext: page.hasNext,
+      items: serialize(await Promise.all(jobs.map(async (job) => ({
+        ...job,
+        evaluatorProgress: await commerce.getEvaluatorProgress(job.id).catch(() => null),
+      })))),
+    });
   } catch (err: unknown) {
     if (respondWithValidationError(err, res)) return;
     res.status(500).json({ error: (err as Error).message });
